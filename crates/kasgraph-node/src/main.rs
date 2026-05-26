@@ -101,6 +101,17 @@ struct IngestionState {
     prior_poi: PoiHash,
 }
 
+impl IngestionState {
+    /// Re-anchor the POI hash chain from a known-good survivor
+    /// hash. Called on startup (with the highest-DAA surviving POI
+    /// from Postgres) and after each committed-state unwind so the
+    /// next committed block's POI chains from the survivor, not the
+    /// now-deleted block.
+    fn reseed_prior_poi(&mut self, prior_poi: PoiHash) {
+        self.prior_poi = prior_poi;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IngestionTransition {
     committed_writes: Vec<CommittedBlockWrite>,
@@ -249,6 +260,20 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
     let notifications = build_notifications(config, rpc_client.as_ref()).await?;
     let mut ingestion = IngestionState::default();
 
+    if let Some(checkpoint) = store
+        .latest_poi_for_subgraph(&subgraph)
+        .await
+        .context("loading latest POI for subgraph on startup")?
+    {
+        ingestion.reseed_prior_poi(checkpoint.poi_hash);
+        info!(
+            subgraph = subgraph.schema_name(),
+            resumed_from_daa = checkpoint.block_daa_score,
+            prior_poi = poi_hex(&checkpoint.poi_hash),
+            "re-anchored ingestion POI chain from existing checkpoint"
+        );
+    }
+
     for notification in notifications {
         let transition = ingestion
             .apply_notification(notification)
@@ -282,6 +307,27 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 removed = report.removed_hashes.len(),
                 audit_id = report.audit_id,
                 "committed-state unwind applied"
+            );
+
+            // POI re-anchor: after deleting the unwound POI rows,
+            // load the new highest-DAA survivor and re-seed the
+            // in-memory hash chain. If nothing survives, reset to
+            // the zero seed so the next committed block restarts
+            // from genesis-style chaining.
+            let post_unwind = store
+                .latest_poi_for_subgraph(&subgraph)
+                .await
+                .context("loading latest POI after unwind")?;
+            let reseed = post_unwind
+                .as_ref()
+                .map(|cp| cp.poi_hash)
+                .unwrap_or_default();
+            ingestion.reseed_prior_poi(reseed);
+            info!(
+                subgraph = subgraph.schema_name(),
+                resumed_from_daa = post_unwind.as_ref().map(|cp| cp.block_daa_score),
+                prior_poi = poi_hex(&reseed),
+                "re-anchored ingestion POI chain after unwind"
             );
         }
 
@@ -810,6 +856,50 @@ mod tests {
             .unwrap();
         assert!(transition.committed_unwinds.is_empty());
         assert_eq!(transition.committed_writes.len(), 1);
+    }
+
+    #[test]
+    fn reseed_prior_poi_anchors_next_committed_chain_from_survivor() {
+        // Build state A: commit a single block; remember its POI.
+        let mut state_a = IngestionState::default();
+        let t = state_a.apply_block(block("a", 1, true)).unwrap();
+        let survivor_poi = t.committed_writes[0].poi_hash;
+
+        // State B: empty in-memory but re-seeded from the survivor.
+        // The next committed block must hash from `survivor_poi`,
+        // not from the default zero seed.
+        let mut state_b = IngestionState::default();
+        state_b.reseed_prior_poi(survivor_poi);
+        let next_b = state_b.apply_block(block("b", 2, true)).unwrap();
+
+        // For comparison: continue state A naturally.
+        let next_a = state_a.apply_block(block("b", 2, true)).unwrap();
+
+        assert_eq!(
+            next_a.committed_writes[0].poi_hash, next_b.committed_writes[0].poi_hash,
+            "re-seeded chain must match natural continuation"
+        );
+    }
+
+    #[test]
+    fn reseed_prior_poi_with_zero_resets_to_genesis_chain() {
+        // Commit some blocks, then re-seed to the default seed —
+        // the next committed block's POI must equal a fresh state's
+        // first POI for the same block.
+        let mut state = IngestionState::default();
+        state.apply_block(block("a", 1, true)).unwrap();
+        state.apply_block(block("b", 2, true)).unwrap();
+        state.reseed_prior_poi(PoiHash::default());
+
+        let next = state.apply_block(block("c", 3, true)).unwrap();
+
+        let mut fresh = IngestionState::default();
+        let fresh_first = fresh.apply_block(block("c", 3, true)).unwrap();
+
+        assert_eq!(
+            next.committed_writes[0].poi_hash, fresh_first.committed_writes[0].poi_hash,
+            "reseed-to-default must produce the same POI as a fresh state's first commit"
+        );
     }
 
     #[test]

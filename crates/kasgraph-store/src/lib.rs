@@ -295,6 +295,45 @@ impl Store {
         Ok(())
     }
 
+    /// Highest-DAA surviving POI checkpoint for `subgraph`, or
+    /// `None` if no POI has been written yet. Used to re-anchor
+    /// `IngestionState.prior_poi` on startup and after an unwind so
+    /// the next committed block continues the same hash chain.
+    pub async fn latest_poi_for_subgraph(
+        &self,
+        subgraph: &SubgraphId,
+    ) -> Result<Option<PoiCheckpoint>, StoreError> {
+        let row: Option<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT block_daa_score, poi_hash FROM kasgraph_poi \
+             WHERE subgraph = $1 \
+             ORDER BY block_daa_score DESC \
+             LIMIT 1",
+        )
+        .bind(subgraph.schema_name())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        let Some((block_daa_score, poi_bytes)) = row else {
+            return Ok(None);
+        };
+        if poi_bytes.len() != 32 {
+            return Err(StoreError::Query(format!(
+                "latest POI for subgraph `{}` has unexpected length {} (want 32)",
+                subgraph.schema_name(),
+                poi_bytes.len()
+            )));
+        }
+        let mut poi_hash = [0u8; 32];
+        poi_hash.copy_from_slice(&poi_bytes);
+
+        Ok(Some(PoiCheckpoint {
+            subgraph: subgraph.clone(),
+            block_daa_score,
+            poi_hash,
+        }))
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:

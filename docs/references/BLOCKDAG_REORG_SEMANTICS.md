@@ -93,7 +93,7 @@ Gap recovery is intentionally bounded — by default, recovery covers at most `K
 | Promotion on finality | Yes — `BlockAdded { is_finalized: true }` flushes the probabilistic prefix. |
 | Probabilistic conflict rollback | Yes — `remove_probabilistic_by_hashes` + `remove_probabilistic_in_range`. |
 | Committed-state SQL unwind | Yes — `Store::unwind_committed_blocks_for_subgraph` deletes the matching `kasgraph_poi` + `kasgraph_rpc_block_audit` + `kasgraph_committed_block` rows inside one SQL transaction and writes a `kasgraph_reorg_audit` row recording the operation. `IngestionState` surfaces `committed_unwinds` from `VirtualChainChanged.removed_chain_block_hashes`. |
-| POI re-anchoring after unwind | **Partial** — the deleted POI rows leave the prior-survivor checkpoint as the natural resume anchor, but `IngestionState.prior_poi` is not yet re-seeded from that survivor row. The next jump is to look up the highest-DAA surviving POI on startup / after-unwind and restore `prior_poi` from it so replay produces the same hash chain as a fresh from-genesis run. |
+| POI re-anchoring after unwind | Yes — `Store::latest_poi_for_subgraph` returns the highest-DAA surviving checkpoint; `IngestionState::reseed_prior_poi` updates the in-memory hash chain anchor. The node loop re-anchors on startup (so a restart resumes the same chain) and after every committed unwind (so the next committed block hashes from the survivor, not the deleted block). Unit tests confirm a re-seeded chain matches the natural continuation byte-for-byte. |
 | Recovery range request | Yes — `RecoveryRequired` is produced, env-driven replay hashes are honoured. |
 | Continuous wRPC subscription | **Bootstrap only** — subscribe + initial read loop; the long-lived loop lands next. |
 
