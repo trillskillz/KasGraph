@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, mpsc},
     task::JoinHandle,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -284,6 +284,31 @@ impl MultiRpcClient {
         parse_notifications_jsonl(jsonl, served_by)
     }
 
+    /// Spawn a long-lived task that subscribes to `url`, parses each
+    /// incoming notification, and pushes it onto `sender`. The task
+    /// reconnects with exponential backoff on transport errors and
+    /// on clean server-side disconnects. It exits when:
+    ///   - `sender` is closed (downstream consumer dropped the
+    ///     receiver), or
+    ///   - `backoff.max_attempts` is reached (only when non-zero).
+    ///
+    /// Each reconnect resends the same `notifyBlockAdded` and
+    /// `notifyVirtualChainChanged` subscribe payloads as the
+    /// one-shot reader. The returned `JoinHandle` lets callers
+    /// observe completion; awaiting it is optional.
+    pub fn spawn_continuous_subscription(
+        &self,
+        url: String,
+        served_by: String,
+        sender: mpsc::Sender<ChainNotification>,
+        backoff: SubscriptionBackoff,
+    ) -> JoinHandle<()> {
+        let client = self.clone();
+        tokio::spawn(async move {
+            run_continuous_subscription(client, url, served_by, sender, backoff).await;
+        })
+    }
+
     pub async fn read_notifications_ws(
         &self,
         url: &str,
@@ -371,6 +396,129 @@ pub fn parse_notifications_jsonl(
         notifications.push(parse_chain_notification(value, served_by)?);
     }
     Ok(notifications)
+}
+
+/// Reconnect/backoff policy for [`MultiRpcClient::spawn_continuous_subscription`].
+///
+/// Delay grows by `multiplier` on each consecutive failure and is
+/// clamped to `max_delay`. A clean disconnect (server closed the
+/// stream without error) resets the delay to `initial_delay`.
+#[derive(Debug, Clone)]
+pub struct SubscriptionBackoff {
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+    pub multiplier: f64,
+    /// 0 means retry forever.
+    pub max_attempts: u32,
+}
+
+impl Default for SubscriptionBackoff {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            multiplier: 2.0,
+            max_attempts: 0,
+        }
+    }
+}
+
+async fn run_continuous_subscription(
+    client: MultiRpcClient,
+    url: String,
+    served_by: String,
+    sender: mpsc::Sender<ChainNotification>,
+    backoff: SubscriptionBackoff,
+) {
+    let mut attempt: u32 = 0;
+    let mut delay = backoff.initial_delay;
+
+    loop {
+        if sender.is_closed() {
+            return;
+        }
+
+        match run_subscription_once(&client, &url, &served_by, &sender).await {
+            Ok(()) => {
+                attempt = 0;
+                delay = backoff.initial_delay;
+                warn!(
+                    url = %url,
+                    "wRPC subscription stream ended; reconnecting"
+                );
+            }
+            Err(err) => {
+                attempt = attempt.saturating_add(1);
+                if backoff.max_attempts != 0 && attempt > backoff.max_attempts {
+                    warn!(
+                        url = %url,
+                        attempts = attempt,
+                        error = %err,
+                        "wRPC subscription exhausted max_attempts; giving up"
+                    );
+                    return;
+                }
+                warn!(
+                    url = %url,
+                    attempt = attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %err,
+                    "wRPC subscription error; backing off before reconnect"
+                );
+                tokio::time::sleep(delay).await;
+                let scaled_ms = (delay.as_millis() as f64 * backoff.multiplier).max(1.0) as u64;
+                delay = std::cmp::min(Duration::from_millis(scaled_ms), backoff.max_delay);
+            }
+        }
+    }
+}
+
+async fn run_subscription_once(
+    client: &MultiRpcClient,
+    url: &str,
+    served_by: &str,
+    sender: &mpsc::Sender<ChainNotification>,
+) -> Result<(), RpcError> {
+    let (stream, _) = connect_async(url)
+        .await
+        .map_err(|err| RpcError::Transport {
+            endpoint: url.to_owned(),
+            source: anyhow_compat::AnyhowError(err.to_string()),
+        })?;
+    let (mut write, mut read) = stream.split();
+    send_notification_subscriptions(&mut write, url).await?;
+
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = sender.closed() => return Ok(()),
+            next = read.next() => match next {
+                Some(message) => message.map_err(|err| RpcError::Transport {
+                    endpoint: url.to_owned(),
+                    source: anyhow_compat::AnyhowError(err.to_string()),
+                })?,
+                None => return Ok(()),
+            },
+        };
+
+        let notifications = match message {
+            Message::Text(text) => parse_ws_message(client, &text, served_by).await?,
+            Message::Binary(bytes) => {
+                let text = String::from_utf8(bytes.to_vec())
+                    .map_err(|err| RpcError::MalformedResponse(err.to_string()))?;
+                parse_ws_message(client, &text, served_by).await?
+            }
+            Message::Close(_) => return Ok(()),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Vec::new(),
+        };
+
+        for notification in notifications {
+            if sender.send(notification).await.is_err() {
+                // Receiver dropped — caller doesn't want any more.
+                return Ok(());
+            }
+        }
+    }
 }
 
 pub async fn read_notifications_ws(
@@ -820,6 +968,69 @@ mod tests {
         spawn_mock_ws_server_with_tail(messages, None).await
     }
 
+    /// Mock ws server that accepts a series of sequential
+    /// connections. For each connection it consumes the two
+    /// subscribe messages, sends the connection's batch of
+    /// payloads, then closes. After the last batch the listener
+    /// stays open but does not accept more connections.
+    async fn spawn_mock_ws_server_multi(batches: Vec<Vec<Value>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for batch in batches {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut ws) = accept_async(socket).await else {
+                    continue;
+                };
+
+                // Drain the two subscribe messages.
+                let _ = ws.next().await;
+                let _ = ws.next().await;
+
+                for message in batch {
+                    if ws
+                        .send(Message::Text(message.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = ws.close(None).await;
+            }
+        });
+
+        format!("ws://{}", addr)
+    }
+
+    /// Mock ws server that accepts one connection and stays open
+    /// without ever sending a payload — used to test that the
+    /// driver exits cleanly when the receiver is dropped while it
+    /// is blocked on `read.next()`.
+    async fn spawn_mock_ws_server_idle() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = accept_async(socket).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            let _ = ws.next().await;
+            // Hold the connection open indefinitely.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = ws.close(None).await;
+        });
+
+        format!("ws://{}", addr)
+    }
+
     async fn spawn_mock_ws_server_with_tail(
         messages: Vec<Value>,
         tail_sleep: Option<Duration>,
@@ -1183,6 +1394,131 @@ mod tests {
             }
             other => panic!("unexpected second notification: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn continuous_subscription_reconnects_after_server_disconnect() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+
+        // Two batches → server accepts twice; each batch carries a
+        // single fully-resolved BlockAdded so we don't need HTTP
+        // fallback lookups in this test.
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-1", "daaScore": 1, "blueScore": 1},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-2", "daaScore": 2, "blueScore": 2},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+        );
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let notification = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("channel closed");
+            got.push(notification);
+        }
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        let hashes: Vec<&str> = got
+            .iter()
+            .filter_map(|n| match n {
+                ChainNotification::BlockAdded(block) => Some(block.hash.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hashes, vec!["block-1", "block-2"]);
+    }
+
+    #[tokio::test]
+    async fn continuous_subscription_exits_when_receiver_is_dropped_mid_stream() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+        let ws_url = spawn_mock_ws_server_idle().await;
+
+        let (tx, rx) = mpsc::channel::<ChainNotification>(4);
+        let handle = client.spawn_continuous_subscription(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff::default(),
+        );
+
+        // Receiver dropped immediately; driver should notice via
+        // sender.closed() inside its select! and exit.
+        drop(rx);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("driver did not exit after receiver was dropped")
+            .expect("driver task panicked");
+    }
+
+    #[tokio::test]
+    async fn continuous_subscription_gives_up_after_max_attempts() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+        // No ws server at this URL — connect_async will fail every
+        // attempt. With max_attempts = 2, the driver should give up
+        // quickly.
+        let unreachable = "ws://127.0.0.1:1".to_owned();
+
+        let (tx, _rx) = mpsc::channel::<ChainNotification>(1);
+        let handle = client.spawn_continuous_subscription(
+            unreachable,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(20),
+                multiplier: 2.0,
+                max_attempts: 2,
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("driver did not exit after max_attempts")
+            .expect("driver task panicked");
     }
 
     #[tokio::test]

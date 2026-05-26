@@ -2,7 +2,14 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — POI re-anchor on resume)
+## Latest commit arc (2026-05-26 — continuous wRPC subscription primitive)
+
+- `SubscriptionBackoff { initial_delay, max_delay, multiplier, max_attempts }` config struct (with sensible `Default`).
+- `MultiRpcClient::spawn_continuous_subscription(url, served_by, sender, backoff) -> JoinHandle<()>` runs a long-lived driver that subscribes, parses, and forwards each `ChainNotification` onto an `mpsc::Sender`. Exponential backoff on transport errors; backoff resets on clean disconnect; cooperative shutdown via `tokio::select!` on `sender.closed()` even when blocked on `read.next()`; gives up after `max_attempts` (0 = forever).
+- Three new tests against new mock helpers (`spawn_mock_ws_server_multi`, `spawn_mock_ws_server_idle`): reconnect after server-side disconnect delivers both batches; receiver-drop mid-stream exits the driver; unreachable URL plus `max_attempts = 2` exits the driver promptly.
+- 53 tests total. `BLOCKDAG_REORG_SEMANTICS.md` updated to mark the continuous primitive as landed, with node-side wiring as the next jump.
+
+## Previous commit arc (2026-05-26 — POI re-anchor on resume)
 
 - `Store::latest_poi_for_subgraph(subgraph) -> Option<PoiCheckpoint>` returns the highest-DAA surviving POI row.
 - `IngestionState::reseed_prior_poi(prior_poi)` sets the in-memory hash chain anchor.
@@ -55,11 +62,9 @@ What landed:
 
 What still needs to land:
 
-- Continuous real wRPC subscription input instead of the current bootstrap/read-into-Vec pass.
+- **Node-side wiring of the continuous subscription**: replace the bootstrap pass in `kasgraph-node::persist_bootstrap_state` with a streaming consumer (`mpsc::Receiver<ChainNotification>`) driven by `spawn_continuous_subscription`. Behind an env flag (`KASGRAPH_INGEST_MODE=continuous` or similar) so the bootstrap path keeps working for now. POI re-anchor on startup and after unwind are already in place and survive the migration.
 - Validate actual transport framing / subscribe acknowledgement payloads against a real Kaspa node if the live wire format differs from the current JSON assumption.
-- Missed-event recovery around actual subscription gaps (current recovery is env-driven only).
-- POI re-anchor on resume: after an unwind, look up the highest-DAA surviving POI and restore `IngestionState.prior_poi` so replay produces the same hash chain as a from-genesis run. The unwind itself now lands; the resume seeding does not.
-- A continuous fetched-block/subscription loop instead of the current JSONL/env-driven pass.
+- Missed-event recovery anchored to actual subscription gaps (today recovery is env-driven only; the continuous loop should emit `RecoveryRequired` when reconnect detects a DAA-score discontinuity).
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration
 
