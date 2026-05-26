@@ -2,7 +2,13 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — active gap recovery on the consumer side)
+## Latest commit arc (2026-05-26 — health-probe loop in continuous mode)
+
+- `run_continuous_ingestion` now spawns `MultiRpcClient::spawn_health_probe_loop` alongside the subscription driver, so `endpoint_health()` stays fresh while the wRPC subscription is the only active traffic.
+- The probe handle is explicitly aborted on exit (the loop has no built-in shutdown signal); without that the task would keep firing every interval until process exit.
+- No test surface change — the probe loop is a background timer best validated via integration tests. The build remains green at 59 tests.
+
+## Previous commit arc (2026-05-26 — active gap recovery on the consumer side)
 
 - `apply_and_persist_notification` now returns `NotificationOutcome { recovery_requested, committed_count }` so the continuous loop can react to gap announcements.
 - New `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` env (parsed into `ContinuousConfig.gap_recovery_block_hashes`) feeds runtime gap recovery; distinct from the existing `KASGRAPH_RECOVERY_BLOCK_HASHES` which only drives bootstrap replay.
@@ -92,7 +98,6 @@ What still needs to land:
 
 - **Live-network validation**: point continuous mode at a real Kaspa wRPC node and confirm the JSON framing assumed by `parse_ws_message` matches the wire format. If the upstream sends bincode or a different envelope shape, extend the parser; the rest of the pipeline does not change.
 - **Real DAA-range RPC method**: `MultiRpcClient::fetch_blocks_in_daa_range(from, to)` so active gap recovery does not need an operator-curated hash list. Today the path uses `recover_blocks_by_hashes`, which means operators have to know the missing hashes ahead of time — fine for forensic replay, not for unattended gap recovery.
-- **Periodic health-probe loop** in the long-lived path so endpoint health stays fresh while the wRPC subscription is the only active traffic.
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration
 

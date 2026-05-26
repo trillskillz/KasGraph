@@ -473,6 +473,13 @@ async fn run_continuous_ingestion(
         backoff,
     );
 
+    // Periodic health probes keep endpoint_health() fresh while
+    // the wRPC subscription is the only active traffic. The probe
+    // loop is unconditional in continuous mode — without it, a
+    // backup endpoint could be silently dead until the next
+    // failover-triggered fetch_block call.
+    let health_handle = driver_client.spawn_health_probe_loop();
+
     info!(
         ws_url = %ws_url,
         served_by = continuous.served_by,
@@ -565,6 +572,12 @@ async fn run_continuous_ingestion(
     // sender.closed() path fires before we await its handle.
     drop(rx);
     let _ = driver_handle.await;
+
+    // The probe loop is an infinite `loop { sleep }` with no
+    // shutdown signal, so abort it explicitly. Without this the
+    // task would keep firing every health_probe_interval until
+    // process exit.
+    health_handle.abort();
 
     info!(processed, "continuous ingestion loop done");
     Ok(())
