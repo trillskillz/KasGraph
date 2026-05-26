@@ -1,0 +1,16 @@
+[package]
+name = "kasgraph-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "KasStream — Substreams-style real-time streaming primitive for KasGraph. Block-by-block event delivery over gRPC with backpressure."
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

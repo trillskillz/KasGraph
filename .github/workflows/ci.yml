@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: npm install
+      - name: TypeScript typecheck
+        run: npm run typecheck
+      - name: Vitest
+        run: npm test
+      - name: Cargo build (workspace)
+        run: cargo build --workspace --all-targets
+      - name: Cargo test (workspace)
+        run: cargo test --workspace

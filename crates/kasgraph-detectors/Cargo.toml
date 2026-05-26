@@ -1,0 +1,15 @@
+[package]
+name = "kasgraph-detectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Built-in pattern detectors for KasGraph: OpenSilver covenant patterns, native KRC-20 / KCC20, KRC-721 NFTs, KasBonds."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true

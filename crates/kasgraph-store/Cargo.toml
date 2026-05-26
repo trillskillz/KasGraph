@@ -1,0 +1,16 @@
+[package]
+name = "kasgraph-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Postgres adapter for KasGraph. Per-subgraph schemas, materialized views, POI checkpoints."
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sqlx.workspace = true

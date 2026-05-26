@@ -1,0 +1,14 @@
+[package]
+name = "kasgraph-mapping"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "WASM mapping runtime for KasGraph subgraphs. TypeScript/AssemblyScript mappings compile to WASM and execute deterministically per block."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

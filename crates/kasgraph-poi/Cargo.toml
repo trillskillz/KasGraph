@@ -1,0 +1,14 @@
+[package]
+name = "kasgraph-poi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Proof-of-indexing for KasGraph. Per-block hash of indexed state. Foundation for future decentralization."
+
+[dependencies]
+blake2.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true

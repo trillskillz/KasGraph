@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kasgraph-node",
+    "crates/kasgraph-store",
+    "crates/kasgraph-mapping",
+    "crates/kasgraph-rpc",
+    "crates/kasgraph-detectors",
+    "crates/kasgraph-poi",
+    "crates/kasgraph-stream",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/trillskillz/KasGraph"
+authors = ["KasGraph contributors"]
+rust-version = "1.78"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+futures = "0.3"
+
+# Serde stack
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Hex / bytes
+hex = "0.4"
+bytes = "1"
+
+# Postgres
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "chrono", "uuid", "json"] }
+
+# RPC / WebSocket
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.24"
+
+# Hashing (blake2 for POI; matches kaspa engine choice)
+blake2 = "0.10"
+
+# Internal crates
+kasgraph-rpc = { path = "crates/kasgraph-rpc" }
+kasgraph-store = { path = "crates/kasgraph-store" }
+kasgraph-detectors = { path = "crates/kasgraph-detectors" }
+kasgraph-mapping = { path = "crates/kasgraph-mapping" }
+kasgraph-poi = { path = "crates/kasgraph-poi" }
+kasgraph-stream = { path = "crates/kasgraph-stream" }

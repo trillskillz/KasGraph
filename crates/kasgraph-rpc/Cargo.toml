@@ -1,0 +1,18 @@
+[package]
+name = "kasgraph-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Multi-RPC client with failover for KasGraph. Subscribes to Rusty Kaspa nodes, handles BlockDAG reorgs, and surfaces KIP-20 covenant context."
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true

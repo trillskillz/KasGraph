@@ -1,0 +1,29 @@
+{
+  "name": "kasgraph",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "KasGraph monorepo. Subgraph-style indexing for Kaspa with GraphQL + MCP + KasStream.",
+  "packageManager": "npm@10.9.2",
+  "workspaces": [
+    "sdk",
+    "cli",
+    "api",
+    "mcp"
+  ],
+  "scripts": {
+    "build": "tsc -b sdk cli api mcp",
+    "build:rust": "cargo build --workspace",
+    "clean": "rm -rf sdk/dist cli/dist api/dist mcp/dist target",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:rust": "cargo test --workspace",
+    "typecheck": "tsc -b sdk cli api mcp",
+    "verify": "npm run typecheck && npm run test && npm run test:rust"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

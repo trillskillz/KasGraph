@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+target/
+coverage/
+.cache/
+.DS_Store
+.env
+.env.local
+*.log
+*.tsbuildinfo
+.firecrawl/
