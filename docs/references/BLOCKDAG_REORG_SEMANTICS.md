@@ -92,8 +92,8 @@ Gap recovery is intentionally bounded — by default, recovery covers at most `K
 | Probabilistic buffering | Yes — `IngestionState::probabilistic` BTreeMap keyed on DAA score. |
 | Promotion on finality | Yes — `BlockAdded { is_finalized: true }` flushes the probabilistic prefix. |
 | Probabilistic conflict rollback | Yes — `remove_probabilistic_by_hashes` + `remove_probabilistic_in_range`. |
-| Committed-state SQL unwind | **Not yet** — logged and ignored; the schema columns to support it land alongside the unwind migration. |
-| POI re-anchoring after unwind | **Not yet** — requires committed-state unwind to be live first. |
+| Committed-state SQL unwind | Yes — `Store::unwind_committed_blocks_for_subgraph` deletes the matching `kasgraph_poi` + `kasgraph_rpc_block_audit` + `kasgraph_committed_block` rows inside one SQL transaction and writes a `kasgraph_reorg_audit` row recording the operation. `IngestionState` surfaces `committed_unwinds` from `VirtualChainChanged.removed_chain_block_hashes`. |
+| POI re-anchoring after unwind | **Partial** — the deleted POI rows leave the prior-survivor checkpoint as the natural resume anchor, but `IngestionState.prior_poi` is not yet re-seeded from that survivor row. The next jump is to look up the highest-DAA surviving POI on startup / after-unwind and restore `prior_poi` from it so replay produces the same hash chain as a fresh from-genesis run. |
 | Recovery range request | Yes — `RecoveryRequired` is produced, env-driven replay hashes are honoured. |
 | Continuous wRPC subscription | **Bootstrap only** — subscribe + initial read loop; the long-lived loop lands next. |
 

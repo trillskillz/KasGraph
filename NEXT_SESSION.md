@@ -2,6 +2,15 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
 
+## Latest commit arc (2026-05-26 — committed-state unwind)
+
+- New migration `20260526150000_committed_unwind.sql` adds `kasgraph_committed_block` (per-subgraph hash → daa/served_by index) and `kasgraph_reorg_audit` (per-unwind record with removed-hash array, reason, timing).
+- `Store::record_committed_block` and `Store::unwind_committed_blocks_for_subgraph` land. Unwind runs in one SQL transaction: lookup committed rows → delete matching POI + audit + committed-block rows → insert reorg audit row → return `CommittedUnwindReport { removed_hashes, audit_id }`.
+- `IngestionState` gains `remove_committed_by_hashes` and surfaces `committed_unwinds: Vec<BootstrapBlock>` on the transition struct. `kasgraph-node` calls the Store unwind whenever the transition reports any.
+- Node persistence loop now also writes `kasgraph_committed_block` rows alongside POI + audit so the unwind has something to delete.
+- Two new node-side tests: `virtual_chain_changed_surfaces_committed_unwinds_for_committed_removals` and `block_added_notification_does_not_emit_committed_unwinds`. Migrator test updated to expect 2 migrations.
+- `BLOCKDAG_REORG_SEMANTICS.md` "what the scaffold does" table updated.
+
 ## Current state (2026-05-26)
 
 - Workspace scaffold landed (cargo + npm workspaces, CI, vitest).
@@ -39,8 +48,8 @@ What still needs to land:
 
 - Continuous real wRPC subscription input instead of the current bootstrap/read-into-Vec pass.
 - Validate actual transport framing / subscribe acknowledgement payloads against a real Kaspa node if the live wire format differs from the current JSON assumption.
-- Missed-event recovery around actual subscription gaps.
-- True replay-safe removal of already-committed blocks when deeper reorg support is implemented.
+- Missed-event recovery around actual subscription gaps (current recovery is env-driven only).
+- POI re-anchor on resume: after an unwind, look up the highest-DAA surviving POI and restore `IngestionState.prior_poi` so replay produces the same hash chain as a from-genesis run. The unwind itself now lands; the resume seeding does not.
 - A continuous fetched-block/subscription loop instead of the current JSONL/env-driven pass.
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration

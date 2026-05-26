@@ -104,6 +104,30 @@ pub struct RpcBlockAuditRecord {
     pub served_by: String,
 }
 
+/// A committed block written into a subgraph's POI/audit history.
+/// Recorded so that a later removed-chain notification can find and
+/// delete the right rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedBlockRecord {
+    pub subgraph: SubgraphId,
+    pub block_hash: String,
+    pub daa_score: i64,
+    pub served_by: String,
+}
+
+/// Summary of one `unwind_committed_blocks_for_subgraph` call —
+/// what was actually deleted and the audit row id that recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedUnwindReport {
+    /// Hashes that existed in `kasgraph_committed_block` and were
+    /// deleted. May be shorter than the requested list if some
+    /// hashes were never committed.
+    pub removed_hashes: Vec<String>,
+    /// `kasgraph_reorg_audit.id` of the row that records this
+    /// unwind.
+    pub audit_id: i64,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -244,6 +268,131 @@ impl Store {
 
         Ok(())
     }
+
+    /// Record that `block_hash` was committed for `subgraph`. Calls
+    /// to `unwind_committed_blocks_for_subgraph` use this table to
+    /// find what to delete.
+    pub async fn record_committed_block(
+        &self,
+        record: &CommittedBlockRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO kasgraph_committed_block \
+             (subgraph, block_hash, daa_score, served_by) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (subgraph, block_hash) DO UPDATE SET \
+                 daa_score = EXCLUDED.daa_score, \
+                 served_by = EXCLUDED.served_by",
+        )
+        .bind(record.subgraph.schema_name())
+        .bind(&record.block_hash)
+        .bind(record.daa_score)
+        .bind(&record.served_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Roll back committed state for the listed block hashes, in a
+    /// single SQL transaction. The order inside the transaction
+    /// matches the BlockDAG reorg semantics doc:
+    ///   1. Resolve which of the listed hashes are actually
+    ///      committed for this subgraph (skip any that aren't).
+    ///   2. Sort by `daa_score DESC` so deletion proceeds from the
+    ///      newest block backwards.
+    ///   3. Delete matching `kasgraph_poi` rows, then matching
+    ///      `kasgraph_rpc_block_audit` rows, then the
+    ///      `kasgraph_committed_block` rows themselves.
+    ///   4. Insert a `kasgraph_reorg_audit` row recording the
+    ///      hashes removed, the highest deleted DAA, the reason
+    ///      string, and the wall-clock start/finish times.
+    ///
+    /// Returns a [`CommittedUnwindReport`] describing what actually
+    /// changed.
+    pub async fn unwind_committed_blocks_for_subgraph(
+        &self,
+        subgraph: &SubgraphId,
+        block_hashes: &[String],
+        reason: &str,
+    ) -> Result<CommittedUnwindReport, StoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT block_hash, daa_score FROM kasgraph_committed_block \
+             WHERE subgraph = $1 AND block_hash = ANY($2) \
+             ORDER BY daa_score DESC",
+        )
+        .bind(subgraph.schema_name())
+        .bind(block_hashes)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        let removed_hashes: Vec<String> = rows.iter().map(|(h, _)| h.clone()).collect();
+        let removed_daa_scores: Vec<i64> = rows.iter().map(|(_, d)| *d).collect();
+        let at_daa = removed_daa_scores.iter().copied().max().unwrap_or(0);
+
+        if !removed_hashes.is_empty() {
+            sqlx::query(
+                "DELETE FROM kasgraph_poi \
+                 WHERE subgraph = $1 AND block_daa_score = ANY($2)",
+            )
+            .bind(subgraph.schema_name())
+            .bind(&removed_daa_scores)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+            sqlx::query(
+                "DELETE FROM kasgraph_rpc_block_audit \
+                 WHERE block_hash = ANY($1)",
+            )
+            .bind(&removed_hashes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+            sqlx::query(
+                "DELETE FROM kasgraph_committed_block \
+                 WHERE subgraph = $1 AND block_hash = ANY($2)",
+            )
+            .bind(subgraph.schema_name())
+            .bind(&removed_hashes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+        }
+
+        let audit_id: (i64,) = sqlx::query_as(
+            "INSERT INTO kasgraph_reorg_audit \
+             (subgraph, at_daa, removed_hashes, removed_count, reason, unwind_finished_at) \
+             VALUES ($1, $2, $3, $4, $5, NOW()) \
+             RETURNING id",
+        )
+        .bind(subgraph.schema_name())
+        .bind(at_daa)
+        .bind(&removed_hashes)
+        .bind(removed_hashes.len() as i32)
+        .bind(reason)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(CommittedUnwindReport {
+            removed_hashes,
+            audit_id: audit_id.0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -273,9 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn migrator_embeds_first_schema_slice() {
+    fn migrator_embeds_both_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.len(), 2);
         assert_eq!(migrations[0].version, 20260526110500);
+        assert_eq!(migrations[1].version, 20260526150000);
     }
 }

@@ -30,7 +30,9 @@ use kasgraph_rpc::{
     ChainNotification, IngestedBlock, MultiRpcClient, RpcClientConfig, RpcEndpoint,
     parse_notifications_jsonl,
 };
-use kasgraph_store::{PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId};
+use kasgraph_store::{
+    CommittedBlockRecord, PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId,
+};
 use tracing::{info, warn};
 
 const DEFAULT_SUBGRAPH: &str = "kasgraph_scaffold";
@@ -103,6 +105,11 @@ struct IngestionState {
 struct IngestionTransition {
     committed_writes: Vec<CommittedBlockWrite>,
     rolled_back_probabilistic: Vec<BootstrapBlock>,
+    /// Hashes that arrived in a `VirtualChainChanged.removed_chain_block_hashes`
+    /// list and matched a previously-committed block. The persistence
+    /// layer must call `Store::unwind_committed_blocks_for_subgraph`
+    /// with this list so POI + audit rows are deleted.
+    committed_unwinds: Vec<BootstrapBlock>,
     recovery_requested: Option<(u64, u64)>,
 }
 
@@ -255,6 +262,29 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
             );
         }
 
+        if !transition.committed_unwinds.is_empty() {
+            let unwound_hashes: Vec<String> = transition
+                .committed_unwinds
+                .iter()
+                .map(|b| b.hash.clone())
+                .collect();
+            let report = store
+                .unwind_committed_blocks_for_subgraph(
+                    &subgraph,
+                    &unwound_hashes,
+                    "virtualChainChanged removed_chain_block_hashes",
+                )
+                .await
+                .context("unwinding committed blocks for reorg")?;
+            warn!(
+                subgraph = subgraph.schema_name(),
+                requested = unwound_hashes.len(),
+                removed = report.removed_hashes.len(),
+                audit_id = report.audit_id,
+                "committed-state unwind applied"
+            );
+        }
+
         if let Some((from_daa, to_daa)) = transition.recovery_requested {
             info!(from_daa, to_daa, "recovery requested by ingestion state");
         }
@@ -271,6 +301,13 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 served_by: committed.block.served_by.clone(),
             };
 
+            let committed_record = CommittedBlockRecord {
+                subgraph: subgraph.clone(),
+                block_hash: committed.block.hash.clone(),
+                daa_score: committed.block.daa_score,
+                served_by: committed.block.served_by.clone(),
+            };
+
             store
                 .insert_poi_checkpoint(&checkpoint)
                 .await
@@ -279,6 +316,10 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 .insert_rpc_block_audit(&audit)
                 .await
                 .context("writing RPC audit record")?;
+            store
+                .record_committed_block(&committed_record)
+                .await
+                .context("recording committed block for reorg-tracking")?;
 
             info!(
                 subgraph = subgraph.schema_name(),
@@ -429,6 +470,7 @@ impl IngestionState {
                 added_chain_blocks,
             } => {
                 let mut rolled_back_probabilistic = self.remove_probabilistic_by_hashes(&removed_chain_block_hashes);
+                let committed_unwinds = self.remove_committed_by_hashes(&removed_chain_block_hashes);
                 let mut committed_writes = Vec::new();
 
                 for block in added_chain_blocks {
@@ -440,6 +482,7 @@ impl IngestionState {
                 Ok(IngestionTransition {
                     committed_writes,
                     rolled_back_probabilistic,
+                    committed_unwinds,
                     recovery_requested: None,
                 })
             }
@@ -455,6 +498,7 @@ impl IngestionState {
                 Ok(IngestionTransition {
                     committed_writes: Vec::new(),
                     rolled_back_probabilistic,
+                    committed_unwinds: Vec::new(),
                     recovery_requested: Some((from_daa_score, to_daa_score)),
                 })
             }
@@ -469,6 +513,7 @@ impl IngestionState {
                 return Ok(IngestionTransition {
                     committed_writes: Vec::new(),
                     rolled_back_probabilistic,
+                    committed_unwinds: Vec::new(),
                     recovery_requested: None,
                 });
             }
@@ -477,11 +522,12 @@ impl IngestionState {
                 existing_hash = existing.hash,
                 incoming_hash = block.hash,
                 daa_score = block.daa_score,
-                "conflict against committed block detected; ignoring incoming block until deeper reorg support lands"
+                "conflict against committed block detected; ignoring incoming block — explicit VirtualChainChanged.removed_chain_block_hashes drives committed-state unwind"
             );
             return Ok(IngestionTransition {
                 committed_writes: Vec::new(),
                 rolled_back_probabilistic,
+                committed_unwinds: Vec::new(),
                 recovery_requested: None,
             });
         }
@@ -502,6 +548,7 @@ impl IngestionState {
             return Ok(IngestionTransition {
                 committed_writes: Vec::new(),
                 rolled_back_probabilistic,
+                committed_unwinds: Vec::new(),
                 recovery_requested: None,
             });
         }
@@ -531,8 +578,24 @@ impl IngestionState {
         Ok(IngestionTransition {
             committed_writes,
             rolled_back_probabilistic,
+            committed_unwinds: Vec::new(),
             recovery_requested: None,
         })
+    }
+
+    fn remove_committed_by_hashes(&mut self, hashes: &[String]) -> Vec<BootstrapBlock> {
+        let mut removed = Vec::new();
+        let matching_scores: Vec<i64> = self
+            .committed
+            .iter()
+            .filter_map(|(score, block)| hashes.contains(&block.hash).then_some(*score))
+            .collect();
+        for score in matching_scores {
+            if let Some(block) = self.committed.remove(&score) {
+                removed.push(block);
+            }
+        }
+        removed
     }
 
     fn remove_probabilistic_by_hashes(&mut self, hashes: &[String]) -> Vec<BootstrapBlock> {
@@ -704,6 +767,49 @@ mod tests {
         assert_eq!(transition.rolled_back_probabilistic.len(), 2);
         assert_eq!(transition.recovery_requested, Some((6, 7)));
         assert!(state.probabilistic.values().any(|block| block.hash == "a"));
+    }
+
+    #[test]
+    fn virtual_chain_changed_surfaces_committed_unwinds_for_committed_removals() {
+        let mut state = IngestionState::default();
+        state.apply_block(block("committed-a", 100, true)).unwrap();
+        state.apply_block(block("committed-b", 101, true)).unwrap();
+        state.apply_block(block("probabilistic-c", 102, false)).unwrap();
+        assert_eq!(state.committed.len(), 2);
+
+        let transition = state
+            .apply_notification(ChainNotification::VirtualChainChanged {
+                removed_chain_block_hashes: vec![
+                    "committed-a".to_owned(),
+                    "probabilistic-c".to_owned(),
+                    "never-seen".to_owned(),
+                ],
+                added_chain_blocks: Vec::new(),
+            })
+            .unwrap();
+
+        let unwound_hashes: Vec<&str> = transition
+            .committed_unwinds
+            .iter()
+            .map(|b| b.hash.as_str())
+            .collect();
+        assert_eq!(unwound_hashes, vec!["committed-a"]);
+        assert_eq!(transition.rolled_back_probabilistic.len(), 1);
+        assert_eq!(transition.rolled_back_probabilistic[0].hash, "probabilistic-c");
+        assert!(!state.committed.contains_key(&100));
+        assert!(state.committed.contains_key(&101));
+    }
+
+    #[test]
+    fn block_added_notification_does_not_emit_committed_unwinds() {
+        let mut state = IngestionState::default();
+        let transition = state
+            .apply_notification(ChainNotification::BlockAdded(block_to_rpc(&block(
+                "x", 1, true,
+            ))))
+            .unwrap();
+        assert!(transition.committed_unwinds.is_empty());
+        assert_eq!(transition.committed_writes.len(), 1);
     }
 
     #[test]
