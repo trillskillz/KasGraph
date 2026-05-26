@@ -127,6 +127,15 @@ struct ContinuousConfig {
     backoff_max_ms: u64,
     backoff_multiplier: f64,
     backoff_max_attempts: u32,
+    /// Hashes to feed into `recover_blocks_by_hashes` when the
+    /// continuous driver announces a runtime gap via a synthetic
+    /// `RecoveryRequired`. Empty (default) means gaps are logged
+    /// but no blocks are actively re-fetched — operators set
+    /// `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` to a comma-separated
+    /// list when they want best-effort recovery. Distinct from
+    /// `KASGRAPH_RECOVERY_BLOCK_HASHES`, which only drives the
+    /// one-shot bootstrap replay path.
+    gap_recovery_block_hashes: Vec<String>,
 }
 
 impl Default for ContinuousConfig {
@@ -140,6 +149,7 @@ impl Default for ContinuousConfig {
             backoff_max_ms: 30_000,
             backoff_multiplier: 2.0,
             backoff_max_attempts: 0,
+            gap_recovery_block_hashes: Vec::new(),
         }
     }
 }
@@ -280,6 +290,10 @@ impl NodeConfig {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0),
+                gap_recovery_block_hashes: env::var("KASGRAPH_GAP_RECOVERY_BLOCK_HASHES")
+                    .ok()
+                    .map(|value| parse_csv_env(&value))
+                    .unwrap_or_default(),
             },
             bootstrap_block: BootstrapBlock {
                 hash: env::var("KASGRAPH_BOOTSTRAP_BLOCK_HASH")
@@ -370,8 +384,13 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         IngestMode::Bootstrap => {
             let notifications = build_notifications(config, rpc_client.as_ref()).await?;
             for notification in notifications {
-                apply_and_persist_notification(&store, &subgraph, &mut ingestion, notification)
-                    .await?;
+                let _ = apply_and_persist_notification(
+                    &store,
+                    &subgraph,
+                    &mut ingestion,
+                    notification,
+                )
+                .await?;
             }
             info!(
                 committed_blocks = ingestion.committed.len(),
@@ -478,8 +497,59 @@ async fn run_continuous_ingestion(
             break;
         };
 
-        apply_and_persist_notification(store, subgraph, ingestion, notification).await?;
+        let outcome =
+            apply_and_persist_notification(store, subgraph, ingestion, notification).await?;
         processed = processed.saturating_add(1);
+
+        // Active gap recovery: when the driver-synthesized
+        // RecoveryRequired propagates through ingestion, try to
+        // fetch the missed blocks if operator has configured a
+        // hash list. The result is fed back through the same
+        // helper once — we explicitly do not loop on a second
+        // RecoveryRequired to avoid recovery storms.
+        if let Some((from_daa, to_daa)) = outcome.recovery_requested {
+            if !continuous.gap_recovery_block_hashes.is_empty() {
+                match driver_client
+                    .recover_blocks_by_hashes(
+                        &continuous.gap_recovery_block_hashes,
+                        from_daa,
+                        to_daa,
+                    )
+                    .await
+                {
+                    Ok(recovery_notification) => {
+                        let recovered =
+                            apply_and_persist_notification(
+                                store,
+                                subgraph,
+                                ingestion,
+                                recovery_notification,
+                            )
+                            .await?;
+                        info!(
+                            from_daa,
+                            to_daa,
+                            committed = recovered.committed_count,
+                            "active gap recovery applied"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            from_daa,
+                            to_daa,
+                            error = %err,
+                            "active gap recovery failed; continuing live tail"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    from_daa,
+                    to_daa,
+                    "gap announced but KASGRAPH_GAP_RECOVERY_BLOCK_HASHES is empty; skipping active recovery"
+                );
+            }
+        }
 
         if continuous.max_messages != 0 && processed >= continuous.max_messages {
             info!(
@@ -500,6 +570,19 @@ async fn run_continuous_ingestion(
     Ok(())
 }
 
+/// What a single `apply_and_persist_notification` call did, so the
+/// caller can react (active gap recovery for the continuous loop,
+/// logging for the bootstrap loop, …).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NotificationOutcome {
+    /// `Some(from, to)` when the notification was a
+    /// `RecoveryRequired` — the continuous loop fetches missing
+    /// blocks for this range when configured to.
+    recovery_requested: Option<(u64, u64)>,
+    /// Number of committed-block writes persisted in this call.
+    committed_count: usize,
+}
+
 /// Apply one ChainNotification to the ingestion state and persist
 /// every side-effect. Called from both the bootstrap-pass loop and
 /// the continuous wRPC loop so they cannot drift in behaviour.
@@ -508,7 +591,7 @@ async fn apply_and_persist_notification(
     subgraph: &SubgraphId,
     ingestion: &mut IngestionState,
     notification: ChainNotification,
-) -> Result<()> {
+) -> Result<NotificationOutcome> {
     let transition = ingestion
         .apply_notification(notification)
         .context("applying ingestion notification")?;
@@ -565,11 +648,14 @@ async fn apply_and_persist_notification(
         );
     }
 
-    if let Some((from_daa, to_daa)) = transition.recovery_requested {
+    let recovery_requested = transition.recovery_requested;
+    if let Some((from_daa, to_daa)) = recovery_requested {
         info!(from_daa, to_daa, "recovery requested by ingestion state");
     }
 
+    let mut committed_count: usize = 0;
     for committed in transition.committed_writes {
+        committed_count = committed_count.saturating_add(1);
         let checkpoint = PoiCheckpoint {
             subgraph: subgraph.clone(),
             block_daa_score: committed.block.daa_score,
@@ -611,7 +697,10 @@ async fn apply_and_persist_notification(
         );
     }
 
-    Ok(())
+    Ok(NotificationOutcome {
+        recovery_requested,
+        committed_count,
+    })
 }
 
 async fn build_notifications(
@@ -1221,6 +1310,17 @@ mod tests {
         assert_eq!(c.backoff_max_ms, 30_000);
         assert_eq!(c.backoff_multiplier, 2.0);
         assert_eq!(c.backoff_max_attempts, 0);
+        assert!(
+            c.gap_recovery_block_hashes.is_empty(),
+            "gap recovery defaults to off; operator opts in via env"
+        );
+    }
+
+    #[test]
+    fn notification_outcome_default_indicates_no_recovery_and_no_writes() {
+        let outcome = NotificationOutcome::default();
+        assert!(outcome.recovery_requested.is_none());
+        assert_eq!(outcome.committed_count, 0);
     }
 
     #[tokio::test]

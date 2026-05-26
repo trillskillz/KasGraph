@@ -87,7 +87,11 @@ Gap recovery is intentionally bounded — by default, recovery covers at most `K
 
 ### Gap detection at reconnect
 
-The continuous wRPC driver tracks the highest DAA score it has forwarded. After every reconnect (transport error *or* clean disconnect — never the initial connect), it primes a one-shot gap check. When the next DAA-bearing notification arrives, if its lowest DAA is more than one beyond the last emitted DAA, the driver synthesizes a `RecoveryRequired { from_daa_score: last + 1, to_daa_score: first - 1, reason: "subscription gap after reconnect…" }` and forwards it on the same channel *before* the actual notification. The downstream `IngestionState` already handles `RecoveryRequired` (rolls back probabilistic blocks in range, surfaces `recovery_requested` on the transition), so missed-event recovery requires no consumer changes. Live block re-fetching for the gap range is the remaining hook on the node side.
+The continuous wRPC driver tracks the highest DAA score it has forwarded. After every reconnect (transport error *or* clean disconnect — never the initial connect), it primes a one-shot gap check. When the next DAA-bearing notification arrives, if its lowest DAA is more than one beyond the last emitted DAA, the driver synthesizes a `RecoveryRequired { from_daa_score: last + 1, to_daa_score: first - 1, reason: "subscription gap after reconnect…" }` and forwards it on the same channel *before* the actual notification. The downstream `IngestionState` already handles `RecoveryRequired` (rolls back probabilistic blocks in range, surfaces `recovery_requested` on the transition).
+
+### Active gap recovery in continuous mode
+
+When `KASGRAPH_INGEST_MODE=continuous` is in effect, `run_continuous_ingestion` examines the `NotificationOutcome` returned from each persist call. If `outcome.recovery_requested` is `Some((from, to))` AND `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` is non-empty AND a `MultiRpcClient` is available, the node calls `recover_blocks_by_hashes(hashes, from, to)`, then re-applies the returned `VirtualChainChanged` through the same persist helper. A second `RecoveryRequired` triggered by the recovery itself is intentionally not chased — one-level recovery prevents recovery storms when the same range keeps faulting. When the hash list is empty, gaps are logged but no blocks are re-fetched (operator opt-in until a real `getBlocks(from_daa..to_daa)` RPC method lands).
 
 ## What the current scaffold does and does not handle
 

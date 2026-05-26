@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — gap-aware recovery on reconnect)
+## Latest commit arc (2026-05-26 — active gap recovery on the consumer side)
+
+- `apply_and_persist_notification` now returns `NotificationOutcome { recovery_requested, committed_count }` so the continuous loop can react to gap announcements.
+- New `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` env (parsed into `ContinuousConfig.gap_recovery_block_hashes`) feeds runtime gap recovery; distinct from the existing `KASGRAPH_RECOVERY_BLOCK_HASHES` which only drives bootstrap replay.
+- When `outcome.recovery_requested` is `Some((from, to))` AND the hash list is non-empty AND a client is available, the loop calls `MultiRpcClient::recover_blocks_by_hashes(hashes, from, to)` and re-applies the resulting `VirtualChainChanged` through the same persist helper. A second-level recovery is intentionally not chased — one-level guard prevents recovery storms.
+- When the hash list is empty, the gap is logged with a clear "skipping active recovery" warning so operators know what to set.
+- Two new node tests: `continuous_config_defaults_match_documented_values` extended to assert gap hashes default empty; `notification_outcome_default_indicates_no_recovery_and_no_writes` pins the outcome shape.
+- 59 tests total. `BLOCKDAG_REORG_SEMANTICS.md` gains an "Active gap recovery in continuous mode" subsection; STATUS.md updated.
+
+## Previous commit arc (2026-05-26 — gap-aware recovery on reconnect)
 
 - New private `DriverState { last_emitted_daa, pending_gap_check }` lives in `run_continuous_subscription` and survives across reconnects.
 - `pending_gap_check` is set after every reconnect (transport error *or* clean disconnect) but never on the initial connect.
@@ -82,7 +91,7 @@ What landed:
 What still needs to land:
 
 - **Live-network validation**: point continuous mode at a real Kaspa wRPC node and confirm the JSON framing assumed by `parse_ws_message` matches the wire format. If the upstream sends bincode or a different envelope shape, extend the parser; the rest of the pipeline does not change.
-- **Active gap recovery on the consumer side**: the driver now *announces* missed-event gaps via synthetic `RecoveryRequired`, and `IngestionState` rolls back probabilistic state in the gap range and surfaces `recovery_requested`. The remaining hook is in `kasgraph-node` — fetch the actual blocks in `(from_daa_score..=to_daa_score)` via `MultiRpcClient::recover_blocks_by_hashes` (or a future `getBlocks` range API) and re-ingest them through `apply_and_persist_notification` before resuming live tailing.
+- **Real DAA-range RPC method**: `MultiRpcClient::fetch_blocks_in_daa_range(from, to)` so active gap recovery does not need an operator-curated hash list. Today the path uses `recover_blocks_by_hashes`, which means operators have to know the missing hashes ahead of time — fine for forensic replay, not for unattended gap recovery.
 - **Periodic health-probe loop** in the long-lived path so endpoint health stays fresh while the wRPC subscription is the only active traffic.
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration
