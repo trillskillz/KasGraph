@@ -85,6 +85,10 @@ A subscription gap can hide both adds and removes. The `RecoveryRequired { from_
 
 Gap recovery is intentionally bounded — by default, recovery covers at most `KASGRAPH_RECOVERY_MAX_BLOCKS` (default 5,000) blocks. A gap larger than that is escalated as a restart-from-pruning-point event rather than handled inline.
 
+### Gap detection at reconnect
+
+The continuous wRPC driver tracks the highest DAA score it has forwarded. After every reconnect (transport error *or* clean disconnect — never the initial connect), it primes a one-shot gap check. When the next DAA-bearing notification arrives, if its lowest DAA is more than one beyond the last emitted DAA, the driver synthesizes a `RecoveryRequired { from_daa_score: last + 1, to_daa_score: first - 1, reason: "subscription gap after reconnect…" }` and forwards it on the same channel *before* the actual notification. The downstream `IngestionState` already handles `RecoveryRequired` (rolls back probabilistic blocks in range, surfaces `recovery_requested` on the transition), so missed-event recovery requires no consumer changes. Live block re-fetching for the gap range is the remaining hook on the node side.
+
 ## What the current scaffold does and does not handle
 
 | Concern | Current behaviour |

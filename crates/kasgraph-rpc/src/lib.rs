@@ -423,6 +423,19 @@ impl Default for SubscriptionBackoff {
     }
 }
 
+/// Per-driver bookkeeping that survives across reconnects so the
+/// continuous loop can detect (and signal) missed-event gaps.
+#[derive(Debug, Default)]
+struct DriverState {
+    /// Highest DAA score the driver has forwarded so far. `None`
+    /// before any DAA-bearing notification has been emitted.
+    last_emitted_daa: Option<u64>,
+    /// `true` immediately after every reconnect (never on the
+    /// initial connect). When set, the next DAA-bearing
+    /// notification triggers a gap check.
+    pending_gap_check: bool,
+}
+
 async fn run_continuous_subscription(
     client: MultiRpcClient,
     url: String,
@@ -432,18 +445,21 @@ async fn run_continuous_subscription(
 ) {
     let mut attempt: u32 = 0;
     let mut delay = backoff.initial_delay;
+    let mut state = DriverState::default();
 
     loop {
         if sender.is_closed() {
             return;
         }
 
-        match run_subscription_once(&client, &url, &served_by, &sender).await {
+        match run_subscription_once(&client, &url, &served_by, &sender, &mut state).await {
             Ok(()) => {
                 attempt = 0;
                 delay = backoff.initial_delay;
+                state.pending_gap_check = true;
                 warn!(
                     url = %url,
+                    last_emitted_daa = state.last_emitted_daa,
                     "wRPC subscription stream ended; reconnecting"
                 );
             }
@@ -458,6 +474,7 @@ async fn run_continuous_subscription(
                     );
                     return;
                 }
+                state.pending_gap_check = true;
                 warn!(
                     url = %url,
                     attempt = attempt,
@@ -473,11 +490,36 @@ async fn run_continuous_subscription(
     }
 }
 
+/// Lowest DAA score across the DAA-bearing payload, or `None` for
+/// notifications that don't carry one (e.g. `RecoveryRequired`).
+fn first_daa_of(notification: &ChainNotification) -> Option<u64> {
+    match notification {
+        ChainNotification::BlockAdded(block) => Some(block.daa_score),
+        ChainNotification::VirtualChainChanged {
+            added_chain_blocks, ..
+        } => added_chain_blocks.iter().map(|b| b.daa_score).min(),
+        ChainNotification::RecoveryRequired { .. } => None,
+    }
+}
+
+/// Highest DAA score across the DAA-bearing payload, or `None` for
+/// notifications that don't carry one.
+fn max_daa_of(notification: &ChainNotification) -> Option<u64> {
+    match notification {
+        ChainNotification::BlockAdded(block) => Some(block.daa_score),
+        ChainNotification::VirtualChainChanged {
+            added_chain_blocks, ..
+        } => added_chain_blocks.iter().map(|b| b.daa_score).max(),
+        ChainNotification::RecoveryRequired { .. } => None,
+    }
+}
+
 async fn run_subscription_once(
     client: &MultiRpcClient,
     url: &str,
     served_by: &str,
     sender: &mpsc::Sender<ChainNotification>,
+    state: &mut DriverState,
 ) -> Result<(), RpcError> {
     let (stream, _) = connect_async(url)
         .await
@@ -513,6 +555,44 @@ async fn run_subscription_once(
         };
 
         for notification in notifications {
+            // Gap-aware recovery: after every reconnect, the first
+            // DAA-bearing notification triggers a check. If its
+            // lowest DAA score is more than one beyond what we last
+            // emitted, synthesize a RecoveryRequired covering the
+            // missed range and send it first.
+            if state.pending_gap_check {
+                if let (Some(last), Some(first)) =
+                    (state.last_emitted_daa, first_daa_of(&notification))
+                {
+                    if first > last.saturating_add(1) {
+                        let gap = ChainNotification::RecoveryRequired {
+                            from_daa_score: last.saturating_add(1),
+                            to_daa_score: first.saturating_sub(1),
+                            reason: format!(
+                                "subscription gap after reconnect: last emitted DAA {last}, next observed DAA {first}"
+                            ),
+                        };
+                        if sender.send(gap).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    state.pending_gap_check = false;
+                } else if first_daa_of(&notification).is_some() {
+                    // First DAA-bearing notification ever observed:
+                    // nothing to compare against, just clear the
+                    // flag.
+                    state.pending_gap_check = false;
+                }
+            }
+
+            if let Some(daa) = max_daa_of(&notification) {
+                state.last_emitted_daa = Some(
+                    state
+                        .last_emitted_daa
+                        .map_or(daa, |prev| prev.max(daa)),
+                );
+            }
+
             if sender.send(notification).await.is_err() {
                 // Receiver dropped — caller doesn't want any more.
                 return Ok(());
@@ -1467,6 +1547,158 @@ mod tests {
             })
             .collect();
         assert_eq!(hashes, vec!["block-1", "block-2"]);
+    }
+
+    #[tokio::test]
+    async fn continuous_subscription_emits_recovery_required_when_reconnect_skips_daa() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+
+        // First batch: block at DAA 10. Server closes after the
+        // batch. Second batch (after reconnect): block at DAA 15 —
+        // 4 DAA past the last emitted, so the driver must
+        // synthesize a RecoveryRequired for [11, 14] before
+        // forwarding the BlockAdded.
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-10", "daaScore": 10, "blueScore": 10},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-15", "daaScore": 15, "blueScore": 15},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+        );
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let n = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("channel closed");
+            got.push(n);
+        }
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        match &got[0] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 10),
+            other => panic!("first should be BlockAdded(10), got {other:?}"),
+        }
+        match &got[1] {
+            ChainNotification::RecoveryRequired { from_daa_score, to_daa_score, reason } => {
+                assert_eq!(*from_daa_score, 11);
+                assert_eq!(*to_daa_score, 14);
+                assert!(reason.contains("subscription gap"));
+            }
+            other => panic!("second should be synthetic RecoveryRequired, got {other:?}"),
+        }
+        match &got[2] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 15),
+            other => panic!("third should be BlockAdded(15), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_subscription_does_not_emit_recovery_when_reconnect_is_contiguous() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+
+        // First batch: DAA 10. Second batch (after reconnect): DAA
+        // 11 — exactly one ahead, no gap to fill.
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-10", "daaScore": 10, "blueScore": 10},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-11", "daaScore": 11, "blueScore": 11},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+        );
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let n = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("channel closed");
+            got.push(n);
+        }
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert_eq!(got.len(), 2);
+        for (i, n) in got.iter().enumerate() {
+            match n {
+                ChainNotification::BlockAdded(_) => {}
+                other => panic!("notification {i} should be BlockAdded, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

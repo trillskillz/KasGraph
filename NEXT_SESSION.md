@@ -2,7 +2,17 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — continuous wRPC ingestion wired end-to-end)
+## Latest commit arc (2026-05-26 — gap-aware recovery on reconnect)
+
+- New private `DriverState { last_emitted_daa, pending_gap_check }` lives in `run_continuous_subscription` and survives across reconnects.
+- `pending_gap_check` is set after every reconnect (transport error *or* clean disconnect) but never on the initial connect.
+- When set, the next DAA-bearing notification triggers a check: if its lowest DAA is more than one beyond the last emitted DAA, the driver sends a synthetic `RecoveryRequired { from_daa_score: last + 1, to_daa_score: first - 1, reason: "subscription gap after reconnect…" }` onto the same channel before forwarding the actual notification.
+- `first_daa_of` / `max_daa_of` helpers handle the per-variant payload shape; `RecoveryRequired` carries no DAA and does not advance `last_emitted_daa`.
+- Two new rpc tests: the skip-DAA case emits the synthetic recovery in correct order; the contiguous case emits no synthetic recovery. The receiver-drop, max-attempts, and reconnect-with-contiguous-batch tests all still pass.
+- `BLOCKDAG_REORG_SEMANTICS.md` gains a "Gap detection at reconnect" subsection.
+- 58 tests total. The downstream node `IngestionState` already handles `RecoveryRequired` (rolls back probabilistic in range, surfaces `recovery_requested`), so no consumer changes were needed.
+
+## Previous commit arc (2026-05-26 — continuous wRPC ingestion wired end-to-end)
 
 - The per-notification persist work (apply → unwind → POI re-anchor → POI/audit/committed-block writes) is now a single `apply_and_persist_notification` helper called by both the bootstrap and continuous paths.
 - New `IngestMode { Bootstrap, Continuous }` selected via `KASGRAPH_INGEST_MODE` (defaults to `bootstrap`; unknown values warn and fall back).
@@ -72,7 +82,7 @@ What landed:
 What still needs to land:
 
 - **Live-network validation**: point continuous mode at a real Kaspa wRPC node and confirm the JSON framing assumed by `parse_ws_message` matches the wire format. If the upstream sends bincode or a different envelope shape, extend the parser; the rest of the pipeline does not change.
-- **Missed-event recovery on reconnect gaps**: the continuous loop currently treats every reconnect as a clean resume. Detect DAA-score discontinuity at the boundary and emit a synthetic `RecoveryRequired` notification so the existing recovery path catches the gap.
+- **Active gap recovery on the consumer side**: the driver now *announces* missed-event gaps via synthetic `RecoveryRequired`, and `IngestionState` rolls back probabilistic state in the gap range and surfaces `recovery_requested`. The remaining hook is in `kasgraph-node` — fetch the actual blocks in `(from_daa_score..=to_daa_score)` via `MultiRpcClient::recover_blocks_by_hashes` (or a future `getBlocks` range API) and re-ingest them through `apply_and_persist_notification` before resuming live tailing.
 - **Periodic health-probe loop** in the long-lived path so endpoint health stays fresh while the wRPC subscription is the only active traffic.
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration
