@@ -28,11 +28,12 @@ use anyhow::{Context, Result};
 use kasgraph_poi::{PoiHash, compute_poi, poi_hex};
 use kasgraph_rpc::{
     ChainNotification, IngestedBlock, MultiRpcClient, RpcClientConfig, RpcEndpoint,
-    parse_notifications_jsonl,
+    SubscriptionBackoff, parse_notifications_jsonl,
 };
 use kasgraph_store::{
     CommittedBlockRecord, PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId,
 };
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 const DEFAULT_SUBGRAPH: &str = "kasgraph_scaffold";
@@ -77,7 +78,7 @@ struct NotificationStreamConfig {
     idle_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct NodeConfig {
     database_url: Option<String>,
     subgraph: String,
@@ -86,6 +87,61 @@ struct NodeConfig {
     recovery: RecoveryConfig,
     notification_stream: Option<NotificationStreamConfig>,
     bootstrap_block: BootstrapBlock,
+    ingest_mode: IngestMode,
+    continuous: ContinuousConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestMode {
+    /// Default: one-shot bootstrap pass through configured RPC or
+    /// scaffold notifications, then exit.
+    Bootstrap,
+    /// Long-lived loop: subscribe to the wRPC websocket via
+    /// `MultiRpcClient::spawn_continuous_subscription`, consume
+    /// notifications until either `max_messages` are processed or
+    /// the receiver is shut down by Ctrl-C.
+    Continuous,
+}
+
+impl Default for IngestMode {
+    fn default() -> Self {
+        Self::Bootstrap
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ContinuousConfig {
+    /// Websocket URL the long-lived driver subscribes to.
+    /// `KASGRAPH_NOTIFICATION_WS_URL` is reused so bootstrap and
+    /// continuous modes pick the same source by default.
+    ws_url: Option<String>,
+    served_by: String,
+    /// 0 = run until shutdown signal. Non-zero is mainly for tests
+    /// and bounded smoke runs.
+    max_messages: usize,
+    /// Channel buffer between the wRPC driver and the persistence
+    /// loop. Backpressure: if the loop falls behind, the driver
+    /// awaits before delivering the next notification.
+    channel_capacity: usize,
+    backoff_initial_ms: u64,
+    backoff_max_ms: u64,
+    backoff_multiplier: f64,
+    backoff_max_attempts: u32,
+}
+
+impl Default for ContinuousConfig {
+    fn default() -> Self {
+        Self {
+            ws_url: None,
+            served_by: "wrpc".to_owned(),
+            max_messages: 0,
+            channel_capacity: 64,
+            backoff_initial_ms: 500,
+            backoff_max_ms: 30_000,
+            backoff_multiplier: 2.0,
+            backoff_max_attempts: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +244,43 @@ impl NodeConfig {
                     }),
                 }
             },
+            ingest_mode: match env::var("KASGRAPH_INGEST_MODE").ok().as_deref() {
+                Some("continuous") => IngestMode::Continuous,
+                Some("bootstrap") | None => IngestMode::Bootstrap,
+                Some(other) => {
+                    warn!(value = other, "unknown KASGRAPH_INGEST_MODE; falling back to bootstrap");
+                    IngestMode::Bootstrap
+                }
+            },
+            continuous: ContinuousConfig {
+                ws_url: env::var("KASGRAPH_NOTIFICATION_WS_URL").ok(),
+                served_by: env::var("KASGRAPH_NOTIFICATION_SOURCE_LABEL")
+                    .unwrap_or_else(|_| "wrpc".to_owned()),
+                max_messages: env::var("KASGRAPH_CONTINUOUS_MAX_MESSAGES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+                channel_capacity: env::var("KASGRAPH_CONTINUOUS_CHANNEL_CAPACITY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(64),
+                backoff_initial_ms: env::var("KASGRAPH_CONTINUOUS_BACKOFF_INITIAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(500),
+                backoff_max_ms: env::var("KASGRAPH_CONTINUOUS_BACKOFF_MAX_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30_000),
+                backoff_multiplier: env::var("KASGRAPH_CONTINUOUS_BACKOFF_MULTIPLIER")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2.0),
+                backoff_max_attempts: env::var("KASGRAPH_CONTINUOUS_BACKOFF_MAX_ATTEMPTS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            },
             bootstrap_block: BootstrapBlock {
                 hash: env::var("KASGRAPH_BOOTSTRAP_BLOCK_HASH")
                     .unwrap_or_else(|_| DEFAULT_BLOCK_HASH.to_owned()),
@@ -257,7 +350,6 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         .with_context(|| format!("ensuring schema {} exists", subgraph.schema_name()))?;
 
     let rpc_client = config.rpc.as_ref().map(build_rpc_client);
-    let notifications = build_notifications(config, rpc_client.as_ref()).await?;
     let mut ingestion = IngestionState::default();
 
     if let Some(checkpoint) = store
@@ -274,116 +366,250 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         );
     }
 
-    for notification in notifications {
-        let transition = ingestion
-            .apply_notification(notification)
-            .context("applying ingestion notification")?;
-
-        for rolled_back in transition.rolled_back_probabilistic {
-            warn!(
-                block_hash = rolled_back.hash,
-                daa_score = rolled_back.daa_score,
-                "rolled back probabilistic block before replay"
-            );
-        }
-
-        if !transition.committed_unwinds.is_empty() {
-            let unwound_hashes: Vec<String> = transition
-                .committed_unwinds
-                .iter()
-                .map(|b| b.hash.clone())
-                .collect();
-            let report = store
-                .unwind_committed_blocks_for_subgraph(
-                    &subgraph,
-                    &unwound_hashes,
-                    "virtualChainChanged removed_chain_block_hashes",
-                )
-                .await
-                .context("unwinding committed blocks for reorg")?;
-            warn!(
-                subgraph = subgraph.schema_name(),
-                requested = unwound_hashes.len(),
-                removed = report.removed_hashes.len(),
-                audit_id = report.audit_id,
-                "committed-state unwind applied"
-            );
-
-            // POI re-anchor: after deleting the unwound POI rows,
-            // load the new highest-DAA survivor and re-seed the
-            // in-memory hash chain. If nothing survives, reset to
-            // the zero seed so the next committed block restarts
-            // from genesis-style chaining.
-            let post_unwind = store
-                .latest_poi_for_subgraph(&subgraph)
-                .await
-                .context("loading latest POI after unwind")?;
-            let reseed = post_unwind
-                .as_ref()
-                .map(|cp| cp.poi_hash)
-                .unwrap_or_default();
-            ingestion.reseed_prior_poi(reseed);
+    match config.ingest_mode {
+        IngestMode::Bootstrap => {
+            let notifications = build_notifications(config, rpc_client.as_ref()).await?;
+            for notification in notifications {
+                apply_and_persist_notification(&store, &subgraph, &mut ingestion, notification)
+                    .await?;
+            }
             info!(
-                subgraph = subgraph.schema_name(),
-                resumed_from_daa = post_unwind.as_ref().map(|cp| cp.block_daa_score),
-                prior_poi = poi_hex(&reseed),
-                "re-anchored ingestion POI chain after unwind"
+                committed_blocks = ingestion.committed.len(),
+                probabilistic_blocks = ingestion.probabilistic.len(),
+                "ingestion pass complete"
             );
         }
-
-        if let Some((from_daa, to_daa)) = transition.recovery_requested {
-            info!(from_daa, to_daa, "recovery requested by ingestion state");
-        }
-
-        for committed in transition.committed_writes {
-            let checkpoint = PoiCheckpoint {
-                subgraph: subgraph.clone(),
-                block_daa_score: committed.block.daa_score,
-                poi_hash: committed.poi_hash,
-            };
-            let audit = RpcBlockAuditRecord {
-                block_hash: committed.block.hash.clone(),
-                daa_score: committed.block.daa_score,
-                served_by: committed.block.served_by.clone(),
-            };
-
-            let committed_record = CommittedBlockRecord {
-                subgraph: subgraph.clone(),
-                block_hash: committed.block.hash.clone(),
-                daa_score: committed.block.daa_score,
-                served_by: committed.block.served_by.clone(),
-            };
-
-            store
-                .insert_poi_checkpoint(&checkpoint)
-                .await
-                .context("writing POI checkpoint")?;
-            store
-                .insert_rpc_block_audit(&audit)
-                .await
-                .context("writing RPC audit record")?;
-            store
-                .record_committed_block(&committed_record)
-                .await
-                .context("recording committed block for reorg-tracking")?;
-
+        IngestMode::Continuous => {
+            run_continuous_ingestion(&store, &subgraph, &mut ingestion, config, rpc_client.as_ref())
+                .await?;
             info!(
-                subgraph = subgraph.schema_name(),
-                block_hash = audit.block_hash,
-                daa_score = checkpoint.block_daa_score,
-                poi = poi_hex(&checkpoint.poi_hash),
-                served_by = audit.served_by,
-                finalized = committed.block.is_finalized,
-                "persisted committed checkpoint"
+                committed_blocks = ingestion.committed.len(),
+                probabilistic_blocks = ingestion.probabilistic.len(),
+                "continuous ingestion exited"
             );
         }
     }
 
-    info!(
-        committed_blocks = ingestion.committed.len(),
-        probabilistic_blocks = ingestion.probabilistic.len(),
-        "ingestion pass complete"
+    Ok(())
+}
+
+/// Continuous-mode preflight check. Pulled out so tests can
+/// exercise it without standing up a Store fixture.
+fn validate_continuous_config(config: &NodeConfig) -> Result<()> {
+    if config.continuous.ws_url.is_none() {
+        anyhow::bail!(
+            "KASGRAPH_INGEST_MODE=continuous requires KASGRAPH_NOTIFICATION_WS_URL"
+        );
+    }
+    Ok(())
+}
+
+/// Long-lived ingestion: subscribe to the wRPC websocket via
+/// `MultiRpcClient::spawn_continuous_subscription`, consume the
+/// resulting `ChainNotification`s, persist each one through the
+/// shared `apply_and_persist_notification` helper. Exits when:
+///   - `KASGRAPH_CONTINUOUS_MAX_MESSAGES` is reached (test / smoke
+///     mode), or
+///   - the OS sends SIGINT (Ctrl-C), or
+///   - the upstream driver exhausts `max_attempts` and closes the
+///     channel from the sender side.
+async fn run_continuous_ingestion(
+    store: &Store,
+    subgraph: &SubgraphId,
+    ingestion: &mut IngestionState,
+    config: &NodeConfig,
+    rpc_client: Option<&MultiRpcClient>,
+) -> Result<()> {
+    validate_continuous_config(config)?;
+    let continuous = &config.continuous;
+    let ws_url = continuous.ws_url.clone().expect("validated above");
+
+    // Reuse the configured MultiRpcClient if one exists (so HTTP
+    // fallback for virtual-chain hash hydration shares health
+    // probes + audit log with the rest of the node). Otherwise
+    // build a single-endpoint client pointing at the ws URL — same
+    // pattern as the bootstrap path.
+    let driver_client = rpc_client.cloned().unwrap_or_else(|| {
+        build_rpc_client(&RpcConfig {
+            primary_url: ws_url.clone(),
+            primary_label: continuous.served_by.clone(),
+            timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
+            health_probe_interval_ms: DEFAULT_HEALTH_PROBE_INTERVAL_MS,
+            backup_urls: Vec::new(),
+        })
+    });
+
+    let backoff = SubscriptionBackoff {
+        initial_delay: Duration::from_millis(continuous.backoff_initial_ms),
+        max_delay: Duration::from_millis(continuous.backoff_max_ms),
+        multiplier: continuous.backoff_multiplier,
+        max_attempts: continuous.backoff_max_attempts,
+    };
+
+    let (tx, mut rx) = mpsc::channel(continuous.channel_capacity.max(1));
+    let driver_handle = driver_client.spawn_continuous_subscription(
+        ws_url.clone(),
+        continuous.served_by.clone(),
+        tx,
+        backoff,
     );
+
+    info!(
+        ws_url = %ws_url,
+        served_by = continuous.served_by,
+        channel_capacity = continuous.channel_capacity,
+        max_messages = continuous.max_messages,
+        "continuous wRPC ingestion started"
+    );
+
+    let mut processed: usize = 0;
+    loop {
+        let maybe_notification = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                info!("received Ctrl-C; shutting down continuous ingestion");
+                break;
+            }
+            next = rx.recv() => next,
+        };
+
+        let Some(notification) = maybe_notification else {
+            warn!("continuous subscription driver closed the channel; exiting ingestion loop");
+            break;
+        };
+
+        apply_and_persist_notification(store, subgraph, ingestion, notification).await?;
+        processed = processed.saturating_add(1);
+
+        if continuous.max_messages != 0 && processed >= continuous.max_messages {
+            info!(
+                processed,
+                max_messages = continuous.max_messages,
+                "reached KASGRAPH_CONTINUOUS_MAX_MESSAGES; exiting ingestion loop"
+            );
+            break;
+        }
+    }
+
+    // Drop the receiver explicitly so the driver's
+    // sender.closed() path fires before we await its handle.
+    drop(rx);
+    let _ = driver_handle.await;
+
+    info!(processed, "continuous ingestion loop done");
+    Ok(())
+}
+
+/// Apply one ChainNotification to the ingestion state and persist
+/// every side-effect. Called from both the bootstrap-pass loop and
+/// the continuous wRPC loop so they cannot drift in behaviour.
+async fn apply_and_persist_notification(
+    store: &Store,
+    subgraph: &SubgraphId,
+    ingestion: &mut IngestionState,
+    notification: ChainNotification,
+) -> Result<()> {
+    let transition = ingestion
+        .apply_notification(notification)
+        .context("applying ingestion notification")?;
+
+    for rolled_back in transition.rolled_back_probabilistic {
+        warn!(
+            block_hash = rolled_back.hash,
+            daa_score = rolled_back.daa_score,
+            "rolled back probabilistic block before replay"
+        );
+    }
+
+    if !transition.committed_unwinds.is_empty() {
+        let unwound_hashes: Vec<String> = transition
+            .committed_unwinds
+            .iter()
+            .map(|b| b.hash.clone())
+            .collect();
+        let report = store
+            .unwind_committed_blocks_for_subgraph(
+                subgraph,
+                &unwound_hashes,
+                "virtualChainChanged removed_chain_block_hashes",
+            )
+            .await
+            .context("unwinding committed blocks for reorg")?;
+        warn!(
+            subgraph = subgraph.schema_name(),
+            requested = unwound_hashes.len(),
+            removed = report.removed_hashes.len(),
+            audit_id = report.audit_id,
+            "committed-state unwind applied"
+        );
+
+        // POI re-anchor: after deleting the unwound POI rows, load
+        // the new highest-DAA survivor and re-seed the in-memory
+        // hash chain. If nothing survives, reset to the zero seed
+        // so the next committed block restarts from genesis-style
+        // chaining.
+        let post_unwind = store
+            .latest_poi_for_subgraph(subgraph)
+            .await
+            .context("loading latest POI after unwind")?;
+        let reseed = post_unwind
+            .as_ref()
+            .map(|cp| cp.poi_hash)
+            .unwrap_or_default();
+        ingestion.reseed_prior_poi(reseed);
+        info!(
+            subgraph = subgraph.schema_name(),
+            resumed_from_daa = post_unwind.as_ref().map(|cp| cp.block_daa_score),
+            prior_poi = poi_hex(&reseed),
+            "re-anchored ingestion POI chain after unwind"
+        );
+    }
+
+    if let Some((from_daa, to_daa)) = transition.recovery_requested {
+        info!(from_daa, to_daa, "recovery requested by ingestion state");
+    }
+
+    for committed in transition.committed_writes {
+        let checkpoint = PoiCheckpoint {
+            subgraph: subgraph.clone(),
+            block_daa_score: committed.block.daa_score,
+            poi_hash: committed.poi_hash,
+        };
+        let audit = RpcBlockAuditRecord {
+            block_hash: committed.block.hash.clone(),
+            daa_score: committed.block.daa_score,
+            served_by: committed.block.served_by.clone(),
+        };
+        let committed_record = CommittedBlockRecord {
+            subgraph: subgraph.clone(),
+            block_hash: committed.block.hash.clone(),
+            daa_score: committed.block.daa_score,
+            served_by: committed.block.served_by.clone(),
+        };
+
+        store
+            .insert_poi_checkpoint(&checkpoint)
+            .await
+            .context("writing POI checkpoint")?;
+        store
+            .insert_rpc_block_audit(&audit)
+            .await
+            .context("writing RPC audit record")?;
+        store
+            .record_committed_block(&committed_record)
+            .await
+            .context("recording committed block for reorg-tracking")?;
+
+        info!(
+            subgraph = subgraph.schema_name(),
+            block_hash = audit.block_hash,
+            daa_score = checkpoint.block_daa_score,
+            poi = poi_hex(&checkpoint.poi_hash),
+            served_by = audit.served_by,
+            finalized = committed.block.is_finalized,
+            "persisted committed checkpoint"
+        );
+    }
 
     Ok(())
 }
@@ -931,10 +1157,17 @@ mod tests {
                 is_finalized: true,
                 canonical_entity_bytes: b"scaffold-entity-state".to_vec(),
             },
+            ingest_mode: IngestMode::default(),
+            continuous: ContinuousConfig::default(),
         };
 
         assert_eq!(config.subgraph, "kasgraph_scaffold");
         assert_eq!(config.bootstrap_block.served_by, "bootstrap");
+        assert_eq!(config.ingest_mode, IngestMode::Bootstrap);
+        assert_eq!(config.continuous.channel_capacity, 64);
+        assert_eq!(config.continuous.backoff_initial_ms, 500);
+        assert_eq!(config.continuous.backoff_max_attempts, 0);
+        assert_eq!(config.continuous.max_messages, 0);
     }
 
     #[test]
@@ -973,6 +1206,62 @@ mod tests {
     }
 
     #[test]
+    fn ingest_mode_defaults_to_bootstrap() {
+        assert_eq!(IngestMode::default(), IngestMode::Bootstrap);
+    }
+
+    #[test]
+    fn continuous_config_defaults_match_documented_values() {
+        let c = ContinuousConfig::default();
+        assert!(c.ws_url.is_none());
+        assert_eq!(c.served_by, "wrpc");
+        assert_eq!(c.max_messages, 0);
+        assert_eq!(c.channel_capacity, 64);
+        assert_eq!(c.backoff_initial_ms, 500);
+        assert_eq!(c.backoff_max_ms, 30_000);
+        assert_eq!(c.backoff_multiplier, 2.0);
+        assert_eq!(c.backoff_max_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn run_continuous_ingestion_fails_without_ws_url() {
+        // We don't have a Store fixture in unit tests, so this only
+        // exercises the early-return validation. The Store is never
+        // touched on the bail path.
+        let store_url = "postgres://localhost/should-not-be-touched";
+        // We use a sentinel store value via a small helper: connect
+        // is async + needs a real PG, so we skip it by checking only
+        // the validation error before that point.
+        let mut config = NodeConfig {
+            database_url: Some(store_url.to_owned()),
+            subgraph: DEFAULT_SUBGRAPH.to_owned(),
+            block_hashes: vec![DEFAULT_BLOCK_HASH.to_owned()],
+            rpc: None,
+            recovery: RecoveryConfig {
+                removed_block_hashes: Vec::new(),
+                recovery_block_hashes: Vec::new(),
+                recovery_range: None,
+            },
+            notification_stream: None,
+            bootstrap_block: block("bootstrap", 1, true),
+            ingest_mode: IngestMode::Continuous,
+            continuous: ContinuousConfig::default(),
+        };
+        config.continuous.ws_url = None;
+
+        // Skip the real store dependency by constructing the
+        // validation through a small helper. The first thing
+        // run_continuous_ingestion does is check for ws_url and
+        // bail.
+        assert!(config.continuous.ws_url.is_none());
+        assert_eq!(config.ingest_mode, IngestMode::Continuous);
+        // Direct call would require a live Store. We assert the
+        // precondition guard via a focused function instead.
+        let validation = validate_continuous_config(&config);
+        assert!(validation.is_err());
+    }
+
+    #[test]
     fn parse_csv_env_discards_empty_entries() {
         assert_eq!(parse_csv_env("a, b, ,c"), vec!["a", "b", "c"]);
     }
@@ -1003,6 +1292,8 @@ mod tests {
                 idle_timeout_ms: 0,
             }),
             bootstrap_block: block("bootstrap", 1, true),
+            ingest_mode: IngestMode::default(),
+            continuous: ContinuousConfig::default(),
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();

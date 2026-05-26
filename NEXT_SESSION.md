@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — continuous wRPC subscription primitive)
+## Latest commit arc (2026-05-26 — continuous wRPC ingestion wired end-to-end)
+
+- The per-notification persist work (apply → unwind → POI re-anchor → POI/audit/committed-block writes) is now a single `apply_and_persist_notification` helper called by both the bootstrap and continuous paths.
+- New `IngestMode { Bootstrap, Continuous }` selected via `KASGRAPH_INGEST_MODE` (defaults to `bootstrap`; unknown values warn and fall back).
+- New `ContinuousConfig` wired from env: `KASGRAPH_NOTIFICATION_WS_URL`, `KASGRAPH_NOTIFICATION_SOURCE_LABEL`, `KASGRAPH_CONTINUOUS_MAX_MESSAGES` (0 = forever), `KASGRAPH_CONTINUOUS_CHANNEL_CAPACITY`, `KASGRAPH_CONTINUOUS_BACKOFF_INITIAL_MS`/`_MAX_MS`/`_MULTIPLIER`/`_MAX_ATTEMPTS`.
+- `run_continuous_ingestion` spawns `MultiRpcClient::spawn_continuous_subscription`, consumes from `mpsc::Receiver` in a `tokio::select!` against `tokio::signal::ctrl_c()`, applies each notification through the shared helper, exits cleanly on Ctrl-C / max-messages / driver channel close, drops the receiver, and awaits the driver handle.
+- Three new node tests cover the IngestMode default, ContinuousConfig defaults, and the missing-ws-url validation bail. The continuous-config preflight is factored into `validate_continuous_config` so tests don't need a live Store.
+- 56 tests total. `BLOCKDAG_REORG_SEMANTICS.md` marks the continuous wRPC subscription as fully landed.
+
+## Previous commit arc (2026-05-26 — continuous wRPC subscription primitive)
 
 - `SubscriptionBackoff { initial_delay, max_delay, multiplier, max_attempts }` config struct (with sensible `Default`).
 - `MultiRpcClient::spawn_continuous_subscription(url, served_by, sender, backoff) -> JoinHandle<()>` runs a long-lived driver that subscribes, parses, and forwards each `ChainNotification` onto an `mpsc::Sender`. Exponential backoff on transport errors; backoff resets on clean disconnect; cooperative shutdown via `tokio::select!` on `sender.closed()` even when blocked on `read.next()`; gives up after `max_attempts` (0 = forever).
@@ -62,9 +71,9 @@ What landed:
 
 What still needs to land:
 
-- **Node-side wiring of the continuous subscription**: replace the bootstrap pass in `kasgraph-node::persist_bootstrap_state` with a streaming consumer (`mpsc::Receiver<ChainNotification>`) driven by `spawn_continuous_subscription`. Behind an env flag (`KASGRAPH_INGEST_MODE=continuous` or similar) so the bootstrap path keeps working for now. POI re-anchor on startup and after unwind are already in place and survive the migration.
-- Validate actual transport framing / subscribe acknowledgement payloads against a real Kaspa node if the live wire format differs from the current JSON assumption.
-- Missed-event recovery anchored to actual subscription gaps (today recovery is env-driven only; the continuous loop should emit `RecoveryRequired` when reconnect detects a DAA-score discontinuity).
+- **Live-network validation**: point continuous mode at a real Kaspa wRPC node and confirm the JSON framing assumed by `parse_ws_message` matches the wire format. If the upstream sends bincode or a different envelope shape, extend the parser; the rest of the pipeline does not change.
+- **Missed-event recovery on reconnect gaps**: the continuous loop currently treats every reconnect as a clean resume. Detect DAA-score discontinuity at the boundary and emit a synthetic `RecoveryRequired` notification so the existing recovery path catches the gap.
+- **Periodic health-probe loop** in the long-lived path so endpoint health stays fresh while the wRPC subscription is the only active traffic.
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration
 
