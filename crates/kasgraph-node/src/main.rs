@@ -31,7 +31,10 @@ use kasgraph_rpc::{
     parse_notifications_jsonl, ChainNotification, IngestedBlock, LiveRpcCapabilities,
     MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
 };
-use kasgraph_store::{CommittedBlockRecord, PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId};
+use kasgraph_store::{
+    CommittedBlockRecord, DetectedPatternRecord, PoiCheckpoint, RpcBlockAuditRecord, Store,
+    SubgraphId,
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -42,7 +45,9 @@ const DEFAULT_PRIMARY_RPC_LABEL: &str = "primary";
 const DEFAULT_RPC_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_HEALTH_PROBE_INTERVAL_MS: u64 = 10_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Eq is intentionally not derived: detector_hits.payload is a
+// serde_json::Value which only implements PartialEq.
+#[derive(Debug, Clone, PartialEq)]
 struct BootstrapBlock {
     hash: String,
     daa_score: i64,
@@ -54,6 +59,11 @@ struct BootstrapBlock {
     /// Empty for synthetic/scaffold blocks that have no real wire
     /// payload. Drives the detector pass on the committed-write path.
     outputs: Vec<kasgraph_rpc::IngestedTransactionOutput>,
+    /// Detector matches computed from `outputs` once, when the
+    /// block leaves `block_from_rpc`. Reused by both the
+    /// canonical-bytes builder (POI input) and the persist loop
+    /// (so detection runs exactly once per block).
+    detector_hits: Vec<kasgraph_detectors::DetectedPattern>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,13 +165,16 @@ impl Default for ContinuousConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Eq dropped transitively because BootstrapBlock.detector_hits
+// holds DetectedPattern whose payload is serde_json::Value
+// (PartialEq only).
+#[derive(Debug, Clone, PartialEq)]
 struct CommittedBlockWrite {
     block: BootstrapBlock,
     poi_hash: PoiHash,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct IngestionState {
     committed: BTreeMap<i64, BootstrapBlock>,
     probabilistic: BTreeMap<i64, BootstrapBlock>,
@@ -179,7 +192,7 @@ impl IngestionState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct IngestionTransition {
     committed_writes: Vec<CommittedBlockWrite>,
     rolled_back_probabilistic: Vec<BootstrapBlock>,
@@ -322,6 +335,7 @@ impl NodeConfig {
                     .map(|value| value.into_bytes())
                     .unwrap_or_else(|_| b"scaffold-entity-state".to_vec()),
                 outputs: Vec::new(),
+                detector_hits: Vec::new(),
             },
         }
     }
@@ -766,16 +780,36 @@ async fn apply_and_persist_notification(
             "persisted committed checkpoint"
         );
 
-        let hits = run_detectors_on_block(&committed.block);
+        // Detector hits were computed once in block_from_rpc and
+        // already contributed to canonical_entity_bytes (and thus
+        // to the POI we just persisted). Re-using them here keeps
+        // detection-cost O(block), not O(2*block).
+        let hits = &committed.block.detector_hits;
         if !hits.is_empty() {
             info!(
                 subgraph = subgraph.schema_name(),
                 block_hash = committed.block.hash,
                 daa_score = committed.block.daa_score,
                 hits = hits.len(),
-                summary = %summarize_detector_hits(&hits),
+                summary = %summarize_detector_hits(hits),
                 "detector hits on committed block"
             );
+            for hit in hits {
+                let record = DetectedPatternRecord {
+                    subgraph: subgraph.clone(),
+                    block_hash: committed.block.hash.clone(),
+                    block_daa_score: committed.block.daa_score,
+                    tx_hash: hit.tx_hash.clone(),
+                    output_index: hit.output_index as i32,
+                    detector_kind: format!("{:?}", hit.kind),
+                    covenant_id: hit.covenant_id.clone(),
+                    payload: hit.payload.clone(),
+                };
+                store
+                    .insert_detected_pattern(&record)
+                    .await
+                    .context("writing detected pattern row")?;
+            }
         }
     }
 
@@ -785,10 +819,11 @@ async fn apply_and_persist_notification(
     })
 }
 
-/// Run every registered detector against every output of `block` and
-/// return the matches. No DB writes yet — entity-row persistence
-/// lands in the next slice. Returns an empty `Vec` for scaffold
-/// blocks that carry no outputs (the synthetic JSONL/bootstrap path).
+/// Run every registered detector against every output of `block`.
+/// Production code reads `block.detector_hits` directly (populated
+/// in `block_from_rpc`); this helper stays for tests that want to
+/// exercise the dispatch without going through the wRPC parse path.
+#[cfg(test)]
 fn run_detectors_on_block(
     block: &BootstrapBlock,
 ) -> Vec<kasgraph_detectors::DetectedPattern> {
@@ -1159,7 +1194,12 @@ impl IngestionState {
 }
 
 fn block_from_rpc(block: IngestedBlock) -> BootstrapBlock {
-    let canonical_entity_bytes = canonical_bytes_for_block(&block);
+    let detector_hits: Vec<kasgraph_detectors::DetectedPattern> = block
+        .outputs
+        .iter()
+        .flat_map(|out| detect_in_output(&out.script_public_key, &out.tx_hash, out.output_index))
+        .collect();
+    let canonical_entity_bytes = canonical_bytes_for_block(&block, &detector_hits);
     BootstrapBlock {
         hash: block.hash.clone(),
         daa_score: block.daa_score as i64,
@@ -1168,6 +1208,7 @@ fn block_from_rpc(block: IngestedBlock) -> BootstrapBlock {
         is_finalized: block.is_finalized,
         canonical_entity_bytes,
         outputs: block.outputs,
+        detector_hits,
     }
 }
 
@@ -1182,12 +1223,70 @@ fn block_to_rpc(block: &BootstrapBlock) -> IngestedBlock {
     }
 }
 
-fn canonical_bytes_for_block(block: &IngestedBlock) -> Vec<u8> {
-    format!(
+/// Canonical state bytes that feed POI for `block`.
+///
+/// Shape: `header || sorted-detector-rows`. The header is the
+/// block's metadata (hash, daa, blue, finalized, served_by). The
+/// detector rows are sorted by `(tx_hash, output_index, kind)` so
+/// the byte stream is invariant under emission order — same chain
+/// → same POI hash. Each row is rendered as
+/// `det:<tx_hash>:<output_index>:<kind>:<covenant_id>:<payload-json>`.
+///
+/// Empty detector lists collapse to just the header, so synthetic
+/// scaffold blocks still produce a stable POI.
+fn canonical_bytes_for_block(
+    block: &IngestedBlock,
+    detector_hits: &[kasgraph_detectors::DetectedPattern],
+) -> Vec<u8> {
+    let mut buffer = format!(
         "hash={}::daa={}::blue={}::finalized={}::served_by={}",
         block.hash, block.daa_score, block.blue_score, block.is_finalized, block.served_by
-    )
-    .into_bytes()
+    );
+
+    let mut rows: Vec<&kasgraph_detectors::DetectedPattern> = detector_hits.iter().collect();
+    rows.sort_by(|a, b| {
+        (a.tx_hash.as_str(), a.output_index, format!("{:?}", a.kind)).cmp(&(
+            b.tx_hash.as_str(),
+            b.output_index,
+            format!("{:?}", b.kind),
+        ))
+    });
+
+    for row in rows {
+        let covenant = row.covenant_id.as_deref().unwrap_or("");
+        // serde_json's Map preserves insertion order; we want the
+        // bytes to be invariant to that, so we re-serialize through
+        // a BTreeMap sort.
+        let payload_canonical = canonicalize_json(&row.payload);
+        buffer.push_str(&format!(
+            "::det:{}:{}:{:?}:{}:{}",
+            row.tx_hash, row.output_index, row.kind, covenant, payload_canonical
+        ));
+    }
+
+    buffer.into_bytes()
+}
+
+/// Render `value` as a string with object keys in sorted order so
+/// canonical_bytes_for_block stays stable across runs regardless of
+/// how the payload was constructed.
+fn canonicalize_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&String, &serde_json::Value> =
+                map.iter().collect();
+            let parts: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| format!("{:?}:{}", k, canonicalize_json(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(canonicalize_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        other => other.to_string(),
+    }
 }
 
 fn parse_csv_env(value: &str) -> Vec<String> {
@@ -1219,6 +1318,7 @@ mod tests {
             is_finalized: finalized,
             canonical_entity_bytes: format!("state-{hash}-{daa_score}").into_bytes(),
             outputs: Vec::new(),
+            detector_hits: Vec::new(),
         }
     }
 
@@ -1525,6 +1625,109 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bytes_change_when_detector_hits_change() {
+        use kasgraph_detectors::DetectedPattern;
+        let block_meta = IngestedBlock {
+            hash: "h".to_owned(),
+            daa_score: 5,
+            blue_score: 5,
+            is_finalized: true,
+            served_by: "wrpc".to_owned(),
+            outputs: Vec::new(),
+        };
+        let hits_a = vec![DetectedPattern {
+            kind: DetectorKind::OpenSilverOwnable,
+            covenant_id: Some("0xabc".to_owned()),
+            tx_hash: "tx-1".to_owned(),
+            output_index: 0,
+            payload: serde_json::json!({"owner": "k1"}),
+        }];
+        let hits_b = vec![DetectedPattern {
+            kind: DetectorKind::KCC20Asset,
+            covenant_id: Some("0xdef".to_owned()),
+            tx_hash: "tx-1".to_owned(),
+            output_index: 0,
+            payload: serde_json::json!({"controller": "k2"}),
+        }];
+
+        let bytes_a = canonical_bytes_for_block(&block_meta, &hits_a);
+        let bytes_b = canonical_bytes_for_block(&block_meta, &hits_b);
+        let bytes_none = canonical_bytes_for_block(&block_meta, &[]);
+
+        assert_ne!(bytes_a, bytes_b, "different hits must change canonical bytes");
+        assert_ne!(bytes_a, bytes_none, "presence of hits must change canonical bytes");
+    }
+
+    #[test]
+    fn canonical_bytes_are_stable_under_hit_reordering() {
+        use kasgraph_detectors::DetectedPattern;
+        let block_meta = IngestedBlock {
+            hash: "h".to_owned(),
+            daa_score: 5,
+            blue_score: 5,
+            is_finalized: true,
+            served_by: "wrpc".to_owned(),
+            outputs: Vec::new(),
+        };
+        let hit_one = DetectedPattern {
+            kind: DetectorKind::OpenSilverOwnable,
+            covenant_id: None,
+            tx_hash: "tx-1".to_owned(),
+            output_index: 0,
+            payload: serde_json::json!({"k": "v"}),
+        };
+        let hit_two = DetectedPattern {
+            kind: DetectorKind::KCC20Asset,
+            covenant_id: None,
+            tx_hash: "tx-2".to_owned(),
+            output_index: 0,
+            payload: serde_json::json!({"k": "v"}),
+        };
+
+        let forward = canonical_bytes_for_block(&block_meta, &[hit_one.clone(), hit_two.clone()]);
+        let reversed = canonical_bytes_for_block(&block_meta, &[hit_two, hit_one]);
+        assert_eq!(forward, reversed, "canonical bytes must not depend on hit order");
+    }
+
+    #[test]
+    fn canonical_bytes_are_stable_under_payload_key_reordering() {
+        use kasgraph_detectors::DetectedPattern;
+        let block_meta = IngestedBlock {
+            hash: "h".to_owned(),
+            daa_score: 5,
+            blue_score: 5,
+            is_finalized: true,
+            served_by: "wrpc".to_owned(),
+            outputs: Vec::new(),
+        };
+        // Two payloads with the same key/value pairs but constructed
+        // from different JSON literals — serde preserves source
+        // order in Value::Object, so canonicalize_json must sort.
+        let payload_ab: serde_json::Value =
+            serde_json::from_str(r#"{"a": "1", "b": "2"}"#).unwrap();
+        let payload_ba: serde_json::Value =
+            serde_json::from_str(r#"{"b": "2", "a": "1"}"#).unwrap();
+        let hit_ab = DetectedPattern {
+            kind: DetectorKind::OpenSilverOwnable,
+            covenant_id: None,
+            tx_hash: "tx".to_owned(),
+            output_index: 0,
+            payload: payload_ab,
+        };
+        let hit_ba = DetectedPattern {
+            kind: DetectorKind::OpenSilverOwnable,
+            covenant_id: None,
+            tx_hash: "tx".to_owned(),
+            output_index: 0,
+            payload: payload_ba,
+        };
+
+        let bytes_ab = canonical_bytes_for_block(&block_meta, &[hit_ab]);
+        let bytes_ba = canonical_bytes_for_block(&block_meta, &[hit_ba]);
+        assert_eq!(bytes_ab, bytes_ba, "payload key order must not affect POI");
+    }
+
+    #[test]
     fn duplicate_committed_block_is_ignored() {
         let mut state = IngestionState::default();
         state.apply_block(block("a", 1, true)).unwrap();
@@ -1553,6 +1756,7 @@ mod tests {
                 is_finalized: true,
                 canonical_entity_bytes: b"scaffold-entity-state".to_vec(),
                 outputs: Vec::new(),
+                detector_hits: Vec::new(),
             },
             ingest_mode: IngestMode::default(),
             continuous: ContinuousConfig::default(),

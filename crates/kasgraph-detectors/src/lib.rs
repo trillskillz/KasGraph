@@ -81,7 +81,7 @@ pub enum DetectorKind {
 }
 
 /// What a detector emits when it matches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetectedPattern {
     pub kind: DetectorKind,
     /// KIP-20 covenant ID for the matched UTXO, hex-encoded. Stable

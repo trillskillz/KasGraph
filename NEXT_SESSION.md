@@ -2,7 +2,18 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — detector pipeline now sees real outputs)
+## Latest commit arc (2026-05-26 — detector hits persisted + POI now reflects them)
+
+- New migration `20260526160000_detector_hits.sql` adds `kasgraph_detected_pattern (subgraph, block_hash, block_daa_score, tx_hash, output_index, detector_kind, covenant_id, payload, detected_at)`. Three indexes: subgraph+DAA-desc, subgraph+kind+DAA-desc, and a partial covenant-id index.
+- `Store::insert_detected_pattern` uses `ON CONFLICT DO UPDATE` so re-applying a block (e.g. mid-recovery) is idempotent. `Store::unwind_committed_blocks_for_subgraph` now also deletes matching detector rows in the same transaction — the same chain bytes always produce the same detector ledger.
+- `BootstrapBlock` gains `detector_hits: Vec<DetectedPattern>` computed once in `block_from_rpc`; production code reads it directly, tests still use the `#[cfg(test)]` `run_detectors_on_block` helper.
+- `canonical_bytes_for_block` now incorporates sorted detector hits. Each row is rendered as `det:tx_hash:output_index:kind:covenant_id:canonical_payload_json`. Sort key is `(tx_hash, output_index, kind)`; payload JSON keys are sorted via `canonicalize_json` so the bytes are invariant under emission order *and* under serde's source-key order.
+- POI now reflects real on-chain state, not just block metadata — the verifiability goal from Phase 2.8 is unblocked.
+- Three new node tests pin: canonical bytes change when hits differ; canonical bytes stable under hit reordering; canonical bytes stable under payload key reordering. Store migrator test updated to expect 3 migrations.
+- `DetectorKind` derive gained `PartialEq` (already had `Eq` via the discriminant-only Hash derive); `BootstrapBlock` / `IngestionState` / `IngestionTransition` shed `Eq` since `DetectedPattern.payload` is a `serde_json::Value`.
+- 95 tests total (was 92). Build clean, zero warnings.
+
+## Previous commit arc (2026-05-26 — detector pipeline now sees real outputs)
 
 - `IngestedBlock` gains `outputs: Vec<IngestedTransactionOutput>`. Each entry carries `tx_hash`, `output_index`, hex-decoded `script_public_key`, and `value` (sompi). Serde-`default` keeps backwards compat with header-only notifications.
 - `parse_block_value` now walks `transactions[].outputs[]` from the live wRPC payload, decoding `scriptPublicKey.scriptPublicKey` hex strings. Three new tests cover the happy path, the no-`transactions` case, and the skip-malformed-entries case while preserving `output_index` alignment.

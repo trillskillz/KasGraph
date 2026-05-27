@@ -130,6 +130,25 @@ pub struct CommittedUnwindReport {
     pub audit_id: i64,
 }
 
+/// One detector hit persisted into `kasgraph_detected_pattern`.
+/// Sourced from `kasgraph_detectors::DetectedPattern` plus the
+/// committing block's `(subgraph, block_hash, block_daa_score)`
+/// context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedPatternRecord {
+    pub subgraph: SubgraphId,
+    pub block_hash: String,
+    pub block_daa_score: i64,
+    pub tx_hash: String,
+    pub output_index: i32,
+    /// Discriminant name (e.g. `"OpenSilverVault"`). Stored as text
+    /// so adding a new variant in `kasgraph-detectors` doesn't need
+    /// an enum migration on the SQL side.
+    pub detector_kind: String,
+    pub covenant_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -339,6 +358,41 @@ impl Store {
         }))
     }
 
+    /// Persist one detector hit. The PK is
+    /// `(subgraph, block_hash, tx_hash, output_index, detector_kind)`
+    /// so re-applying the same block (e.g. mid-recovery) is
+    /// idempotent — duplicate inserts are silently overwritten via
+    /// `ON CONFLICT DO UPDATE`.
+    pub async fn insert_detected_pattern(
+        &self,
+        record: &DetectedPatternRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO kasgraph_detected_pattern \
+             (subgraph, block_hash, block_daa_score, tx_hash, output_index, \
+              detector_kind, covenant_id, payload) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (subgraph, block_hash, tx_hash, output_index, detector_kind) \
+             DO UPDATE SET \
+                 block_daa_score = EXCLUDED.block_daa_score, \
+                 covenant_id = EXCLUDED.covenant_id, \
+                 payload = EXCLUDED.payload",
+        )
+        .bind(record.subgraph.schema_name())
+        .bind(&record.block_hash)
+        .bind(record.block_daa_score)
+        .bind(&record.tx_hash)
+        .bind(record.output_index)
+        .bind(&record.detector_kind)
+        .bind(record.covenant_id.as_ref())
+        .bind(&record.payload)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -411,6 +465,19 @@ impl Store {
             .execute(&mut *tx)
             .await
             .map_err(|err| StoreError::Query(err.to_string()))?;
+
+            // Detector hits anchored on the unwound blocks are
+            // dropped in the same transaction, so a replay of the
+            // surviving chain reproduces the same detector ledger.
+            sqlx::query(
+                "DELETE FROM kasgraph_detected_pattern \
+                 WHERE subgraph = $1 AND block_hash = ANY($2)",
+            )
+            .bind(subgraph.schema_name())
+            .bind(&removed_hashes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
         }
 
         let audit_id: (i64,) = sqlx::query_as(
@@ -466,10 +533,11 @@ mod tests {
     }
 
     #[test]
-    fn migrator_embeds_both_schema_slices_in_order() {
+    fn migrator_embeds_all_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations.len(), 3);
         assert_eq!(migrations[0].version, 20260526110500);
         assert_eq!(migrations[1].version, 20260526150000);
+        assert_eq!(migrations[2].version, 20260526160000);
     }
 }
