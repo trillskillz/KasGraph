@@ -7,7 +7,7 @@
 [![KIP-20](https://img.shields.io/badge/KIP--20-covenant_ids_first_class-orange.svg)](docs/references/KIP20_COVENANT_ID_QUERIES.md)
 [![MCP](https://img.shields.io/badge/MCP-first_class-blueviolet.svg)](mcp/)
 
-**Why this exists**: Kaspa's own developer docs list structured data querying as missing. The community API is best-effort with no SLA. Kasplex covers inscription-style KRC-20 (legacy). krc721.stream covers legacy NFTs. kas.fyi is commercial RPC, not subgraph-style. With Toccata landing covenants, native KRC-20, and ZK opcodes, every serious dApp will need structured data querying — and an MCP surface so AI agents can use it without writing GraphQL.
+**Why this exists**: Kaspa's own developer docs list structured data querying as missing. The community API is best-effort with no SLA. Kasplex covers inscription-style KRC-20 (legacy). krc721.stream covers legacy NFTs. With Toccata landing covenants, native KRC-20, and ZK opcodes, every serious dApp will need structured data querying — and an MCP surface so AI agents can use it without writing GraphQL.
 
 KIP-20 Covenant IDs make this dramatically easier than EVM indexing. Stable consensus-tracked identifiers for stateful contracts mean lineage queries are first-class. No recursive UTXO walking. No event log parsing heuristics.
 
