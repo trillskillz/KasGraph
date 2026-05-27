@@ -33,6 +33,14 @@ import {
 
 export const KASGRAPH_API_VERSION = '0.1.0';
 
+// Postgres-backed `GatewayResolvers` impl (Phase 2.4 + 2.5 schema).
+export {
+  PgGatewayResolvers,
+  type PgPoolLike,
+  type QueryResult,
+  type QueryResultRow,
+} from './pg-resolvers.js';
+
 // ---------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------

@@ -2,7 +2,18 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — GraphQL gateway surface + dispatch)
+## Latest commit arc (2026-05-26 — Postgres-backed GatewayResolvers)
+
+- `@kasgraph/api` now ships `PgGatewayResolvers` implementing every `GatewayResolvers` method against the Phase 2.4 + 2.5 schema: `committedBlock`, `committedBlocks`, `poiCheckpoints` (with optional `fromDaa`/`toDaa` bounds), `detectedPatterns` (with optional `kind` filter), `covenantLineage` (head + ordered entries).
+- Constructed against a minimal `PgPoolLike` interface — production code passes a real `pg.Pool`; tests use a recording mock that captures `(sql, values)` tuples and replays canned `rows[]`.
+- Defensive serializers handle the cross-shape pg type-parser delivery: `bigIntString` for BIGINT (string OR number), `isoString` for TIMESTAMPTZ (Date OR string), `hexFromBytes` for BYTEA (Buffer / Uint8Array / string).
+- `boundedFirst` clamps `first` to `[1, 1000]` with default 50; null `covenant_id` / `payload` columns get omitted from the response (honors `exactOptionalPropertyTypes: true`).
+- 12 new vitest cases in `tests/pg-resolvers.test.ts` pin: SQL shape per resolver, parameter binding order, optional-clause inclusion, `first` clamping/defaulting, hex serialization across buffer/string/Uint8Array, lineage two-query sequence with empty-bytes omission.
+- `pg ^8.13.0` + `@types/pg ^8.11.10` added to `api/package.json`. Typecheck clean across all four TS packages.
+- Total: 98 cargo + 46 TS = **144 tests** green.
+- Phase 3.1 now has a real Postgres-backed production resolver. Next slice for that phase: a Yoga HTTP server wrapping `executeGraphQLQuery` + `PgGatewayResolvers` so the gateway responds to real GraphQL requests end-to-end.
+
+## Previous commit arc (2026-05-26 — GraphQL gateway surface + dispatch)
 
 - `@kasgraph/api` now ships the canonical KasGraph base schema (`CommittedBlock`, `PoiCheckpoint`, `DetectedPattern`, `CovenantLineage`, `CovenantLineageEntry` plus `BigInt` + `JSON` scalars), an executable schema built lazily via `buildSchema`, a `GatewayResolvers` interface, and `executeGraphQLQuery(request, resolvers)` that uses the reference `graphql` engine for parse + validate + execute.
 - `BigInt` scalar serializes DAA scores as decimal strings (no JS Number precision loss past 2^53). `JSON` scalar passes payloads through as-is.
