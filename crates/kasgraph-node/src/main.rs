@@ -35,6 +35,7 @@ use kasgraph_store::{
     CommittedBlockRecord, DetectedPatternRecord, PoiCheckpoint, RpcBlockAuditRecord, Store,
     SubgraphId,
 };
+use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -391,6 +392,16 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         .with_context(|| format!("ensuring schema {} exists", subgraph.schema_name()))?;
 
     let rpc_client = config.rpc.as_ref().map(build_rpc_client);
+    let stream_capacity = env::var("KASGRAPH_STREAM_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024usize);
+    let stream_hub = StreamHub::new(stream_capacity);
+    info!(
+        capacity = stream_capacity,
+        "KasStream hub initialized; detector hits will be published to in-process subscribers"
+    );
+
     let mut ingestion = IngestionState::default();
 
     if let Some(checkpoint) = store
@@ -411,9 +422,14 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         IngestMode::Bootstrap => {
             let notifications = build_notifications(config, rpc_client.as_ref()).await?;
             for notification in notifications {
-                let _ =
-                    apply_and_persist_notification(&store, &subgraph, &mut ingestion, notification)
-                        .await?;
+                let _ = apply_and_persist_notification(
+                    &store,
+                    &subgraph,
+                    &mut ingestion,
+                    notification,
+                    Some(&stream_hub),
+                )
+                .await?;
             }
             info!(
                 committed_blocks = ingestion.committed.len(),
@@ -428,6 +444,7 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 &mut ingestion,
                 config,
                 rpc_client.as_ref(),
+                Some(&stream_hub),
             )
             .await?;
             info!(
@@ -465,6 +482,7 @@ async fn run_continuous_ingestion(
     ingestion: &mut IngestionState,
     config: &NodeConfig,
     rpc_client: Option<&MultiRpcClient>,
+    stream: Option<&StreamHub>,
 ) -> Result<()> {
     validate_continuous_config(config)?;
     let continuous = &config.continuous;
@@ -556,7 +574,8 @@ async fn run_continuous_ingestion(
         };
 
         let outcome =
-            apply_and_persist_notification(store, subgraph, ingestion, notification).await?;
+            apply_and_persist_notification(store, subgraph, ingestion, notification, stream)
+                .await?;
         processed = processed.saturating_add(1);
 
         // Active gap recovery: when the driver-synthesized
@@ -609,6 +628,7 @@ async fn run_continuous_ingestion(
                         subgraph,
                         ingestion,
                         recovery_notification,
+                        stream,
                     )
                     .await?;
                     info!(
@@ -670,11 +690,16 @@ struct NotificationOutcome {
 /// Apply one ChainNotification to the ingestion state and persist
 /// every side-effect. Called from both the bootstrap-pass loop and
 /// the continuous wRPC loop so they cannot drift in behaviour.
+///
+/// `stream` is the in-process KasStream hub. When provided, every
+/// committed detector hit is published to it; `None` is a clean
+/// no-op for paths that don't care (e.g. tests).
 async fn apply_and_persist_notification(
     store: &Store,
     subgraph: &SubgraphId,
     ingestion: &mut IngestionState,
     notification: ChainNotification,
+    stream: Option<&StreamHub>,
 ) -> Result<NotificationOutcome> {
     let transition = ingestion
         .apply_notification(notification)
@@ -809,6 +834,7 @@ async fn apply_and_persist_notification(
                     .insert_detected_pattern(&record)
                     .await
                     .context("writing detected pattern row")?;
+                publish_hit_to_stream(stream, &committed.block, hit);
             }
         }
     }
@@ -836,6 +862,47 @@ fn run_detectors_on_block(
         ));
     }
     hits
+}
+
+/// Build a `StreamEvent` from one detector hit and publish it onto
+/// `hub`. `None` is a clean no-op so call sites that don't have a
+/// hub (tests, bootstrap-without-stream builds) stay readable.
+///
+/// The payload nests the original detector payload plus the
+/// `tx_hash`, `output_index`, and (if present) `covenant_id` so a
+/// `StreamFilter::CovenantId(...)` consumer can match without
+/// re-deriving the id from the kind-specific payload schema.
+fn publish_hit_to_stream(
+    hub: Option<&StreamHub>,
+    block: &BootstrapBlock,
+    hit: &kasgraph_detectors::DetectedPattern,
+) {
+    let Some(hub) = hub else { return };
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "tx_hash".to_owned(),
+        serde_json::Value::String(hit.tx_hash.clone()),
+    );
+    payload.insert(
+        "output_index".to_owned(),
+        serde_json::Value::from(hit.output_index),
+    );
+    if let Some(covenant_id) = &hit.covenant_id {
+        payload.insert(
+            "covenant_id".to_owned(),
+            serde_json::Value::String(covenant_id.clone()),
+        );
+    }
+    payload.insert("detector_payload".to_owned(), hit.payload.clone());
+
+    let event = StreamEvent {
+        block_daa_score: block.daa_score as u64,
+        block_hash: block.hash.clone(),
+        kind: format!("{:?}", hit.kind),
+        payload: serde_json::Value::Object(payload),
+    };
+    hub.publish(event);
 }
 
 /// Compact human-readable summary of detector hits for log lines.
@@ -1622,6 +1689,91 @@ mod tests {
         let summary = summarize_detector_hits(&hits);
         assert!(summary.contains("OpenSilverOwnable:2"));
         assert!(summary.contains("KCC20Asset:1"));
+    }
+
+    #[tokio::test]
+    async fn publish_hit_to_stream_delivers_event_to_subscriber() {
+        use kasgraph_detectors::DetectedPattern;
+        use kasgraph_stream::StreamFilter;
+
+        let hub = StreamHub::new(8);
+        let mut subscriber = hub.subscribe(vec![StreamFilter::All]);
+
+        let block = block("h-stream", 42, true);
+        let hit = DetectedPattern {
+            kind: DetectorKind::KCC20Asset,
+            covenant_id: Some("0xabc".to_owned()),
+            tx_hash: "tx-stream".to_owned(),
+            output_index: 3,
+            payload: serde_json::json!({"k": "v"}),
+        };
+
+        publish_hit_to_stream(Some(&hub), &block, &hit);
+
+        let event = subscriber.recv().await.expect("recv");
+        assert_eq!(event.block_daa_score, 42);
+        assert_eq!(event.block_hash, "h-stream");
+        assert_eq!(event.kind, "KCC20Asset");
+        assert_eq!(event.payload["tx_hash"], "tx-stream");
+        assert_eq!(event.payload["output_index"], 3);
+        assert_eq!(event.payload["covenant_id"], "0xabc");
+        assert_eq!(event.payload["detector_payload"]["k"], "v");
+    }
+
+    #[tokio::test]
+    async fn publish_hit_to_stream_with_none_hub_is_a_no_op() {
+        use kasgraph_detectors::DetectedPattern;
+        // No assertion needed beyond "doesn't panic"; the point is
+        // that `None` is a legal hub.
+        let block = block("h-none", 1, true);
+        let hit = DetectedPattern {
+            kind: DetectorKind::OpenSilverOwnable,
+            covenant_id: None,
+            tx_hash: "tx".to_owned(),
+            output_index: 0,
+            payload: serde_json::json!({}),
+        };
+        publish_hit_to_stream(None, &block, &hit);
+    }
+
+    #[tokio::test]
+    async fn publish_hit_to_stream_covenant_id_filter_matches_real_hits() {
+        use kasgraph_detectors::DetectedPattern;
+        use kasgraph_stream::StreamFilter;
+
+        let hub = StreamHub::new(8);
+        let mut watcher = hub.subscribe(vec![StreamFilter::CovenantId("0xtarget".to_owned())]);
+
+        let block = block("h", 1, true);
+
+        // Mismatching covenant id — filter should drop it.
+        publish_hit_to_stream(
+            Some(&hub),
+            &block,
+            &DetectedPattern {
+                kind: DetectorKind::KCC20Asset,
+                covenant_id: Some("0xother".to_owned()),
+                tx_hash: "t1".to_owned(),
+                output_index: 0,
+                payload: serde_json::json!({}),
+            },
+        );
+        // Matching covenant id — filter should pass it through.
+        publish_hit_to_stream(
+            Some(&hub),
+            &block,
+            &DetectedPattern {
+                kind: DetectorKind::KCC20Asset,
+                covenant_id: Some("0xtarget".to_owned()),
+                tx_hash: "t2".to_owned(),
+                output_index: 0,
+                payload: serde_json::json!({}),
+            },
+        );
+
+        let event = watcher.recv().await.expect("recv");
+        assert_eq!(event.payload["tx_hash"], "t2");
+        assert_eq!(event.payload["covenant_id"], "0xtarget");
     }
 
     #[test]

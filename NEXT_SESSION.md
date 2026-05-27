@@ -2,7 +2,17 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — detector hits persisted + POI now reflects them)
+## Latest commit arc (2026-05-26 — detector hits published to KasStream hub)
+
+- `kasgraph-node` creates a single `kasgraph_stream::StreamHub` at startup (capacity from `KASGRAPH_STREAM_CAPACITY`, default 1024).
+- `apply_and_persist_notification` takes `Option<&StreamHub>`; after every successful detector-hit DB insert, the same hit is built into a `StreamEvent` and published via `publish_hit_to_stream`.
+- Event payload nests the original `detector_payload` plus `tx_hash`, `output_index`, and (when present) `covenant_id` so the existing `StreamFilter::CovenantId(...)` matcher works on real published events without re-deriving the id from kind-specific payload schemas.
+- Hub is threaded through to both the bootstrap and continuous paths (continuous-mode recovery re-applies also publish).
+- Three new node-side tests pin: All-filter subscriber receives the published event with all expected fields; `None` hub is a clean no-op; `StreamFilter::CovenantId` correctly filters published events.
+- Phase 3.3 (KasStream streaming primitive) now has both a hub implementation and a real producer wired into the node. The gRPC server layer on top is the next jump for that phase.
+- 98 tests total (was 95). Build clean, zero warnings.
+
+## Previous commit arc (2026-05-26 — detector hits persisted + POI now reflects them)
 
 - New migration `20260526160000_detector_hits.sql` adds `kasgraph_detected_pattern (subgraph, block_hash, block_daa_score, tx_hash, output_index, detector_kind, covenant_id, payload, detected_at)`. Three indexes: subgraph+DAA-desc, subgraph+kind+DAA-desc, and a partial covenant-id index.
 - `Store::insert_detected_pattern` uses `ON CONFLICT DO UPDATE` so re-applying a block (e.g. mid-recovery) is idempotent. `Store::unwind_committed_blocks_for_subgraph` now also deletes matching detector rows in the same transaction — the same chain bytes always produce the same detector ledger.
