@@ -2,7 +2,15 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — NDJSON event trace from the soak runner)
+## Latest commit arc (2026-05-26 — combined integration test for reconnect + gap)
+
+- New `continuous_subscription_interleaves_events_and_notifications_around_reconnect_gap` test asserts the notification stream AND the driver-event stream agree on ordering around a reconnect-with-gap.
+- Notification stream: `BlockAdded(10)`, `BlockAdded(11)`, synthetic `RecoveryRequired(12, 14, ...)`, `BlockAdded(15)`.
+- Event stream: `Connected(0)`, `ReconnectScheduled(1, ...)`, `Connected(1)`, `GapDetected(1, 12, 14)`.
+- Same `reconnect_count` threaded through both streams; same DAA range in synthetic recovery and `GapDetected` event. This is the exact shape the soak runner now persists in NDJSON, so the trace artifact is now grounded by an in-process integration assertion.
+- 86 tests total. Build clean, zero warnings.
+
+## Previous commit arc (2026-05-26 — NDJSON event trace from the soak runner)
 
 - `continuous_wrpc_smoke.rs` now accepts `KASGRAPH_WRPC_EVENT_NDJSON=<path>`. When set, every driver event (`Connected`, `ReconnectScheduled`, `GapDetected`, `Stopped`) and every notification (`BlockAdded`, `VirtualChainChanged`, `RecoveryRequired`) is appended as a JSON object with a `ts_ms` unix-millisecond timestamp.
 - Output uses `BufWriter<File>` and is flushed + closed cleanly on shutdown. Path parent dirs are created on the fly.

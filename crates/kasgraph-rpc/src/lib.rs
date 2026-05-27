@@ -2506,6 +2506,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuous_subscription_interleaves_events_and_notifications_around_reconnect_gap() {
+        // Combined integration view: assert that the event stream
+        // and the notification stream — both of which feed the
+        // soak runner's NDJSON trace — agree on the order around a
+        // reconnect-with-gap. Specifically, on second connect the
+        // driver must:
+        //   - emit `ReconnectScheduled { reconnect_count: 1 }`
+        //   - emit `Connected { reconnect_count: 1 }`
+        //   - synthesize `RecoveryRequired(12, 14, ...)` BEFORE
+        //     forwarding the actual `BlockAdded(15)`
+        //   - emit a `GapDetected { reconnect_count: 1, from: 12,
+        //     to: 14 }` event matching the synthesized recovery.
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-10", "daaScore": 10, "blueScore": 10},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-11", "daaScore": 11, "blueScore": 11},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-15", "daaScore": 15, "blueScore": 15},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription_with_events(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+            event_tx,
+        );
+
+        // 4 notifications: BlockAdded(10), BlockAdded(11),
+        // synthetic RecoveryRequired(12, 14, ...), BlockAdded(15).
+        let mut notifications = Vec::new();
+        for _ in 0..4 {
+            let n = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("notification recv timeout")
+                .expect("notification channel closed");
+            notifications.push(n);
+        }
+
+        // Drain events as long as they keep arriving promptly.
+        // Connected(0), ReconnectScheduled(1), Connected(1),
+        // GapDetected(1, 12, 14).
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            let e = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("event recv timeout")
+                .expect("event channel closed");
+            events.push(e);
+        }
+
+        drop(rx);
+        drop(event_rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // --- Notification stream assertions ---
+        match &notifications[0] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 10),
+            other => panic!("notif[0] expected BlockAdded(10), got {other:?}"),
+        }
+        match &notifications[1] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 11),
+            other => panic!("notif[1] expected BlockAdded(11), got {other:?}"),
+        }
+        match &notifications[2] {
+            ChainNotification::RecoveryRequired {
+                from_daa_score,
+                to_daa_score,
+                reason,
+            } => {
+                assert_eq!(*from_daa_score, 12, "synthetic recovery starts at last+1");
+                assert_eq!(*to_daa_score, 14, "synthetic recovery ends at first-1");
+                assert!(reason.contains("subscription gap"));
+            }
+            other => panic!("notif[2] expected synthetic RecoveryRequired, got {other:?}"),
+        }
+        match &notifications[3] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 15),
+            other => panic!("notif[3] expected BlockAdded(15), got {other:?}"),
+        }
+
+        // --- Event stream assertions ---
+        assert!(
+            matches!(events[0], SubscriptionDriverEvent::Connected { reconnect_count: 0, .. }),
+            "events[0] expected Connected(0), got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(events[1], SubscriptionDriverEvent::ReconnectScheduled { reconnect_count: 1, .. }),
+            "events[1] expected ReconnectScheduled(1), got {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(events[2], SubscriptionDriverEvent::Connected { reconnect_count: 1, .. }),
+            "events[2] expected Connected(1), got {:?}",
+            events[2]
+        );
+        match &events[3] {
+            SubscriptionDriverEvent::GapDetected {
+                reconnect_count,
+                from_daa_score,
+                to_daa_score,
+                ..
+            } => {
+                assert_eq!(*reconnect_count, 1);
+                assert_eq!(*from_daa_score, 12);
+                assert_eq!(*to_daa_score, 14);
+            }
+            other => panic!("events[3] expected GapDetected(1, 12, 14), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn continuous_subscription_emits_recovery_required_when_reconnect_skips_daa() {
         let primary = spawn_mock_rpc_server(vec![]).await;
         let client = client(primary, vec![]);
