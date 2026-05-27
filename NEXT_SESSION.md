@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — combined integration test for reconnect + gap)
+## Latest commit arc (2026-05-26 — detector pipeline now sees real outputs)
+
+- `IngestedBlock` gains `outputs: Vec<IngestedTransactionOutput>`. Each entry carries `tx_hash`, `output_index`, hex-decoded `script_public_key`, and `value` (sompi). Serde-`default` keeps backwards compat with header-only notifications.
+- `parse_block_value` now walks `transactions[].outputs[]` from the live wRPC payload, decoding `scriptPublicKey.scriptPublicKey` hex strings. Three new tests cover the happy path, the no-`transactions` case, and the skip-malformed-entries case while preserving `output_index` alignment.
+- `BootstrapBlock` carries the outputs through to the persist path. The continuous-mode commit loop now calls `kasgraph_detectors::detect_in_output` over every output of each committed block via `run_detectors_on_block` and logs a per-kind summary (`Vault:3,KCC20Asset:1`).
+- Phase 2.5 finally has a real consumer: the detector registry is now exercised on live wRPC traffic, not just in unit tests. Once OpenSilver ships real compiled-script bytes the placeholder discriminators get replaced and live mainnet patterns will surface in node logs immediately.
+- Three new node-side tests for `run_detectors_on_block` (empty-outputs case, registry-match case, mixed match/non-match) plus a focused `summarize_detector_hits` test.
+- 92 tests total (was 86). Build clean, zero warnings.
+
+## Previous commit arc (2026-05-26 — combined integration test for reconnect + gap)
 
 - New `continuous_subscription_interleaves_events_and_notifications_around_reconnect_gap` test asserts the notification stream AND the driver-event stream agree on ordering around a reconnect-with-gap.
 - Notification stream: `BlockAdded(10)`, `BlockAdded(11)`, synthetic `RecoveryRequired(12, 14, ...)`, `BlockAdded(15)`.

@@ -25,6 +25,7 @@
 use std::{collections::BTreeMap, env, time::Duration};
 
 use anyhow::{Context, Result};
+use kasgraph_detectors::{detect_in_output, DetectorKind};
 use kasgraph_poi::{compute_poi, poi_hex, PoiHash};
 use kasgraph_rpc::{
     parse_notifications_jsonl, ChainNotification, IngestedBlock, LiveRpcCapabilities,
@@ -49,6 +50,10 @@ struct BootstrapBlock {
     served_by: String,
     is_finalized: bool,
     canonical_entity_bytes: Vec<u8>,
+    /// Per-output redeem scripts forwarded from `IngestedBlock`.
+    /// Empty for synthetic/scaffold blocks that have no real wire
+    /// payload. Drives the detector pass on the committed-write path.
+    outputs: Vec<kasgraph_rpc::IngestedTransactionOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +321,7 @@ impl NodeConfig {
                 canonical_entity_bytes: env::var("KASGRAPH_BOOTSTRAP_ENTITY_BYTES")
                     .map(|value| value.into_bytes())
                     .unwrap_or_else(|_| b"scaffold-entity-state".to_vec()),
+                outputs: Vec::new(),
             },
         }
     }
@@ -759,12 +765,62 @@ async fn apply_and_persist_notification(
             finalized = committed.block.is_finalized,
             "persisted committed checkpoint"
         );
+
+        let hits = run_detectors_on_block(&committed.block);
+        if !hits.is_empty() {
+            info!(
+                subgraph = subgraph.schema_name(),
+                block_hash = committed.block.hash,
+                daa_score = committed.block.daa_score,
+                hits = hits.len(),
+                summary = %summarize_detector_hits(&hits),
+                "detector hits on committed block"
+            );
+        }
     }
 
     Ok(NotificationOutcome {
         recovery_requested,
         committed_count,
     })
+}
+
+/// Run every registered detector against every output of `block` and
+/// return the matches. No DB writes yet — entity-row persistence
+/// lands in the next slice. Returns an empty `Vec` for scaffold
+/// blocks that carry no outputs (the synthetic JSONL/bootstrap path).
+fn run_detectors_on_block(
+    block: &BootstrapBlock,
+) -> Vec<kasgraph_detectors::DetectedPattern> {
+    let mut hits = Vec::new();
+    for output in &block.outputs {
+        hits.extend(detect_in_output(
+            &output.script_public_key,
+            &output.tx_hash,
+            output.output_index,
+        ));
+    }
+    hits
+}
+
+/// Compact human-readable summary of detector hits for log lines.
+/// Counts hits per `DetectorKind` and renders as `Vault:3,KCC20Asset:1`.
+/// Iteration is insertion-ordered (first-seen kind wins position)
+/// rather than alphabetical — the log line is for humans, not diff.
+fn summarize_detector_hits(hits: &[kasgraph_detectors::DetectedPattern]) -> String {
+    let mut counts: Vec<(DetectorKind, usize)> = Vec::new();
+    for hit in hits {
+        if let Some(entry) = counts.iter_mut().find(|(k, _)| *k == hit.kind) {
+            entry.1 += 1;
+        } else {
+            counts.push((hit.kind, 1));
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| format!("{kind:?}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn build_notifications(
@@ -1111,6 +1167,7 @@ fn block_from_rpc(block: IngestedBlock) -> BootstrapBlock {
         served_by: block.served_by,
         is_finalized: block.is_finalized,
         canonical_entity_bytes,
+        outputs: block.outputs,
     }
 }
 
@@ -1121,6 +1178,7 @@ fn block_to_rpc(block: &BootstrapBlock) -> IngestedBlock {
         blue_score: block.blue_score as u64,
         is_finalized: block.is_finalized,
         served_by: block.served_by.clone(),
+        outputs: block.outputs.clone(),
     }
 }
 
@@ -1160,6 +1218,7 @@ mod tests {
             served_by: "primary".to_owned(),
             is_finalized: finalized,
             canonical_entity_bytes: format!("state-{hash}-{daa_score}").into_bytes(),
+            outputs: Vec::new(),
         }
     }
 
@@ -1398,6 +1457,74 @@ mod tests {
     }
 
     #[test]
+    fn run_detectors_on_block_returns_empty_for_block_without_outputs() {
+        let b = block("h", 1, true);
+        assert!(run_detectors_on_block(&b).is_empty());
+    }
+
+    #[test]
+    fn run_detectors_on_block_invokes_registry_for_each_output() {
+        use kasgraph_detectors::registry;
+        use kasgraph_rpc::IngestedTransactionOutput;
+
+        // Use the OpenSilverOwnable canonical bytes from the detector
+        // registry as one of the redeem scripts, with the masked
+        // state windows zeroed (still matches the fingerprint by
+        // construction). A second output has a non-matching script
+        // and should contribute zero hits.
+        let entry = registry::all()
+            .iter()
+            .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
+            .expect("OpenSilverOwnable registered");
+        let matching_script = entry.fingerprint.bytes.clone();
+        let non_matching_script = vec![0x00, 0x01, 0x02];
+
+        let mut b = block("h-detect", 1, true);
+        b.outputs = vec![
+            IngestedTransactionOutput {
+                tx_hash: "tx-a".to_owned(),
+                output_index: 0,
+                script_public_key: matching_script,
+                value: 1,
+            },
+            IngestedTransactionOutput {
+                tx_hash: "tx-a".to_owned(),
+                output_index: 1,
+                script_public_key: non_matching_script,
+                value: 2,
+            },
+        ];
+
+        let hits = run_detectors_on_block(&b);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, DetectorKind::OpenSilverOwnable);
+        assert_eq!(hits[0].tx_hash, "tx-a");
+        assert_eq!(hits[0].output_index, 0);
+    }
+
+    #[test]
+    fn summarize_detector_hits_counts_per_kind() {
+        use kasgraph_detectors::DetectedPattern;
+        fn hit(kind: DetectorKind) -> DetectedPattern {
+            DetectedPattern {
+                kind,
+                covenant_id: None,
+                tx_hash: "x".to_owned(),
+                output_index: 0,
+                payload: serde_json::json!({}),
+            }
+        }
+        let hits = vec![
+            hit(DetectorKind::OpenSilverOwnable),
+            hit(DetectorKind::KCC20Asset),
+            hit(DetectorKind::OpenSilverOwnable),
+        ];
+        let summary = summarize_detector_hits(&hits);
+        assert!(summary.contains("OpenSilverOwnable:2"));
+        assert!(summary.contains("KCC20Asset:1"));
+    }
+
+    #[test]
     fn duplicate_committed_block_is_ignored() {
         let mut state = IngestionState::default();
         state.apply_block(block("a", 1, true)).unwrap();
@@ -1425,6 +1552,7 @@ mod tests {
                 served_by: DEFAULT_SERVED_BY.to_owned(),
                 is_finalized: true,
                 canonical_entity_bytes: b"scaffold-entity-state".to_vec(),
+                outputs: Vec::new(),
             },
             ingest_mode: IngestMode::default(),
             continuous: ContinuousConfig::default(),
@@ -1447,6 +1575,7 @@ mod tests {
             blue_score: 7,
             is_finalized: true,
             served_by: "primary".to_owned(),
+            outputs: Vec::new(),
         };
 
         let mapped = block_from_rpc(block);

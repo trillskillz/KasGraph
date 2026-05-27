@@ -1012,6 +1012,7 @@ name = "kasgraph-rpc"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "reqwest",
  "rustls",
  "serde",

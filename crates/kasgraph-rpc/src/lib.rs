@@ -132,6 +132,29 @@ pub struct IngestedBlock {
     pub is_finalized: bool,
     /// Audit field: which endpoint served this block.
     pub served_by: String,
+    /// Per-output redeem scripts parsed from the block's transactions.
+    /// Empty when the upstream payload omits `transactions` (e.g.
+    /// header-only notifications). Populated for full block fetches
+    /// where the detector pipeline needs script bytes.
+    #[serde(default)]
+    pub outputs: Vec<IngestedTransactionOutput>,
+}
+
+/// One transaction output extracted from a block. Carries the
+/// information the detector pipeline needs to fingerprint covenant
+/// patterns: the redeem script bytes, plus the (tx_hash, output_index)
+/// pair that identifies the UTXO.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestedTransactionOutput {
+    pub tx_hash: String,
+    pub output_index: u32,
+    /// Hex-decoded `scriptPublicKey.scriptPublicKey` bytes from the
+    /// wRPC payload. Empty when the upstream payload omits the
+    /// scriptPublicKey or it fails to decode.
+    pub script_public_key: Vec<u8>,
+    /// Output value in sompi. `0` when the upstream payload omits it
+    /// or it fails to parse.
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1425,13 +1448,72 @@ fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, Rp
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let outputs = value
+        .get("transactions")
+        .and_then(Value::as_array)
+        .map(|txs| extract_transaction_outputs(txs))
+        .unwrap_or_default();
+
     Ok(IngestedBlock {
         hash,
         daa_score,
         blue_score,
         is_finalized,
         served_by: served_by.to_owned(),
+        outputs,
     })
+}
+
+/// Walk a `transactions` array and collect every output's
+/// (tx_hash, output_index, scriptPublicKey, value). Resilient: any
+/// transaction or output that lacks the expected keys is skipped
+/// rather than failing the whole block parse, because upstream
+/// payload shape varies between blockAdded notifications (which may
+/// omit verboseData) and full getBlock responses.
+fn extract_transaction_outputs(txs: &[Value]) -> Vec<IngestedTransactionOutput> {
+    let mut out = Vec::new();
+    for tx in txs {
+        // Transaction id lives under verboseData on full payloads;
+        // a few alternative shapes also exist.
+        let tx_hash = tx
+            .pointer("/verboseData/transactionId")
+            .and_then(Value::as_str)
+            .or_else(|| tx.get("transactionId").and_then(Value::as_str))
+            .or_else(|| tx.get("id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_owned();
+
+        let Some(outputs) = tx.get("outputs").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for (idx, output) in outputs.iter().enumerate() {
+            let script_hex = output
+                .pointer("/scriptPublicKey/scriptPublicKey")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    output
+                        .get("scriptPublicKey")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("");
+            let script_public_key = hex::decode(script_hex).unwrap_or_default();
+
+            // `value` is usually a stringified u64 in wRPC JSON.
+            let value = output
+                .get("value")
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()))
+                .unwrap_or(0);
+
+            out.push(IngestedTransactionOutput {
+                tx_hash: tx_hash.clone(),
+                output_index: idx as u32,
+                script_public_key,
+                value,
+            });
+        }
+    }
+    out
 }
 
 fn extract_string(candidates: &[Option<&Value>], original: &Value) -> Result<String, RpcError> {
@@ -2192,6 +2274,126 @@ mod tests {
             }
             other => panic!("unexpected notification: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_block_value_extracts_per_output_redeem_script_bytes() {
+        // Real-shape Kaspa wRPC block: two transactions, the first
+        // with two outputs and the second with one. scriptPublicKey
+        // lives at scriptPublicKey.scriptPublicKey (hex string).
+        // transactionId lives under verboseData.
+        let block_value = json!({
+            "header": {
+                "hash": "block-out-test",
+                "daaScore": 100,
+                "blueScore": 99
+            },
+            "transactions": [
+                {
+                    "verboseData": {"transactionId": "tx-1"},
+                    "outputs": [
+                        {
+                            "value": "1500",
+                            "scriptPublicKey": {
+                                "version": 0,
+                                "scriptPublicKey": "deadbeef"
+                            }
+                        },
+                        {
+                            "value": "2500",
+                            "scriptPublicKey": {
+                                "version": 0,
+                                "scriptPublicKey": "cafebabe"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "verboseData": {"transactionId": "tx-2"},
+                    "outputs": [
+                        {
+                            "value": "777",
+                            "scriptPublicKey": {
+                                "version": 0,
+                                "scriptPublicKey": "0011223344"
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let block = parse_block_value(&block_value, "wrpc").expect("parse");
+        assert_eq!(block.hash, "block-out-test");
+        assert_eq!(block.daa_score, 100);
+        assert_eq!(block.outputs.len(), 3);
+
+        assert_eq!(block.outputs[0].tx_hash, "tx-1");
+        assert_eq!(block.outputs[0].output_index, 0);
+        assert_eq!(block.outputs[0].value, 1500);
+        assert_eq!(block.outputs[0].script_public_key, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        assert_eq!(block.outputs[1].tx_hash, "tx-1");
+        assert_eq!(block.outputs[1].output_index, 1);
+        assert_eq!(block.outputs[1].value, 2500);
+        assert_eq!(block.outputs[1].script_public_key, vec![0xCA, 0xFE, 0xBA, 0xBE]);
+
+        assert_eq!(block.outputs[2].tx_hash, "tx-2");
+        assert_eq!(block.outputs[2].output_index, 0);
+        assert_eq!(block.outputs[2].value, 777);
+        assert_eq!(
+            block.outputs[2].script_public_key,
+            vec![0x00, 0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn parse_block_value_returns_empty_outputs_when_transactions_missing() {
+        let block_value = json!({
+            "header": {"hash": "h", "daaScore": 1, "blueScore": 1}
+        });
+        let block = parse_block_value(&block_value, "wrpc").unwrap();
+        assert!(block.outputs.is_empty());
+    }
+
+    #[test]
+    fn parse_block_value_skips_outputs_with_unparseable_script_or_missing_keys() {
+        // First output: no scriptPublicKey at all → script empty,
+        // value 0 (still emitted to keep output_index alignment).
+        // Second output: non-hex script → script empty.
+        // Third output: valid.
+        let block_value = json!({
+            "header": {"hash": "h", "daaScore": 1, "blueScore": 1},
+            "transactions": [
+                {
+                    "verboseData": {"transactionId": "t"},
+                    "outputs": [
+                        {},
+                        {
+                            "value": "5",
+                            "scriptPublicKey": {"scriptPublicKey": "not-hex"}
+                        },
+                        {
+                            "value": "9",
+                            "scriptPublicKey": {"scriptPublicKey": "ab"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let block = parse_block_value(&block_value, "wrpc").unwrap();
+        assert_eq!(block.outputs.len(), 3);
+        assert!(block.outputs[0].script_public_key.is_empty());
+        assert_eq!(block.outputs[0].value, 0);
+        assert!(block.outputs[1].script_public_key.is_empty());
+        assert_eq!(block.outputs[1].value, 5);
+        assert_eq!(block.outputs[2].script_public_key, vec![0xAB]);
+        assert_eq!(block.outputs[2].value, 9);
+        // output_index increments correctly across skipped/invalid
+        // entries.
+        assert_eq!(block.outputs[0].output_index, 0);
+        assert_eq!(block.outputs[1].output_index, 1);
+        assert_eq!(block.outputs[2].output_index, 2);
     }
 
     #[test]
