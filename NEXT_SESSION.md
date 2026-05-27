@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — detector observability in continuous_wrpc_smoke)
+## Latest commit arc (2026-05-26 — MCP tool surface + dispatch contract)
+
+- `@kasgraph/mcp` was a name-only enumeration; now declares per-tool `McpTool { name, description, inputSchema }` for all 8 tools with `additionalProperties:false` JSONSchema inputs.
+- Per-tool TypeScript Input/Output types capture the wire shapes (e.g. `SubgraphSummary`, `CovenantLineageEntry`, `AddressActivityEntry`) so production handlers and test handlers share one contract.
+- `McpHandlers` interface declares one method per tool. `dispatchMcpTool(name, args, handlers)` routes to the right method, validates required input keys, and throws `McpDispatchError { code: 'unknown_tool' | 'invalid_input' }` for malformed calls. Conditional spread keeps `exactOptionalPropertyTypes: true` happy.
+- `tests/mcp.test.ts` adds an in-memory `McpHandlers` impl with seeded subgraphs/addresses and 16 vitest cases covering registry shape, unknown-tool rejection, missing-field rejection, every tool routing correctly, optional-field omission, and the calls-recorded invariant.
+- Total: 98 cargo tests + 21 TS tests = 119 green; typecheck clean across all four TS packages.
+- Phase 3.2 (MCP, CRITICAL per PLAN.md) goes from "tool names enumerated" to "typed dispatch contract + reference test handler". Next slice for that phase: a production handler backed by `pg` that queries the Phase 2.4 schema, plus a stdio/SSE transport.
+
+## Previous commit arc (2026-05-26 — detector observability in continuous_wrpc_smoke)
 
 - `continuous_wrpc_smoke` now dispatches `kasgraph_detectors::detect_in_output` against every output of every received `BlockAdded` / `VirtualChainChanged` block — same dispatch the indexer's `block_from_rpc` performs in production.
 - Per-kind tally rolled into both the stdout summary line and the `KASGRAPH_WRPC_SUMMARY_JSON` artifact (`detectorHitsTotal`, `detectorHitsPerKind { kind: count, ... }`).
