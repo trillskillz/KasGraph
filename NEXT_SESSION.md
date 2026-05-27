@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — detector hits published to KasStream hub)
+## Latest commit arc (2026-05-26 — detector observability in continuous_wrpc_smoke)
+
+- `continuous_wrpc_smoke` now dispatches `kasgraph_detectors::detect_in_output` against every output of every received `BlockAdded` / `VirtualChainChanged` block — same dispatch the indexer's `block_from_rpc` performs in production.
+- Per-kind tally rolled into both the stdout summary line and the `KASGRAPH_WRPC_SUMMARY_JSON` artifact (`detectorHitsTotal`, `detectorHitsPerKind { kind: count, ... }`).
+- Per-hit NDJSON event when `KASGRAPH_WRPC_EVENT_NDJSON` is set: `{kind: "detector_hit", block_hash, block_daa_score, tx_hash, output_index, detector_kind, covenant_id, payload, ts_ms}`.
+- `kasgraph_detectors` added as a `[dev-dependencies]` entry on `kasgraph-rpc` (kept the production crate dep-free of detectors so the layering stays clean).
+- The point of this slice: validate against real mainnet outputs that the placeholder `0xFE`-prefixed discriminators don't false-positive. A clean soak that reports `detector_hits_total=0` proves the placeholder bytes are safe to keep until real OpenSilver compiled bytes ship.
+- 98 tests still green; build clean, zero warnings.
+
+## Previous commit arc (2026-05-26 — detector hits published to KasStream hub)
 
 - `kasgraph-node` creates a single `kasgraph_stream::StreamHub` at startup (capacity from `KASGRAPH_STREAM_CAPACITY`, default 1024).
 - `apply_and_persist_notification` takes `Option<&StreamHub>`; after every successful detector-hit DB insert, the same hit is built into a `StreamEvent` and published via `publish_hit_to_stream`.

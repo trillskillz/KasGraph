@@ -1013,6 +1013,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "hex",
+ "kasgraph-detectors",
  "reqwest",
  "rustls",
  "serde",

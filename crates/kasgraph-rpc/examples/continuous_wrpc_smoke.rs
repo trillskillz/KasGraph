@@ -6,12 +6,72 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use kasgraph_detectors::{detect_in_output, DetectedPattern};
 use kasgraph_rpc::{
-    ChainNotification, MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
-    SubscriptionDriverEvent,
+    ChainNotification, IngestedBlock, MultiRpcClient, RpcClientConfig, RpcEndpoint,
+    SubscriptionBackoff, SubscriptionDriverEvent,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
+
+/// Run every registered detector against every output of `block`
+/// and return the hits. Mirrors the dispatch that
+/// `kasgraph-node::block_from_rpc` performs in production, so the
+/// smoke runner sees the same detector view the indexer would.
+fn detect_in_block(block: &IngestedBlock) -> Vec<DetectedPattern> {
+    let mut hits = Vec::new();
+    for output in &block.outputs {
+        hits.extend(detect_in_output(
+            &output.script_public_key,
+            &output.tx_hash,
+            output.output_index,
+        ));
+    }
+    hits
+}
+
+/// Dispatch detectors against `block`, count per-kind hits into
+/// the rolling tally, and (if `event_writer` is set) write one
+/// NDJSON line per hit. Returns the number of hits found.
+#[allow(clippy::too_many_arguments)]
+fn record_detector_hits(
+    block: &IngestedBlock,
+    detector_hits_total: &mut usize,
+    detector_hits_per_kind: &mut std::collections::BTreeMap<String, usize>,
+    event_writer: &mut Option<BufWriter<File>>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let hits = detect_in_block(block);
+    if hits.is_empty() {
+        return Ok(0);
+    }
+    *detector_hits_total += hits.len();
+    for hit in &hits {
+        let kind = format!("{:?}", hit.kind);
+        *detector_hits_per_kind.entry(kind).or_insert(0) += 1;
+    }
+    println!(
+        "    [detectors] block={} daa={} hits={}",
+        block.hash,
+        block.daa_score,
+        hits.len()
+    );
+    for hit in &hits {
+        write_event_line(
+            event_writer,
+            json!({
+                "kind": "detector_hit",
+                "block_hash": block.hash,
+                "block_daa_score": block.daa_score,
+                "tx_hash": hit.tx_hash,
+                "output_index": hit.output_index,
+                "detector_kind": format!("{:?}", hit.kind),
+                "covenant_id": hit.covenant_id,
+                "payload": hit.payload,
+            }),
+        )?;
+    }
+    Ok(hits.len())
+}
 
 /// Append one NDJSON line stamped with a unix-ms timestamp. No-op
 /// when no event log was requested. Errors are surfaced (a broken
@@ -111,6 +171,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut highest_daa_seen: Option<u64> = None;
     let mut stop_reason: Option<String> = None;
     let mut observed_gap_ranges: Vec<(u64, u64)> = Vec::new();
+    // Detector pipeline observability: counts hits per detector
+    // kind across the run. Validates against real mainnet outputs
+    // that placeholder discriminators don't false-positive.
+    let mut detector_hits_total = 0usize;
+    let mut detector_hits_per_kind: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
 
     loop {
         if max_notifications != 0
@@ -205,6 +271,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             block.is_finalized,
                             block.served_by
                         );
+                        record_detector_hits(
+                            &block,
+                            &mut detector_hits_total,
+                            &mut detector_hits_per_kind,
+                            &mut event_writer,
+                        )?;
                         write_event_line(&mut event_writer, json!({
                             "kind": "notification",
                             "type": "BlockAdded",
@@ -238,6 +310,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 block.is_finalized,
                                 block.served_by
                             );
+                        }
+                        for block in &added_chain_blocks {
+                            record_detector_hits(
+                                block,
+                                &mut detector_hits_total,
+                                &mut detector_hits_per_kind,
+                                &mut event_writer,
+                            )?;
                         }
                         write_event_line(&mut event_writer, json!({
                             "kind": "notification",
@@ -294,8 +374,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_stop_reason =
         stop_reason.unwrap_or_else(|| "receiver closed by smoke runner".to_owned());
 
+    let per_kind_summary = if detector_hits_per_kind.is_empty() {
+        "none".to_owned()
+    } else {
+        detector_hits_per_kind
+            .iter()
+            .map(|(k, n)| format!("{k}:{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     println!(
-        "summary duration_seconds={} blocks={} virtual_chain_changed={} recovery_required={} total={} highest_daa_seen={:?} reconnects={} connections={} stop_reason={}",
+        "summary duration_seconds={} blocks={} virtual_chain_changed={} recovery_required={} total={} highest_daa_seen={:?} reconnects={} connections={} detector_hits_total={} detector_hits_per_kind={} stop_reason={}",
         elapsed_seconds,
         block_added,
         virtual_chain_changed,
@@ -304,6 +393,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         highest_daa_seen,
         reconnects,
         connections,
+        detector_hits_total,
+        per_kind_summary,
         final_stop_reason
     );
 
@@ -328,6 +419,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|(from, to)| json!({"from": from, "to": to}))
                 .collect::<Vec<_>>(),
+            "detectorHitsTotal": detector_hits_total,
+            "detectorHitsPerKind": detector_hits_per_kind
+                .iter()
+                .map(|(kind, count)| (kind.clone(), json!(count)))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
             "capabilities": {
                 "endpoint": capabilities.endpoint,
                 "networkId": capabilities.server_info.network_id,

@@ -18,3 +18,9 @@ reqwest.workspace = true
 rustls.workspace = true
 tokio-tungstenite.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+# Used by examples/continuous_wrpc_smoke.rs to dispatch the
+# detector registry against live wRPC traffic. Kept dev-only so
+# kasgraph-rpc itself stays focused on transport + parsing.
+kasgraph-detectors.workspace = true
