@@ -2,7 +2,14 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest live validation (2026-05-26 — first 15-minute soak stayed clean)
+## Latest commit arc (2026-05-26 — NDJSON event trace from the soak runner)
+
+- `continuous_wrpc_smoke.rs` now accepts `KASGRAPH_WRPC_EVENT_NDJSON=<path>`. When set, every driver event (`Connected`, `ReconnectScheduled`, `GapDetected`, `Stopped`) and every notification (`BlockAdded`, `VirtualChainChanged`, `RecoveryRequired`) is appended as a JSON object with a `ts_ms` unix-millisecond timestamp.
+- Output uses `BufWriter<File>` and is flushed + closed cleanly on shutdown. Path parent dirs are created on the fly.
+- Designed as a replayable trace artifact for diffing soak runs and feeding into the next jump: a targeted integration test that exercises the rpc driver against a mock ws server simulating reconnect + stale-replay + overlap and asserts on the resulting NDJSON.
+- 85 tests still green; build has zero warnings.
+
+## Earlier live validation (2026-05-26 — first 15-minute soak stayed clean)
 
 - Ran:
   - `KASGRAPH_WRPC_DURATION_SECONDS=900 KASGRAPH_WRPC_MAX_MESSAGES=0 KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-900s.json cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`

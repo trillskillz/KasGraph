@@ -1,7 +1,9 @@
 use std::{
-    env, fs,
+    env,
+    fs::{self, File},
+    io::{BufWriter, Write},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use kasgraph_rpc::{
@@ -10,6 +12,28 @@ use kasgraph_rpc::{
 };
 use serde_json::json;
 use tokio::sync::mpsc;
+
+/// Append one NDJSON line stamped with a unix-ms timestamp. No-op
+/// when no event log was requested. Errors are surfaced (a broken
+/// trace makes the whole soak un-replayable, so we'd rather fail
+/// fast than silently lose lines).
+fn write_event_line(
+    writer: &mut Option<BufWriter<File>>,
+    mut payload: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(writer) = writer else {
+        return Ok(());
+    };
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("ts_ms".to_owned(), serde_json::Value::from(ts_ms));
+    }
+    writeln!(writer, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let summary_json_path = env::var("KASGRAPH_WRPC_SUMMARY_JSON")
         .ok()
         .map(PathBuf::from);
+    let event_ndjson_path = env::var("KASGRAPH_WRPC_EVENT_NDJSON")
+        .ok()
+        .map(PathBuf::from);
+
+    let mut event_writer = match event_ndjson_path.as_ref() {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            Some(BufWriter::new(File::create(path)?))
+        }
+        None => None,
+    };
 
     let client = MultiRpcClient::new(RpcClientConfig {
         primary: RpcEndpoint {
@@ -105,20 +142,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         connections += 1;
                         reconnects = reconnects.max(reconnect_count);
                         println!("[event] Connected reconnect_count={reconnect_count}");
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "driver",
+                            "event": "Connected",
+                            "reconnect_count": reconnect_count,
+                        }))?;
                     }
                     SubscriptionDriverEvent::ReconnectScheduled { reconnect_count, delay_ms, reason, last_emitted_daa, .. } => {
                         reconnects = reconnects.max(reconnect_count);
                         println!("[event] ReconnectScheduled reconnect_count={reconnect_count} delay_ms={delay_ms} last_emitted_daa={last_emitted_daa:?} reason={reason}");
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "driver",
+                            "event": "ReconnectScheduled",
+                            "reconnect_count": reconnect_count,
+                            "delay_ms": delay_ms,
+                            "last_emitted_daa": last_emitted_daa,
+                            "reason": reason,
+                        }))?;
                     }
                     SubscriptionDriverEvent::GapDetected { reconnect_count, from_daa_score, to_daa_score, .. } => {
                         reconnects = reconnects.max(reconnect_count);
                         observed_gap_ranges.push((from_daa_score, to_daa_score));
                         println!("[event] GapDetected reconnect_count={reconnect_count} from={from_daa_score} to={to_daa_score}");
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "driver",
+                            "event": "GapDetected",
+                            "reconnect_count": reconnect_count,
+                            "from_daa_score": from_daa_score,
+                            "to_daa_score": to_daa_score,
+                        }))?;
                     }
                     SubscriptionDriverEvent::Stopped { reconnect_count, reason, last_emitted_daa, .. } => {
                         reconnects = reconnects.max(reconnect_count);
                         stop_reason = Some(reason.clone());
                         println!("[event] Stopped reconnect_count={reconnect_count} last_emitted_daa={last_emitted_daa:?} reason={reason}");
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "driver",
+                            "event": "Stopped",
+                            "reconnect_count": reconnect_count,
+                            "last_emitted_daa": last_emitted_daa,
+                            "reason": reason,
+                        }))?;
                     }
                 }
             }
@@ -141,6 +205,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             block.is_finalized,
                             block.served_by
                         );
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "notification",
+                            "type": "BlockAdded",
+                            "index": index,
+                            "hash": block.hash,
+                            "daa_score": block.daa_score,
+                            "blue_score": block.blue_score,
+                            "is_finalized": block.is_finalized,
+                            "served_by": block.served_by,
+                        }))?;
                     }
                     ChainNotification::VirtualChainChanged {
                         removed_chain_block_hashes,
@@ -165,6 +239,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 block.served_by
                             );
                         }
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "notification",
+                            "type": "VirtualChainChanged",
+                            "index": index,
+                            "removed_count": removed_chain_block_hashes.len(),
+                            "added_count": added_chain_blocks.len(),
+                            "removed_hashes": removed_chain_block_hashes,
+                            "added_blocks": added_chain_blocks.iter().map(|b| json!({
+                                "hash": b.hash,
+                                "daa_score": b.daa_score,
+                                "blue_score": b.blue_score,
+                                "is_finalized": b.is_finalized,
+                                "served_by": b.served_by,
+                            })).collect::<Vec<_>>(),
+                        }))?;
                     }
                     ChainNotification::RecoveryRequired {
                         from_daa_score,
@@ -176,6 +265,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "[{index}] RecoveryRequired from={} to={} reason={}",
                             from_daa_score, to_daa_score, reason
                         );
+                        write_event_line(&mut event_writer, json!({
+                            "kind": "notification",
+                            "type": "RecoveryRequired",
+                            "index": index,
+                            "from_daa_score": from_daa_score,
+                            "to_daa_score": to_daa_score,
+                            "reason": reason,
+                        }))?;
                     }
                 }
             }
@@ -185,6 +282,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(receiver);
     drop(event_receiver);
     handle.await?;
+
+    if let Some(mut writer) = event_writer.take() {
+        writer.flush()?;
+        if let Some(path) = event_ndjson_path.as_ref() {
+            println!("wrote event_ndjson={}", path.display());
+        }
+    }
 
     let elapsed_seconds = started.elapsed().as_secs();
     let final_stop_reason =
