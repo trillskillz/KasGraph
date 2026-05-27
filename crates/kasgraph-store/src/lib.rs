@@ -13,7 +13,7 @@
 //!     Postgres side.
 //!   - Phase 2.8: POI per-block hash of indexed state.
 
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use thiserror::Error;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -29,7 +29,9 @@ pub enum StoreError {
     #[error("invalid subgraph id `{0}`: only ASCII lowercase letters, numbers, and underscores are allowed")]
     InvalidSubgraphId(String),
 
-    #[error("POI mismatch for subgraph `{subgraph}` at block {block}: expected {expected}, got {got}")]
+    #[error(
+        "POI mismatch for subgraph `{subgraph}` at block {block}: expected {expected}, got {got}"
+    )]
     PoiMismatch {
         subgraph: String,
         block: u64,
@@ -232,7 +234,10 @@ impl Store {
         Ok(())
     }
 
-    pub async fn insert_poi_checkpoint(&self, checkpoint: &PoiCheckpoint) -> Result<(), StoreError> {
+    pub async fn insert_poi_checkpoint(
+        &self,
+        checkpoint: &PoiCheckpoint,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO kasgraph_poi \
              (subgraph, block_daa_score, poi_hash) \

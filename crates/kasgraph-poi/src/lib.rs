@@ -14,7 +14,7 @@
 //! "Sorted canonical" is defined per subgraph in Phase 2.8 — the
 //! current scaffold accepts pre-canonicalized bytes.
 
-use blake2::{Blake2b, Digest, digest::consts::U32};
+use blake2::{digest::consts::U32, Blake2b, Digest};
 use thiserror::Error;
 
 pub type PoiHash = [u8; 32];
@@ -29,7 +29,10 @@ pub enum PoiError {
 /// canonicalized entity-state bytes for this block.
 ///
 /// `prior_poi` is `[0u8; 32]` at genesis.
-pub fn compute_poi(prior_poi: &PoiHash, canonical_entity_bytes: &[u8]) -> Result<PoiHash, PoiError> {
+pub fn compute_poi(
+    prior_poi: &PoiHash,
+    canonical_entity_bytes: &[u8],
+) -> Result<PoiHash, PoiError> {
     if canonical_entity_bytes.is_empty() {
         return Err(PoiError::EmptyEntityBytes);
     }

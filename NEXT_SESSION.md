@@ -1,12 +1,195 @@
 # Next-session queue
 
-Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are the continuous wRPC loop, committed-state SQL unwind, and the OpenSilver fingerprint sync.
+Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — health-probe loop in continuous mode)
+## Latest live validation (2026-05-26 — first 15-minute soak stayed clean)
+
+- Ran:
+  - `KASGRAPH_WRPC_DURATION_SECONDS=900 KASGRAPH_WRPC_MAX_MESSAGES=0 KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-900s.json cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`
+- Observed real soak result against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`:
+  - 5597 notifications in 900 seconds
+  - `blocks=2800`
+  - `virtual_chain_changed=2797`
+  - `recovery_required=0`
+  - `highest_daa_seen=444267105`
+  - `reconnects=0`
+  - `connections=1`
+  - JSON artifact written successfully to `/tmp/kasgraph-wrpc-soak-900s.json`
+- This is the first longer live baseline showing the current driver stayed connected cleanly for 15 minutes with no synthetic recovery requests.
+
+## Previous live validation (2026-05-26 — first 5-minute soak stayed clean)
+
+- Ran:
+  - `KASGRAPH_WRPC_DURATION_SECONDS=300 KASGRAPH_WRPC_MAX_MESSAGES=0 KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-300s.json cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`
+- Observed real soak result against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`:
+  - 2177 notifications in 301 seconds
+  - `blocks=1087`
+  - `virtual_chain_changed=1090`
+  - `recovery_required=0`
+  - `highest_daa_seen=444258625`
+  - `reconnects=0`
+  - `connections=1`
+  - JSON artifact written successfully to `/tmp/kasgraph-wrpc-soak-300s.json`
+- This is the first medium-duration baseline showing the current driver stayed connected cleanly for five minutes with no synthetic recovery requests.
+
+## Previous live validation (2026-05-26 — first 60-second soak stayed clean)
+
+- Ran:
+  - `KASGRAPH_WRPC_DURATION_SECONDS=60 KASGRAPH_WRPC_MAX_MESSAGES=0 KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-60s.json cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`
+- Observed real soak result against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`:
+  - 465 notifications in 60 seconds
+  - `blocks=233`
+  - `virtual_chain_changed=232`
+  - `recovery_required=0`
+  - `highest_daa_seen=444252802`
+  - `reconnects=0`
+  - `connections=1`
+  - JSON artifact written successfully to `/tmp/kasgraph-wrpc-soak-60s.json`
+- This is the first longer-duration baseline showing the current driver stayed connected cleanly for a full minute with no synthetic recovery requests.
+
+## Previous commit arc (2026-05-26 — continuous soak runner now writes JSON summaries)
+
+- `crates/kasgraph-rpc/examples/continuous_wrpc_smoke.rs` now supports `KASGRAPH_WRPC_SUMMARY_JSON=<path>` and writes a structured JSON artifact containing:
+  - counts by notification type
+  - `highestDaaSeen`
+  - reconnect / connection counts
+  - stop reason
+  - observed gap ranges
+  - advertised capability bits
+- Verified live with:
+  - `KASGRAPH_WRPC_DURATION_SECONDS=10 KASGRAPH_WRPC_MAX_MESSAGES=0 KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-summary.json cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`
+- Observed real soak result against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`:
+  - 106 notifications in 10 seconds
+  - `highest_daa_seen=444251243`
+  - `reconnects=0`
+  - `connections=1`
+  - JSON artifact written successfully to `/tmp/kasgraph-wrpc-soak-summary.json`
+- Verification after the change:
+  - `cargo fmt && cargo test -p kasgraph-rpc`
+  - full `cargo test`
+- This gives the next session a reusable artifact format for comparing 1m / 5m / 15m live soaks.
+
+## Previous commit arc (2026-05-26 — continuous soak runner now emits reconnect/high-water summaries)
+
+- `kasgraph-rpc` now exposes `SubscriptionDriverEvent` plus `spawn_continuous_subscription_with_events(...)` so long-lived smoke/integration flows can observe:
+  - connect events
+  - reconnect scheduling
+  - synthetic gap detection
+  - driver stop reasons
+- `crates/kasgraph-rpc/examples/continuous_wrpc_smoke.rs` now supports wall-clock soak runs with:
+  - `KASGRAPH_WRPC_DURATION_SECONDS`
+  - optional `KASGRAPH_WRPC_MAX_MESSAGES=0` for duration-only stop
+  - compact summary output including `highest_daa_seen`, reconnect count, connection count, and stop reason
+- Added regression coverage:
+  - `continuous_subscription_emits_driver_events_for_reconnects`
+- Verified live with:
+  - `KASGRAPH_WRPC_DURATION_SECONDS=10 KASGRAPH_WRPC_MAX_MESSAGES=0 cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`
+- Observed real soak result against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`:
+  - 100 notifications in 10 seconds
+  - `highest_daa_seen=444248915`
+  - `reconnects=0`
+  - `connections=1`
+- Verification after the change:
+  - `cargo fmt && cargo test -p kasgraph-rpc`
+  - full `cargo test`
+- This gives the next session a much better baseline for longer live-node soak comparisons.
+
+## Previous commit arc (2026-05-26 — reconnect gap detection hardened against stale replay / overlap)
+
+- Fixed a real continuous-driver edge case in `kasgraph-rpc`: after reconnect, stale replay at or below the previous DAA watermark no longer clears the pending gap check.
+- Gap detection now waits for the first **actually new** DAA above the prior watermark, which also fixes overlapping `VirtualChainChanged` reconnect payloads where the notification includes both old and new DAA scores.
+- Added regression tests:
+  - `continuous_subscription_keeps_gap_check_pending_across_stale_replay_after_reconnect`
+  - `continuous_subscription_detects_gap_when_virtual_chain_delta_overlaps_old_daa`
+- Verification after the change:
+  - `cargo fmt && cargo test -p kasgraph-rpc`
+  - full `cargo test`
+- This is a meaningful Phase 2.3 hardening step: reconnects shaped like replay + jump no longer silently suppress synthetic recovery.
+
+## Previous commit arc (2026-05-26 — continuous smoke example landed on top of the `wss://` hardening)
+
+- Added `crates/kasgraph-rpc/examples/continuous_wrpc_smoke.rs`, which exercises the same `spawn_continuous_subscription(...)` reconnect-capable driver used by the node, but without requiring Postgres.
+- Verified it live with:
+  - `KASGRAPH_WRPC_MAX_MESSAGES=6 cargo run -p kasgraph-rpc --example continuous_wrpc_smoke`
+- That continuous smoke captured a mixed real stream from `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`:
+  - 5 `BlockAdded`
+  - 1 `VirtualChainChanged`
+  - 0 `RecoveryRequired`
+- This is important because it proves the in-tree continuous driver can hold a real public mainnet stream end-to-end now that TLS/provider setup is correct.
+- README / STATUS / NEXT_SESSION / RPC reference were updated again to point the next agent at the new smoke path and the remaining reconnect/recovery goals.
+
+## Previous commit arc (2026-05-26 — live smoke example + real `wss://` path hardened)
+
+- Added `crates/kasgraph-rpc/examples/live_wrpc_smoke.rs` for repeatable public-node validation without ad hoc scripts.
+- The repo now explicitly installs a rustls crypto provider before websocket connects, which fixed a real runtime blocker: `wss://` had previously failed with `TLS support not compiled in` and then with rustls `CryptoProvider` panics.
+- `cargo run -p kasgraph-rpc --example live_wrpc_smoke` now works against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json` from this environment.
+- That live smoke captured real notifications from mainnet, including both:
+  - `BlockAdded`
+  - `VirtualChainChanged` (empty add/remove delta in the observed sample)
+- `kasgraph-node` capability-gating was factored into a dedicated helper and now has direct unit coverage for rejecting:
+  - `rpcApiVersion < 1`
+  - missing `hasMessageId`
+  - missing `hasNotifyCommand`
+- Verification after the change:
+  - `cargo fmt`
+  - `cargo test -p kasgraph-rpc -p kasgraph-node`
+  - `cargo run -p kasgraph-rpc --example live_wrpc_smoke`
+  - full `cargo test`
+- This closes another real gap: repo-local live validation no longer depends on external scratch scripts, and public `wss://` endpoints now actually work through the in-tree client.
+
+## Previous commit arc (2026-05-26 — capability probe landed for continuous mode)
+
+- `kasgraph-rpc` now exposes `probe_live_capabilities()`, which calls `getServerInfo` plus `getInfo` against the configured endpoint and returns parsed capability data.
+- New parsed structs landed in `kasgraph-rpc`: `ServerInfo`, `NodeInfo`, and `LiveRpcCapabilities`.
+- `kasgraph-node` continuous mode now runs that probe before subscribing and bails early if the node does not advertise:
+  - `rpcApiVersion >= 1`
+  - `hasMessageId = true`
+  - `hasNotifyCommand = true`
+- Unsynced nodes are now surfaced as a warning during preflight instead of being silently accepted.
+- New regression tests:
+  - `probe_live_capabilities_reads_http_endpoint`
+  - `probe_live_capabilities_reads_wrpc_json_endpoint`
+- `cargo test -p kasgraph-rpc -p kasgraph-node` and full `cargo test` are green after the capability-probe change.
+- This tightens the live path meaningfully: continuous ingestion now fails fast on incompatible public nodes instead of getting further into subscribe/recovery flows before exploding.
+
+## Previous commit arc (2026-05-26 — point RPC over JSON wRPC landed)
+
+- Follow-up live probing against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json` confirmed that point calls like `getBlock`, `getBlockDagInfo`, and `getVirtualChainFromBlock` work over the same JSON wRPC websocket path, not just `getServerInfo` / `getInfo` and subscriptions.
+- `crates/kasgraph-rpc/src/lib.rs` now detects `ws://` / `wss://` endpoint URLs for point RPC and performs a one-shot JSON wRPC request instead of assuming HTTP POST.
+- The wRPC point-response shape is normalized so existing parsers can consume live responses that come back as `{"method":"getBlock", "params": {...}}` rather than HTTP-style `{"result": {...}}`.
+- New regression tests:
+  - `fetch_block_supports_wrpc_json_endpoint`
+  - `recover_blocks_in_daa_range_supports_wrpc_json_endpoint`
+- `cargo test -p kasgraph-rpc` and full `cargo test` are green after the ws point-RPC fallback change.
+- This closes a real Phase 2.3 gap: the confirmed public node can now support subscription, hash hydration, and anchor-based recovery through the same public websocket endpoint instead of needing a separate HTTP JSON-RPC URL.
+
+## Previous commit arc (2026-05-26 — real live wRPC framing validated and code retargeted)
+
+- A reachable public mainnet node was confirmed: `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`.
+- Live probing showed `getServerInfo` and `getInfo` both succeed there, while the earlier guessed `notifyBlockAdded` / `notifyVirtualChainChanged` methods fail with `RPC method not found`.
+- Upstream client source (`kaspa-wrpc-client`) was checked and confirmed that live notifications use generic `subscribe` / `unsubscribe` RPC ops carrying a serialized `Scope` payload, not `notify*` RPC methods.
+- Live probing then confirmed the actual JSON wire shape:
+  - subscribe request: `{"method":"subscribe","params":{"BlockAdded":{}}}`
+  - virtual-chain subscribe request: `{"method":"subscribe","params":{"VirtualChainChanged":{"include_accepted_transaction_ids":false}}}`
+  - subscribe ack: `{"method":"subscribe","params":{"id":...}}`
+  - live notifications: `blockAddedNotification` / `virtualChainChangedNotification` with nested `params.BlockAdded` / `params.VirtualChainChanged` payloads
+- `crates/kasgraph-rpc/src/lib.rs` was updated to use those real subscribe payloads, recognize lowercase `*Notification` method names, and unwrap the nested scope payload before parsing.
+- `cargo test -p kasgraph-rpc` and full `cargo test` are green after the live-wire-format change.
+- Resolver/public-node discovery is still noisy from this environment (`403` / `404` / `523` / SSL mismatch on other candidates), but true wire validation is no longer blocked.
+
+## Previous commit arc (2026-05-26 — anchor-based active gap recovery)
+
+- `MultiRpcClient` now exposes `recover_blocks_in_daa_range(start_hash, from, to)`, which calls `getVirtualChainFromBlock`, parses `removedChainBlockHashes` / `addedChainBlockHashes`, fetches the added blocks, and filters them to the requested DAA window before re-emitting a `VirtualChainChanged` notification.
+- `IngestionState::recovery_anchor_hash(from_daa)` derives the highest locally known pre-gap block hash from committed + probabilistic state.
+- `run_continuous_ingestion` now prefers anchor-based recovery for `RecoveryRequired` events and only falls back to `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` when no local anchor can be derived.
+- New tests: `recover_blocks_in_daa_range_uses_virtual_chain_delta` in `kasgraph-rpc` and `recovery_anchor_hash_prefers_highest_known_block_below_gap_start` in `kasgraph-node`.
+- `cargo test -p kasgraph-rpc -p kasgraph-node` is green.
+
+## Previous commit arc (2026-05-26 — health-probe loop in continuous mode)
 
 - `run_continuous_ingestion` now spawns `MultiRpcClient::spawn_health_probe_loop` alongside the subscription driver, so `endpoint_health()` stays fresh while the wRPC subscription is the only active traffic.
 - The probe handle is explicitly aborted on exit (the loop has no built-in shutdown signal); without that the task would keep firing every interval until process exit.
-- No test surface change — the probe loop is a background timer best validated via integration tests. The build remains green at 59 tests.
+- No test surface change — the probe loop is a background timer best validated via integration tests. The build remained green at 59 tests before the unrelated `kasgraph-stream` failure below.
 
 ## Previous commit arc (2026-05-26 — active gap recovery on the consumer side)
 
@@ -82,11 +265,11 @@ The Graph compatibility deep dive is now landed in `docs/references/THEGRAPH_REF
 
 What landed:
 
-
 - Minimal committed-vs-probabilistic ingestion state in `kasgraph-node`.
 - Minimal live-style notification model in `kasgraph-rpc` / `kasgraph-node` (`BlockAdded`, `VirtualChainChanged`, `RecoveryRequired`).
 - JSONL notification parsing in `kasgraph-rpc`, with `KASGRAPH_NOTIFICATION_JSONL` support in `kasgraph-node` so structured event streams can be injected directly.
-- Initial websocket subscription bootstrap in `kasgraph-rpc` (`notifyBlockAdded` + `notifyVirtualChainChanged`), including parsing of upstream-style event envelopes.
+- Real websocket subscription bootstrap in `kasgraph-rpc` via generic `subscribe` payloads for `BlockAdded` and `VirtualChainChanged`, matching live mainnet wRPC behavior.
+- Parsing of upstream-style event envelopes, including real live `blockAddedNotification` / `virtualChainChangedNotification` wrappers with nested scope payloads.
 - Virtual-chain hydration in `kasgraph-rpc` so hash-only `virtualChainChanged` websocket payloads are resolved back into fetched blocks.
 - Idle-bounded websocket reads in `kasgraph-rpc`, with `max_messages = 0` meaning unbounded capture and `KASGRAPH_NOTIFICATION_IDLE_TIMEOUT_MS` available in `kasgraph-node` to stop quiet streams cleanly.
 - Explicit websocket subscription error handling in `kasgraph-rpc`, so server-side rejections no longer look like an empty or quiet stream.
@@ -96,8 +279,9 @@ What landed:
 
 What still needs to land:
 
-- **Live-network validation**: point continuous mode at a real Kaspa wRPC node and confirm the JSON framing assumed by `parse_ws_message` matches the wire format. If the upstream sends bincode or a different envelope shape, extend the parser; the rest of the pipeline does not change.
-- **Real DAA-range RPC method**: `MultiRpcClient::fetch_blocks_in_daa_range(from, to)` so active gap recovery does not need an operator-curated hash list. Today the path uses `recover_blocks_by_hashes`, which means operators have to know the missing hashes ahead of time — fine for forensic replay, not for unattended gap recovery.
+- **Active recovery-path validation**: the 60s / 5m / 15m passive soaks are all clean, so the next best move is no longer “wait longer” — it is to force or capture reconnects deliberately. Add optional newline-delimited event-log output from the smoke runner and/or a controlled reconnect/fault-injection harness around `spawn_continuous_subscription_with_events(...)` so gap detection and recovery can be validated against real trace shapes instead of hoping the public node flakes.
+- **Live-node validation of anchor-based recovery**: now that point RPC over JSON wRPC is wired, use those forced/captured reconnect traces to inspect the exact `getVirtualChainFromBlock` responses and confirm the new recovery path behaves correctly across reconnects and deeper selected-chain churn.
+- **Next likely code move**: extend `continuous_wrpc_smoke` with optional NDJSON event output (driver events + notification summaries) and then add a targeted integration test or mock harness that simulates reconnect + stale replay + overlap patterns while persisting the resulting trace artifact.
 
 ### 2. Phase 2.4 follow-through — real DB-backed tests and node integration
 
@@ -137,6 +321,10 @@ The fingerprint engine and per-pattern registry are live. What remains:
 - The current POI bytes are still derived from block metadata only (`hash`, `daa`, `blue`, `finalized`, `served_by`). That is good enough for scaffold wiring, not for final indexing correctness.
 - The current reorg handling is intentionally limited: committed conflicts are logged and ignored until deeper rollback support lands; only probabilistic ranges are actively rolled back.
 - Existing tests use fast unit coverage only. No live Postgres fixture is wired yet, so the next useful jump is `sqlx::test` once `DATABASE_URL` or a dedicated test setup exists.
+
+## Fresh blocker note
+
+- General public-node discovery is still flaky from this environment. One live node is confirmed reachable (`eric.kaspa.stream`) and now usable for both subscriptions and point RPC, but other resolver/public-node candidates were still returning 403/404/523 or SSL mismatch responses, so there is not yet a robust multi-node discovery path for broader live validation.
 
 ## Optional / longer-horizon
 

@@ -124,7 +124,10 @@ pub fn detect_in_output(
 fn payload_to_json(payload: BTreeMap<&'static str, Vec<u8>>) -> serde_json::Value {
     let mut map = serde_json::Map::with_capacity(payload.len());
     for (field, bytes) in payload {
-        map.insert(field.to_owned(), serde_json::Value::String(hex::encode(bytes)));
+        map.insert(
+            field.to_owned(),
+            serde_json::Value::String(hex::encode(bytes)),
+        );
     }
     serde_json::Value::Object(map)
 }
@@ -176,6 +179,8 @@ mod tests {
         // canonical bytes start with 0x01, so this collides only if
         // the registry was changed. Asserting no Ownable hit catches
         // accidental over-matching.
-        assert!(hits.iter().all(|h| h.kind != DetectorKind::OpenSilverOwnable));
+        assert!(hits
+            .iter()
+            .all(|h| h.kind != DetectorKind::OpenSilverOwnable));
     }
 }

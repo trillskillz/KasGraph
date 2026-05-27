@@ -129,8 +129,16 @@ mod tests {
                 0x20, 0x21, 0x22, // suffix
             ],
             masked_windows: vec![
-                MaskedWindow { field: "owner", offset: 4, len: 3 },
-                MaskedWindow { field: "state", offset: 9, len: 2 },
+                MaskedWindow {
+                    field: "owner",
+                    offset: 4,
+                    len: 3,
+                },
+                MaskedWindow {
+                    field: "state",
+                    offset: 9,
+                    len: 2,
+                },
             ],
         }
     }
@@ -202,7 +210,11 @@ mod tests {
     fn validate_rejects_out_of_bounds_window() {
         let f = Fingerprint {
             bytes: vec![0x00; 4],
-            masked_windows: vec![MaskedWindow { field: "x", offset: 2, len: 5 }],
+            masked_windows: vec![MaskedWindow {
+                field: "x",
+                offset: 2,
+                len: 5,
+            }],
         };
         assert!(f.validate().is_err());
     }
@@ -212,8 +224,16 @@ mod tests {
         let f = Fingerprint {
             bytes: vec![0x00; 16],
             masked_windows: vec![
-                MaskedWindow { field: "a", offset: 0, len: 5 },
-                MaskedWindow { field: "b", offset: 3, len: 5 },
+                MaskedWindow {
+                    field: "a",
+                    offset: 0,
+                    len: 5,
+                },
+                MaskedWindow {
+                    field: "b",
+                    offset: 3,
+                    len: 5,
+                },
             ],
         };
         assert!(f.validate().is_err());
@@ -224,8 +244,16 @@ mod tests {
         let f = Fingerprint {
             bytes: vec![0x00; 16],
             masked_windows: vec![
-                MaskedWindow { field: "a", offset: 0, len: 5 },
-                MaskedWindow { field: "b", offset: 5, len: 5 },
+                MaskedWindow {
+                    field: "a",
+                    offset: 0,
+                    len: 5,
+                },
+                MaskedWindow {
+                    field: "b",
+                    offset: 5,
+                    len: 5,
+                },
             ],
         };
         assert!(f.validate().is_ok());

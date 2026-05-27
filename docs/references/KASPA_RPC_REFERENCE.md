@@ -209,9 +209,9 @@ The reliable ingestion pattern is:
 
 1. handshake with `GetServerInfo`
 2. snapshot tip with `GetBlockDagInfo`
-3. subscribe to `NotifyBlockAdded`
-4. subscribe to `NotifyVirtualChainChanged`
-5. optionally subscribe to `NotifyVirtualDaaScoreChanged` for operator metrics
+3. issue generic `subscribe` for `BlockAdded`
+4. issue generic `subscribe` for `VirtualChainChanged`
+5. optionally subscribe to `VirtualDaaScoreChanged` for operator metrics
 6. on any socket drop or suspected gap, recover from the last durable selected-chain anchor using `GetVirtualChainFromBlock` or `V2`
 7. re-fetch missing blocks with `GetBlock` / `GetBlocks`
 8. only commit blocks after KasGraph's own finality threshold policy says they are safe
@@ -225,30 +225,81 @@ KasGraph needs both because it is a BlockDAG indexer, not a simple longest-chain
 
 ### Notification payloads
 
-#### `NotifyBlockAdded`
+#### Live wRPC JSON shape validated against a real mainnet node
 
-Request:
+Validated reachable endpoint from this environment:
 
-- `command: Command`
+- `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`
 
-Notification:
+Validated subscribe requests:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"subscribe","params":{"BlockAdded":{}}}
+{"jsonrpc":"2.0","id":2,"method":"subscribe","params":{"VirtualChainChanged":{"include_accepted_transaction_ids":false}}}
+```
+
+Validated subscribe acknowledgement shape:
+
+```json
+{"id":1,"method":"subscribe","params":{"id":5463}}
+```
+
+Validated point-call response shape on the same websocket path:
+
+```json
+{"id":3,"method":"getBlockDagInfo","params":{...}}
+{"id":4,"method":"getBlock","params":{"block":{...}}}
+{"id":5,"method":"getVirtualChainFromBlock","params":{"addedChainBlockHashes":[...],"removedChainBlockHashes":[...]}}
+```
+
+Validated capability-probe responses on the same websocket path:
+
+```json
+{"id":1,"method":"getServerInfo","params":{"networkId":"mainnet","rpcApiVersion":1,"rpcApiRevision":0,"serverVersion":"1.0.1","isSynced":true,"hasUtxoIndex":true,"virtualDaaScore":...}}
+{"id":2,"method":"getInfo","params":{"serverVersion":"1.0.1","isSynced":true,"hasMessageId":true,"hasNotifyCommand":true,"isUtxoIndexed":true,...}}
+```
+
+Validated notification envelope shapes:
+
+```json
+{"method":"blockAddedNotification","params":{"BlockAdded":{"block":{...}}}}
+{"method":"virtualChainChangedNotification","params":{"VirtualChainChanged":{"removedChainBlockHashes":[],"addedChainBlockHashes":[]}}}
+```
+
+This means KasGraph should not call `notifyBlockAdded` / `notifyVirtualChainChanged` as direct RPC methods on live JSON wRPC nodes. The upstream client uses the generic `subscribe` / `unsubscribe` RPC ops with serialized scope payloads. It also means a public JSON wRPC websocket can serve both streaming notifications and point RPC reads, so KasGraph does not need a separate HTTP endpoint just to hydrate `addedChainBlockHashes` or call `getVirtualChainFromBlock`.
+
+Practical follow-through now landed in-repo:
+
+- `kasgraph-rpc` explicitly initializes rustls before websocket connects so `wss://` public nodes work without external helper scripts.
+- `crates/kasgraph-rpc/examples/live_wrpc_smoke.rs` can probe capabilities and capture a small notification sample from a real node.
+- `crates/kasgraph-rpc/examples/continuous_wrpc_smoke.rs` exercises the reconnect-capable continuous driver without requiring Postgres and now supports duration-based soak runs with reconnect/high-water summaries plus optional JSON summary artifacts.
+- `kasgraph-rpc` now exposes `SubscriptionDriverEvent` plus `spawn_continuous_subscription_with_events(...)` so integration/smoke code can observe connect/reconnect/gap/stop events directly.
+- Real smoke runs against `wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json` from this environment captured both `BlockAdded` and `VirtualChainChanged` notifications; the first 60-second, 5-minute, and 15-minute soaks all completed with zero reconnects and zero `RecoveryRequired` notifications.
+- Reconnect gap detection was hardened so stale replay or overlapping old/new DAA payloads after reconnect do not accidentally clear the pending recovery check before the first truly new DAA arrives.
+
+#### `BlockAdded`
+
+Subscribe payload:
+
+- `{"BlockAdded": {}}`
+
+Notification payload:
 
 - `block: RpcBlock`
 
 This is a DAG-arrival signal, not a finality signal.
 
-#### `NotifyVirtualChainChanged`
+#### `VirtualChainChanged`
 
-Request:
+Subscribe payload:
 
-- `include_accepted_transaction_ids: bool`
-- `command: Command`
+- `{"VirtualChainChanged": {"include_accepted_transaction_ids": bool}}`
 
-Notification:
+Notification payload:
 
-- `removed_chain_block_hashes`
-- `added_chain_block_hashes`
-- `accepted_transaction_ids`
+- `removedChainBlockHashes`
+- `addedChainBlockHashes`
+- `acceptedTransactionIds`
 
 This is the selected-chain delta stream and the most important reorg signal.
 
@@ -435,23 +486,22 @@ That decoding belongs in KasGraph detectors and mapping code.
 
 ### Not implemented yet
 
-- actual upstream wRPC subscription handshake using `NotifyBlockAdded` and `NotifyVirtualChainChanged`
-- real transport decoding of upstream notification frames into local `ChainNotification`
-- `GetVirtualChainFromBlock` / `V2` recovery calls against a live node
+- longer-run live validation of reconnect behavior against real public nodes
+- `GetVirtualChainFromBlock` / `V2` recovery calls against a live node under real reconnect/reorg traces beyond one-shot probes
 - removed-chain rollback of already-committed state
 - mempool and UTXO enrichment calls
-- explicit API-version compatibility gating via `GetServerInfo`
+- policy decisions on how strict capability-gating should be for unsynced nodes versus merely warning
+- optional persisted per-event reconnect/gap logs from soak runs so long sessions can be analyzed without preserving the full console transcript
 
 ## Recommended Phase 2.3 build order
 
-1. Add a real `GetServerInfo` probe and fail fast on incompatible RPC API version.
-2. Add live `NotifyBlockAdded` subscription decoding.
-3. Add live `NotifyVirtualChainChanged` subscription decoding.
-4. Track the last durable selected-chain anchor hash in storage.
-5. On reconnect, call `GetVirtualChainFromBlock` from that anchor.
-6. Replay removed blocks first, then added blocks, then persist a fresh POI checkpoint.
-7. Add `GetUtxosByAddresses` enrichment for address and covenant-centric subgraphs.
-8. Add `GetMempoolEntriesByAddresses` only after durable chain ingestion is solid.
+1. Add a real `GetServerInfo` / `GetInfo` probe and fail fast on incompatible advertised capabilities.
+2. Keep the now-validated generic `subscribe` JSON path covered with regression tests and a longer-running live smoke.
+3. Track the last durable selected-chain anchor hash in storage.
+4. On reconnect, call `GetVirtualChainFromBlock` from that anchor.
+5. Replay removed blocks first, then added blocks, then persist a fresh POI checkpoint.
+6. Add `GetUtxosByAddresses` enrichment for address and covenant-centric subgraphs.
+7. Add `GetMempoolEntriesByAddresses` only after durable chain ingestion is solid.
 
 ## KasGraph-specific takeaways
 

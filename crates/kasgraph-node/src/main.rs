@@ -25,14 +25,12 @@
 use std::{collections::BTreeMap, env, time::Duration};
 
 use anyhow::{Context, Result};
-use kasgraph_poi::{PoiHash, compute_poi, poi_hex};
+use kasgraph_poi::{compute_poi, poi_hex, PoiHash};
 use kasgraph_rpc::{
-    ChainNotification, IngestedBlock, MultiRpcClient, RpcClientConfig, RpcEndpoint,
-    SubscriptionBackoff, parse_notifications_jsonl,
+    parse_notifications_jsonl, ChainNotification, IngestedBlock, LiveRpcCapabilities,
+    MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
 };
-use kasgraph_store::{
-    CommittedBlockRecord, PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId,
-};
+use kasgraph_store::{CommittedBlockRecord, PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -127,14 +125,12 @@ struct ContinuousConfig {
     backoff_max_ms: u64,
     backoff_multiplier: f64,
     backoff_max_attempts: u32,
-    /// Hashes to feed into `recover_blocks_by_hashes` when the
-    /// continuous driver announces a runtime gap via a synthetic
-    /// `RecoveryRequired`. Empty (default) means gaps are logged
-    /// but no blocks are actively re-fetched — operators set
-    /// `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` to a comma-separated
-    /// list when they want best-effort recovery. Distinct from
-    /// `KASGRAPH_RECOVERY_BLOCK_HASHES`, which only drives the
-    /// one-shot bootstrap replay path.
+    /// Fallback hashes to feed into `recover_blocks_by_hashes`
+    /// when a runtime gap is announced but the node cannot derive
+    /// a local recovery anchor hash. Empty (default) means gaps
+    /// fall back to logging if anchor-based recovery is impossible.
+    /// Distinct from `KASGRAPH_RECOVERY_BLOCK_HASHES`, which only
+    /// drives the one-shot bootstrap replay path.
     gap_recovery_block_hashes: Vec<String>,
 }
 
@@ -200,28 +196,28 @@ impl NodeConfig {
                 .map(|value| parse_csv_env(&value))
                 .filter(|values| !values.is_empty())
                 .unwrap_or_else(|| {
-                    vec![
-                        env::var("KASGRAPH_BLOCK_HASH")
-                            .unwrap_or_else(|_| DEFAULT_BLOCK_HASH.to_owned()),
-                    ]
+                    vec![env::var("KASGRAPH_BLOCK_HASH")
+                        .unwrap_or_else(|_| DEFAULT_BLOCK_HASH.to_owned())]
                 }),
-            rpc: env::var("KASGRAPH_RPC_PRIMARY_URL").ok().map(|primary_url| RpcConfig {
-                primary_url,
-                primary_label: env::var("KASGRAPH_RPC_PRIMARY_LABEL")
-                    .unwrap_or_else(|_| DEFAULT_PRIMARY_RPC_LABEL.to_owned()),
-                timeout_ms: env::var("KASGRAPH_RPC_TIMEOUT_MS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(DEFAULT_RPC_TIMEOUT_MS),
-                health_probe_interval_ms: env::var("KASGRAPH_RPC_HEALTH_PROBE_INTERVAL_MS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(DEFAULT_HEALTH_PROBE_INTERVAL_MS),
-                backup_urls: env::var("KASGRAPH_RPC_BACKUP_URLS")
-                    .ok()
-                    .map(|value| parse_csv_env(&value))
-                    .unwrap_or_default(),
-            }),
+            rpc: env::var("KASGRAPH_RPC_PRIMARY_URL")
+                .ok()
+                .map(|primary_url| RpcConfig {
+                    primary_url,
+                    primary_label: env::var("KASGRAPH_RPC_PRIMARY_LABEL")
+                        .unwrap_or_else(|_| DEFAULT_PRIMARY_RPC_LABEL.to_owned()),
+                    timeout_ms: env::var("KASGRAPH_RPC_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(DEFAULT_RPC_TIMEOUT_MS),
+                    health_probe_interval_ms: env::var("KASGRAPH_RPC_HEALTH_PROBE_INTERVAL_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(DEFAULT_HEALTH_PROBE_INTERVAL_MS),
+                    backup_urls: env::var("KASGRAPH_RPC_BACKUP_URLS")
+                        .ok()
+                        .map(|value| parse_csv_env(&value))
+                        .unwrap_or_default(),
+                }),
             recovery: RecoveryConfig {
                 removed_block_hashes: env::var("KASGRAPH_REMOVED_BLOCK_HASHES")
                     .ok()
@@ -231,7 +227,9 @@ impl NodeConfig {
                     .ok()
                     .map(|value| parse_csv_env(&value))
                     .unwrap_or_default(),
-                recovery_range: parse_recovery_range(env::var("KASGRAPH_RECOVERY_RANGE").ok().as_deref()),
+                recovery_range: parse_recovery_range(
+                    env::var("KASGRAPH_RECOVERY_RANGE").ok().as_deref(),
+                ),
             },
             notification_stream: {
                 let jsonl = env::var("KASGRAPH_NOTIFICATION_JSONL").ok();
@@ -258,7 +256,10 @@ impl NodeConfig {
                 Some("continuous") => IngestMode::Continuous,
                 Some("bootstrap") | None => IngestMode::Bootstrap,
                 Some(other) => {
-                    warn!(value = other, "unknown KASGRAPH_INGEST_MODE; falling back to bootstrap");
+                    warn!(
+                        value = other,
+                        "unknown KASGRAPH_INGEST_MODE; falling back to bootstrap"
+                    );
                     IngestMode::Bootstrap
                 }
             },
@@ -331,7 +332,11 @@ async fn main() -> Result<()> {
 
     let config = NodeConfig::from_env();
 
-    info!(version = env!("CARGO_PKG_VERSION"), ?config, "kasgraph-node bootstrap");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        ?config,
+        "kasgraph-node bootstrap"
+    );
     info!("crates wired: rpc, store, detectors, mapping, poi, stream");
 
     match &config.database_url {
@@ -341,9 +346,7 @@ async fn main() -> Result<()> {
                 .context("failed to persist bootstrap state")?;
         }
         None => {
-            warn!(
-                "KASGRAPH_DATABASE_URL not set; skipping migrations and persistence bootstrap"
-            );
+            warn!("KASGRAPH_DATABASE_URL not set; skipping migrations and persistence bootstrap");
         }
     }
 
@@ -355,9 +358,13 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
     let store = Store::connect(database_url)
         .await
         .with_context(|| format!("connecting to store at {database_url}"))?;
-    store.migrate().await.context("running shared store migrations")?;
+    store
+        .migrate()
+        .await
+        .context("running shared store migrations")?;
 
-    let subgraph = SubgraphId::new(config.subgraph.clone()).context("validating subgraph schema id")?;
+    let subgraph =
+        SubgraphId::new(config.subgraph.clone()).context("validating subgraph schema id")?;
     store
         .ensure_subgraph_schema(&subgraph)
         .await
@@ -384,13 +391,9 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         IngestMode::Bootstrap => {
             let notifications = build_notifications(config, rpc_client.as_ref()).await?;
             for notification in notifications {
-                let _ = apply_and_persist_notification(
-                    &store,
-                    &subgraph,
-                    &mut ingestion,
-                    notification,
-                )
-                .await?;
+                let _ =
+                    apply_and_persist_notification(&store, &subgraph, &mut ingestion, notification)
+                        .await?;
             }
             info!(
                 committed_blocks = ingestion.committed.len(),
@@ -399,8 +402,14 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
             );
         }
         IngestMode::Continuous => {
-            run_continuous_ingestion(&store, &subgraph, &mut ingestion, config, rpc_client.as_ref())
-                .await?;
+            run_continuous_ingestion(
+                &store,
+                &subgraph,
+                &mut ingestion,
+                config,
+                rpc_client.as_ref(),
+            )
+            .await?;
             info!(
                 committed_blocks = ingestion.committed.len(),
                 probabilistic_blocks = ingestion.probabilistic.len(),
@@ -416,9 +425,7 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
 /// exercise it without standing up a Store fixture.
 fn validate_continuous_config(config: &NodeConfig) -> Result<()> {
     if config.continuous.ws_url.is_none() {
-        anyhow::bail!(
-            "KASGRAPH_INGEST_MODE=continuous requires KASGRAPH_NOTIFICATION_WS_URL"
-        );
+        anyhow::bail!("KASGRAPH_INGEST_MODE=continuous requires KASGRAPH_NOTIFICATION_WS_URL");
     }
     Ok(())
 }
@@ -457,6 +464,30 @@ async fn run_continuous_ingestion(
             backup_urls: Vec::new(),
         })
     });
+
+    let capabilities = driver_client
+        .probe_live_capabilities()
+        .await
+        .context("probing live RPC capabilities before continuous ingestion")?;
+    validate_live_capabilities(&capabilities)?;
+    if !capabilities.server_info.is_synced || !capabilities.node_info.is_synced {
+        warn!(
+            endpoint = capabilities.endpoint,
+            server_version = capabilities.server_info.server_version,
+            network_id = capabilities.server_info.network_id,
+            "live RPC capability probe succeeded but endpoint is not fully synced"
+        );
+    } else {
+        info!(
+            endpoint = capabilities.endpoint,
+            server_version = capabilities.server_info.server_version,
+            network_id = capabilities.server_info.network_id,
+            rpc_api_version = capabilities.server_info.rpc_api_version,
+            has_message_id = capabilities.node_info.has_message_id,
+            has_notify_command = capabilities.node_info.has_notify_command,
+            "live RPC capability probe passed"
+        );
+    }
 
     let backoff = SubscriptionBackoff {
         initial_delay: Duration::from_millis(continuous.backoff_initial_ms),
@@ -509,52 +540,72 @@ async fn run_continuous_ingestion(
         processed = processed.saturating_add(1);
 
         // Active gap recovery: when the driver-synthesized
-        // RecoveryRequired propagates through ingestion, try to
-        // fetch the missed blocks if operator has configured a
-        // hash list. The result is fed back through the same
-        // helper once — we explicitly do not loop on a second
-        // RecoveryRequired to avoid recovery storms.
+        // RecoveryRequired propagates through ingestion, first try
+        // to recover from the highest locally known pre-gap block
+        // via `getVirtualChainFromBlock`; only fall back to the
+        // operator-curated hash list when no local anchor exists.
+        // The result is fed back through the same helper once — we
+        // explicitly do not loop on a second RecoveryRequired to
+        // avoid recovery storms.
         if let Some((from_daa, to_daa)) = outcome.recovery_requested {
-            if !continuous.gap_recovery_block_hashes.is_empty() {
-                match driver_client
+            let recovery_result = if let Some(anchor_hash) =
+                ingestion.recovery_anchor_hash(from_daa)
+            {
+                info!(
+                    from_daa,
+                    to_daa,
+                    anchor_hash,
+                    "attempting anchor-based gap recovery via getVirtualChainFromBlock"
+                );
+                driver_client
+                    .recover_blocks_in_daa_range(&anchor_hash, from_daa, to_daa)
+                    .await
+            } else if !continuous.gap_recovery_block_hashes.is_empty() {
+                warn!(
+                    from_daa,
+                    to_daa,
+                    "no local recovery anchor found; falling back to KASGRAPH_GAP_RECOVERY_BLOCK_HASHES"
+                );
+                driver_client
                     .recover_blocks_by_hashes(
                         &continuous.gap_recovery_block_hashes,
                         from_daa,
                         to_daa,
                     )
                     .await
-                {
-                    Ok(recovery_notification) => {
-                        let recovered =
-                            apply_and_persist_notification(
-                                store,
-                                subgraph,
-                                ingestion,
-                                recovery_notification,
-                            )
-                            .await?;
-                        info!(
-                            from_daa,
-                            to_daa,
-                            committed = recovered.committed_count,
-                            "active gap recovery applied"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            from_daa,
-                            to_daa,
-                            error = %err,
-                            "active gap recovery failed; continuing live tail"
-                        );
-                    }
-                }
             } else {
                 warn!(
                     from_daa,
                     to_daa,
-                    "gap announced but KASGRAPH_GAP_RECOVERY_BLOCK_HASHES is empty; skipping active recovery"
+                    "gap announced but no local recovery anchor or KASGRAPH_GAP_RECOVERY_BLOCK_HASHES is available; skipping active recovery"
                 );
+                continue;
+            };
+
+            match recovery_result {
+                Ok(recovery_notification) => {
+                    let recovered = apply_and_persist_notification(
+                        store,
+                        subgraph,
+                        ingestion,
+                        recovery_notification,
+                    )
+                    .await?;
+                    info!(
+                        from_daa,
+                        to_daa,
+                        committed = recovered.committed_count,
+                        "active gap recovery applied"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        from_daa,
+                        to_daa,
+                        error = %err,
+                        "active gap recovery failed; continuing live tail"
+                    );
+                }
             }
         }
 
@@ -738,7 +789,9 @@ async fn build_notifications(
                         stream.idle_timeout_ms,
                     )
                     .await
-                    .with_context(|| format!("reading notification websocket stream from {ws_url}"));
+                    .with_context(|| {
+                        format!("reading notification websocket stream from {ws_url}")
+                    });
             }
 
             let bootstrap_client = build_rpc_client(&RpcConfig {
@@ -814,6 +867,30 @@ async fn fetch_or_fallback_blocks(
     Ok(vec![config.bootstrap_block.clone()])
 }
 
+fn validate_live_capabilities(capabilities: &LiveRpcCapabilities) -> Result<()> {
+    if capabilities.server_info.rpc_api_version < 1 {
+        anyhow::bail!(
+            "RPC endpoint {} reported unsupported rpcApiVersion={} (need >= 1)",
+            capabilities.endpoint,
+            capabilities.server_info.rpc_api_version
+        );
+    }
+    if !capabilities.node_info.has_message_id {
+        anyhow::bail!(
+            "RPC endpoint {} does not advertise hasMessageId=true; live wRPC subscription path expects message ids",
+            capabilities.endpoint
+        );
+    }
+    if !capabilities.node_info.has_notify_command {
+        anyhow::bail!(
+            "RPC endpoint {} does not advertise hasNotifyCommand=true; live wRPC subscription path expects generic subscribe semantics",
+            capabilities.endpoint
+        );
+    }
+
+    Ok(())
+}
+
 fn build_rpc_client(config: &RpcConfig) -> MultiRpcClient {
     MultiRpcClient::new(RpcClientConfig {
         primary: RpcEndpoint {
@@ -836,15 +913,20 @@ fn build_rpc_client(config: &RpcConfig) -> MultiRpcClient {
 }
 
 impl IngestionState {
-    fn apply_notification(&mut self, notification: ChainNotification) -> Result<IngestionTransition> {
+    fn apply_notification(
+        &mut self,
+        notification: ChainNotification,
+    ) -> Result<IngestionTransition> {
         match notification {
             ChainNotification::BlockAdded(block) => self.apply_block(block_from_rpc(block)),
             ChainNotification::VirtualChainChanged {
                 removed_chain_block_hashes,
                 added_chain_blocks,
             } => {
-                let mut rolled_back_probabilistic = self.remove_probabilistic_by_hashes(&removed_chain_block_hashes);
-                let committed_unwinds = self.remove_committed_by_hashes(&removed_chain_block_hashes);
+                let mut rolled_back_probabilistic =
+                    self.remove_probabilistic_by_hashes(&removed_chain_block_hashes);
+                let committed_unwinds =
+                    self.remove_committed_by_hashes(&removed_chain_block_hashes);
                 let mut committed_writes = Vec::new();
 
                 for block in added_chain_blocks {
@@ -865,10 +947,8 @@ impl IngestionState {
                 to_daa_score,
                 ..
             } => {
-                let rolled_back_probabilistic = self.remove_probabilistic_in_range(
-                    from_daa_score as i64,
-                    to_daa_score as i64,
-                );
+                let rolled_back_probabilistic =
+                    self.remove_probabilistic_in_range(from_daa_score as i64, to_daa_score as i64);
                 Ok(IngestionTransition {
                     committed_writes: Vec::new(),
                     rolled_back_probabilistic,
@@ -938,8 +1018,9 @@ impl IngestionState {
         let mut committed_writes = Vec::new();
         for score in promotable_scores {
             if let Some(probabilistic_block) = self.probabilistic.remove(&score) {
-                let poi_hash = compute_poi(&self.prior_poi, &probabilistic_block.canonical_entity_bytes)
-                    .context("computing committed block POI")?;
+                let poi_hash =
+                    compute_poi(&self.prior_poi, &probabilistic_block.canonical_entity_bytes)
+                        .context("computing committed block POI")?;
                 self.prior_poi = poi_hash;
                 self.committed.insert(score, probabilistic_block.clone());
                 committed_writes.push(CommittedBlockWrite {
@@ -988,7 +1069,11 @@ impl IngestionState {
     }
 
     fn remove_probabilistic_in_range(&mut self, from_daa: i64, to_daa: i64) -> Vec<BootstrapBlock> {
-        let scores: Vec<i64> = self.probabilistic.range(from_daa..=to_daa).map(|(score, _)| *score).collect();
+        let scores: Vec<i64> = self
+            .probabilistic
+            .range(from_daa..=to_daa)
+            .map(|(score, _)| *score)
+            .collect();
         let mut removed = Vec::new();
         for score in scores {
             if let Some(block) = self.probabilistic.remove(&score) {
@@ -1004,6 +1089,16 @@ impl IngestionState {
             .filter_map(|(score, block)| block.is_finalized.then_some(*score))
             .max()
             .unwrap_or_default()
+    }
+
+    fn recovery_anchor_hash(&self, from_daa: u64) -> Option<String> {
+        let cutoff = from_daa.saturating_sub(1) as i64;
+        self.committed
+            .iter()
+            .chain(self.probabilistic.iter())
+            .filter(|(score, _)| **score <= cutoff)
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, block)| block.hash.clone())
     }
 }
 
@@ -1055,6 +1150,7 @@ fn parse_recovery_range(value: Option<&str>) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kasgraph_rpc::{NodeInfo, ServerInfo};
 
     fn block(hash: &str, daa_score: i64, finalized: bool) -> BootstrapBlock {
         BootstrapBlock {
@@ -1067,6 +1163,57 @@ mod tests {
         }
     }
 
+    fn live_capabilities(
+        rpc_api_version: u64,
+        has_message_id: bool,
+        has_notify_command: bool,
+    ) -> LiveRpcCapabilities {
+        LiveRpcCapabilities {
+            endpoint: "primary".to_owned(),
+            server_info: ServerInfo {
+                server_version: "1.0.1".to_owned(),
+                network_id: "mainnet".to_owned(),
+                rpc_api_version,
+                rpc_api_revision: 0,
+                is_synced: true,
+                has_utxo_index: true,
+                virtual_daa_score: Some(123),
+            },
+            node_info: NodeInfo {
+                server_version: "1.0.1".to_owned(),
+                is_synced: true,
+                has_message_id,
+                has_notify_command,
+                is_utxo_indexed: true,
+                mempool_size: Some(0),
+                p2p_id: Some("peer-1".to_owned()),
+            },
+        }
+    }
+
+    #[test]
+    fn validate_live_capabilities_accepts_supported_endpoint() {
+        validate_live_capabilities(&live_capabilities(1, true, true)).unwrap();
+    }
+
+    #[test]
+    fn validate_live_capabilities_rejects_unsupported_rpc_api_version() {
+        let err = validate_live_capabilities(&live_capabilities(0, true, true)).unwrap_err();
+        assert!(err.to_string().contains("unsupported rpcApiVersion=0"));
+    }
+
+    #[test]
+    fn validate_live_capabilities_rejects_missing_message_ids() {
+        let err = validate_live_capabilities(&live_capabilities(1, false, true)).unwrap_err();
+        assert!(err.to_string().contains("hasMessageId=true"));
+    }
+
+    #[test]
+    fn validate_live_capabilities_rejects_missing_notify_command() {
+        let err = validate_live_capabilities(&live_capabilities(1, true, false)).unwrap_err();
+        assert!(err.to_string().contains("hasNotifyCommand=true"));
+    }
+
     #[test]
     fn bootstrap_poi_chain_is_deterministic() {
         let mut state = IngestionState::default();
@@ -1074,7 +1221,10 @@ mod tests {
         let second = state.apply_block(block("b", 2, true)).unwrap();
         assert_eq!(first.committed_writes.len(), 1);
         assert_eq!(second.committed_writes.len(), 1);
-        assert_ne!(first.committed_writes[0].poi_hash, second.committed_writes[0].poi_hash);
+        assert_ne!(
+            first.committed_writes[0].poi_hash,
+            second.committed_writes[0].poi_hash
+        );
     }
 
     #[test]
@@ -1099,6 +1249,18 @@ mod tests {
         assert_eq!(transition.rolled_back_probabilistic.len(), 2);
         assert_eq!(transition.committed_writes.len(), 1);
         assert_eq!(transition.committed_writes[0].block.hash, "c");
+    }
+
+    #[test]
+    fn recovery_anchor_hash_prefers_highest_known_block_below_gap_start() {
+        let mut state = IngestionState::default();
+        state.apply_block(block("committed-9", 9, true)).unwrap();
+        state.apply_block(block("prob-12", 12, false)).unwrap();
+        state.apply_block(block("prob-14", 14, false)).unwrap();
+
+        assert_eq!(state.recovery_anchor_hash(13), Some("prob-12".to_owned()));
+        assert_eq!(state.recovery_anchor_hash(20), Some("prob-14".to_owned()));
+        assert_eq!(state.recovery_anchor_hash(1), None);
     }
 
     #[test]
@@ -1148,7 +1310,9 @@ mod tests {
         let mut state = IngestionState::default();
         state.apply_block(block("committed-a", 100, true)).unwrap();
         state.apply_block(block("committed-b", 101, true)).unwrap();
-        state.apply_block(block("probabilistic-c", 102, false)).unwrap();
+        state
+            .apply_block(block("probabilistic-c", 102, false))
+            .unwrap();
         assert_eq!(state.committed.len(), 2);
 
         let transition = state
@@ -1169,7 +1333,10 @@ mod tests {
             .collect();
         assert_eq!(unwound_hashes, vec!["committed-a"]);
         assert_eq!(transition.rolled_back_probabilistic.len(), 1);
-        assert_eq!(transition.rolled_back_probabilistic[0].hash, "probabilistic-c");
+        assert_eq!(
+            transition.rolled_back_probabilistic[0].hash,
+            "probabilistic-c"
+        );
         assert!(!state.committed.contains_key(&100));
         assert!(state.committed.contains_key(&101));
     }
@@ -1288,7 +1455,9 @@ mod tests {
         assert_eq!(mapped.blue_score, 7);
         assert_eq!(mapped.served_by, "primary");
         assert!(mapped.is_finalized);
-        assert!(String::from_utf8(mapped.canonical_entity_bytes).unwrap().contains("finalized=true"));
+        assert!(String::from_utf8(mapped.canonical_entity_bytes)
+            .unwrap()
+            .contains("finalized=true"));
     }
 
     #[test]
@@ -1410,7 +1579,9 @@ mod tests {
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let notifications = runtime.block_on(build_notifications(&config, None)).unwrap();
+        let notifications = runtime
+            .block_on(build_notifications(&config, None))
+            .unwrap();
         assert_eq!(notifications.len(), 1);
         match &notifications[0] {
             ChainNotification::BlockAdded(block) => assert_eq!(block.hash, "stream-a"),

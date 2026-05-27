@@ -44,7 +44,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "ch
 
 # RPC / WebSocket
 reqwest = { version = "0.12", features = ["json"] }
-tokio-tungstenite = "0.24"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # Hashing (blake2 for POI; matches kaspa engine choice)
 blake2 = "0.10"

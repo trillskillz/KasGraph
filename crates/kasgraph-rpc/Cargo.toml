@@ -15,4 +15,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 tokio-tungstenite.workspace = true

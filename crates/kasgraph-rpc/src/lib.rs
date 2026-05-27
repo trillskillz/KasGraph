@@ -14,22 +14,30 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc, Once,
     },
     time::Duration,
 };
 
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, RwLock, mpsc},
+    sync::{mpsc, Mutex, RwLock},
     task::JoinHandle,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::warn;
+
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+fn ensure_rustls_provider_installed() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// One configured Kaspa RPC endpoint.
 #[derive(Debug, Clone)]
@@ -91,10 +99,7 @@ pub enum RpcError {
     },
 
     #[error("websocket subscription rejected by {endpoint}: {message}")]
-    SubscriptionRejected {
-        endpoint: String,
-        message: String,
-    },
+    SubscriptionRejected { endpoint: String, message: String },
 
     #[error("RPC returned a malformed response: {0}")]
     MalformedResponse(String),
@@ -140,6 +145,35 @@ pub struct BlockAuditRecord {
 pub struct EndpointHealth {
     pub endpoint: String,
     pub healthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub server_version: String,
+    pub network_id: String,
+    pub rpc_api_version: u64,
+    pub rpc_api_revision: u64,
+    pub is_synced: bool,
+    pub has_utxo_index: bool,
+    pub virtual_daa_score: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub server_version: String,
+    pub is_synced: bool,
+    pub has_message_id: bool,
+    pub has_notify_command: bool,
+    pub is_utxo_indexed: bool,
+    pub mempool_size: Option<u64>,
+    pub p2p_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRpcCapabilities {
+    pub endpoint: String,
+    pub server_info: ServerInfo,
+    pub node_info: NodeInfo,
 }
 
 /// Minimal live-ingestion notification surface for Phase 2.3.
@@ -222,6 +256,28 @@ impl MultiRpcClient {
         Ok(blocks)
     }
 
+    pub async fn probe_live_capabilities(&self) -> Result<LiveRpcCapabilities, RpcError> {
+        let backup_start = self.next_backup_index.fetch_add(1, Ordering::Relaxed);
+        let endpoints = self.config.failover_chain(backup_start);
+        let mut last_err = None;
+
+        for endpoint in endpoints {
+            match self.probe_live_capabilities_from_endpoint(&endpoint).await {
+                Ok(capabilities) => {
+                    self.set_endpoint_health(&endpoint.label, true).await;
+                    return Ok(capabilities);
+                }
+                Err(err) => {
+                    self.set_endpoint_health(&endpoint.label, false).await;
+                    warn!(endpoint = endpoint.label, error = %err, "kasgraph-rpc endpoint failed live capability probe; trying next source");
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or(RpcError::AllEndpointsFailed))
+    }
+
     pub async fn probe_health_once(&self) -> Vec<EndpointHealth> {
         let mut statuses = Vec::new();
 
@@ -271,9 +327,52 @@ impl MultiRpcClient {
             removed_chain_block_hashes: Vec::new(),
             added_chain_blocks: recovered
                 .into_iter()
-                .filter(|block| block.daa_score >= from_daa_score && block.daa_score <= to_daa_score)
+                .filter(|block| {
+                    block.daa_score >= from_daa_score && block.daa_score <= to_daa_score
+                })
                 .collect(),
         })
+    }
+
+    pub async fn recover_blocks_in_daa_range(
+        &self,
+        start_hash: &str,
+        from_daa_score: u64,
+        to_daa_score: u64,
+    ) -> Result<ChainNotification, RpcError> {
+        let backup_start = self.next_backup_index.fetch_add(1, Ordering::Relaxed);
+        let endpoints = self.config.failover_chain(backup_start);
+        let mut last_err = None;
+
+        for endpoint in endpoints {
+            match self
+                .fetch_virtual_chain_delta_from_endpoint(&endpoint, start_hash)
+                .await
+            {
+                Ok((removed_chain_block_hashes, added_chain_block_hashes)) => {
+                    self.set_endpoint_health(&endpoint.label, true).await;
+                    let added_chain_blocks = self
+                        .fetch_blocks(&added_chain_block_hashes)
+                        .await?
+                        .into_iter()
+                        .filter(|block| {
+                            block.daa_score >= from_daa_score && block.daa_score <= to_daa_score
+                        })
+                        .collect();
+                    return Ok(ChainNotification::VirtualChainChanged {
+                        removed_chain_block_hashes,
+                        added_chain_blocks,
+                    });
+                }
+                Err(err) => {
+                    self.set_endpoint_health(&endpoint.label, false).await;
+                    warn!(endpoint = endpoint.label, error = %err, "kasgraph-rpc virtual-chain recovery endpoint failed; trying next source");
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or(RpcError::AllEndpointsFailed))
     }
 
     pub fn parse_notifications_jsonl(
@@ -292,8 +391,8 @@ impl MultiRpcClient {
     ///     receiver), or
     ///   - `backoff.max_attempts` is reached (only when non-zero).
     ///
-    /// Each reconnect resends the same `notifyBlockAdded` and
-    /// `notifyVirtualChainChanged` subscribe payloads as the
+    /// Each reconnect resends the same generic `subscribe`
+    /// payloads for `BlockAdded` and `VirtualChainChanged` as the
     /// one-shot reader. The returned `JoinHandle` lets callers
     /// observe completion; awaiting it is optional.
     pub fn spawn_continuous_subscription(
@@ -305,7 +404,29 @@ impl MultiRpcClient {
     ) -> JoinHandle<()> {
         let client = self.clone();
         tokio::spawn(async move {
-            run_continuous_subscription(client, url, served_by, sender, backoff).await;
+            run_continuous_subscription(client, url, served_by, sender, backoff, None).await;
+        })
+    }
+
+    pub fn spawn_continuous_subscription_with_events(
+        &self,
+        url: String,
+        served_by: String,
+        sender: mpsc::Sender<ChainNotification>,
+        backoff: SubscriptionBackoff,
+        event_sender: mpsc::Sender<SubscriptionDriverEvent>,
+    ) -> JoinHandle<()> {
+        let client = self.clone();
+        tokio::spawn(async move {
+            run_continuous_subscription(
+                client,
+                url,
+                served_by,
+                sender,
+                backoff,
+                Some(event_sender),
+            )
+            .await;
         })
     }
 
@@ -349,7 +470,67 @@ impl MultiRpcClient {
         self.post_json(endpoint, payload).await.is_ok()
     }
 
+    async fn probe_live_capabilities_from_endpoint(
+        &self,
+        endpoint: &RpcEndpoint,
+    ) -> Result<LiveRpcCapabilities, RpcError> {
+        let server_info = parse_server_info(
+            self.post_json(
+                endpoint,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getServerInfo",
+                    "params": {}
+                }),
+            )
+            .await?,
+        )?;
+
+        let node_info = parse_node_info(
+            self.post_json(
+                endpoint,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "getInfo",
+                    "params": {}
+                }),
+            )
+            .await?,
+        )?;
+
+        Ok(LiveRpcCapabilities {
+            endpoint: endpoint.label.clone(),
+            server_info,
+            node_info,
+        })
+    }
+
+    async fn fetch_virtual_chain_delta_from_endpoint(
+        &self,
+        endpoint: &RpcEndpoint,
+        start_hash: &str,
+    ) -> Result<(Vec<String>, Vec<String>), RpcError> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getVirtualChainFromBlock",
+            "params": {
+                "startHash": start_hash,
+                "includeAcceptedTransactionIds": false
+            }
+        });
+
+        let response = self.post_json(endpoint, payload).await?;
+        parse_virtual_chain_hashes(response)
+    }
+
     async fn post_json(&self, endpoint: &RpcEndpoint, payload: Value) -> Result<Value, RpcError> {
+        if endpoint.url.starts_with("ws://") || endpoint.url.starts_with("wss://") {
+            return self.ws_request_json(endpoint, payload).await;
+        }
+
         let response = self
             .http_client
             .post(&endpoint.url)
@@ -362,14 +543,83 @@ impl MultiRpcClient {
                 source: anyhow_compat::AnyhowError(err.to_string()),
             })?;
 
-        response.json::<Value>().await.map_err(|err| RpcError::Transport {
-            endpoint: endpoint.label.clone(),
-            source: anyhow_compat::AnyhowError(err.to_string()),
-        })
+        response
+            .json::<Value>()
+            .await
+            .map_err(|err| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError(err.to_string()),
+            })
+    }
+
+    async fn ws_request_json(
+        &self,
+        endpoint: &RpcEndpoint,
+        payload: Value,
+    ) -> Result<Value, RpcError> {
+        ensure_rustls_provider_installed();
+        let (mut stream, _) = tokio::time::timeout(endpoint.timeout, connect_async(&endpoint.url))
+            .await
+            .map_err(|_| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError(format!(
+                    "timed out connecting to {}",
+                    endpoint.url
+                )),
+            })?
+            .map_err(|err| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError(err.to_string()),
+            })?;
+
+        stream
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .map_err(|err| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError(err.to_string()),
+            })?;
+
+        let message = tokio::time::timeout(endpoint.timeout, stream.next())
+            .await
+            .map_err(|_| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError(format!(
+                    "timed out waiting for response from {}",
+                    endpoint.url
+                )),
+            })?
+            .ok_or_else(|| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError("websocket closed before response".to_owned()),
+            })?
+            .map_err(|err| RpcError::Transport {
+                endpoint: endpoint.label.clone(),
+                source: anyhow_compat::AnyhowError(err.to_string()),
+            })?;
+
+        let text = match message {
+            Message::Text(text) => text.to_string(),
+            Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+                .map_err(|err| RpcError::MalformedResponse(err.to_string()))?,
+            other => {
+                return Err(RpcError::MalformedResponse(format!(
+                    "unexpected websocket response frame: {other:?}"
+                )))
+            }
+        };
+
+        let mut value: Value = serde_json::from_str(&text)
+            .map_err(|err| RpcError::MalformedResponse(err.to_string()))?;
+        normalize_rpc_response_shape(&mut value);
+        Ok(value)
     }
 
     async fn set_endpoint_health(&self, endpoint: &str, healthy: bool) {
-        self.health.write().await.insert(endpoint.to_owned(), healthy);
+        self.health
+            .write()
+            .await
+            .insert(endpoint.to_owned(), healthy);
     }
 
     async fn record_audit(&self, block: &IngestedBlock) {
@@ -412,6 +662,33 @@ pub struct SubscriptionBackoff {
     pub max_attempts: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubscriptionDriverEvent {
+    Connected {
+        url: String,
+        reconnect_count: u64,
+    },
+    ReconnectScheduled {
+        url: String,
+        reconnect_count: u64,
+        delay_ms: u64,
+        reason: String,
+        last_emitted_daa: Option<u64>,
+    },
+    GapDetected {
+        url: String,
+        reconnect_count: u64,
+        from_daa_score: u64,
+        to_daa_score: u64,
+    },
+    Stopped {
+        url: String,
+        reconnect_count: u64,
+        reason: String,
+        last_emitted_daa: Option<u64>,
+    },
+}
+
 impl Default for SubscriptionBackoff {
     fn default() -> Self {
         Self {
@@ -434,6 +711,18 @@ struct DriverState {
     /// initial connect). When set, the next DAA-bearing
     /// notification triggers a gap check.
     pending_gap_check: bool,
+    /// Number of reconnect cycles observed after the initial
+    /// connection. Used for smoke/integration observability.
+    reconnect_count: u64,
+}
+
+async fn emit_driver_event(
+    event_sender: &Option<mpsc::Sender<SubscriptionDriverEvent>>,
+    event: SubscriptionDriverEvent,
+) {
+    if let Some(sender) = event_sender {
+        let _ = sender.send(event).await;
+    }
 }
 
 async fn run_continuous_subscription(
@@ -442,6 +731,7 @@ async fn run_continuous_subscription(
     served_by: String,
     sender: mpsc::Sender<ChainNotification>,
     backoff: SubscriptionBackoff,
+    event_sender: Option<mpsc::Sender<SubscriptionDriverEvent>>,
 ) {
     let mut attempt: u32 = 0;
     let mut delay = backoff.initial_delay;
@@ -449,19 +739,60 @@ async fn run_continuous_subscription(
 
     loop {
         if sender.is_closed() {
+            emit_driver_event(
+                &event_sender,
+                SubscriptionDriverEvent::Stopped {
+                    url: url.clone(),
+                    reconnect_count: state.reconnect_count,
+                    reason: "downstream receiver closed".to_owned(),
+                    last_emitted_daa: state.last_emitted_daa,
+                },
+            )
+            .await;
             return;
         }
 
-        match run_subscription_once(&client, &url, &served_by, &sender, &mut state).await {
+        emit_driver_event(
+            &event_sender,
+            SubscriptionDriverEvent::Connected {
+                url: url.clone(),
+                reconnect_count: state.reconnect_count,
+            },
+        )
+        .await;
+
+        match run_subscription_once(
+            &client,
+            &url,
+            &served_by,
+            &sender,
+            &mut state,
+            &event_sender,
+        )
+        .await
+        {
             Ok(()) => {
                 attempt = 0;
                 delay = backoff.initial_delay;
                 state.pending_gap_check = true;
+                state.reconnect_count = state.reconnect_count.saturating_add(1);
                 warn!(
                     url = %url,
                     last_emitted_daa = state.last_emitted_daa,
+                    reconnect_count = state.reconnect_count,
                     "wRPC subscription stream ended; reconnecting"
                 );
+                emit_driver_event(
+                    &event_sender,
+                    SubscriptionDriverEvent::ReconnectScheduled {
+                        url: url.clone(),
+                        reconnect_count: state.reconnect_count,
+                        delay_ms: 0,
+                        reason: "stream ended cleanly".to_owned(),
+                        last_emitted_daa: state.last_emitted_daa,
+                    },
+                )
+                .await;
             }
             Err(err) => {
                 attempt = attempt.saturating_add(1);
@@ -472,16 +803,39 @@ async fn run_continuous_subscription(
                         error = %err,
                         "wRPC subscription exhausted max_attempts; giving up"
                     );
+                    emit_driver_event(
+                        &event_sender,
+                        SubscriptionDriverEvent::Stopped {
+                            url: url.clone(),
+                            reconnect_count: state.reconnect_count,
+                            reason: format!("max attempts exhausted: {err}"),
+                            last_emitted_daa: state.last_emitted_daa,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 state.pending_gap_check = true;
+                state.reconnect_count = state.reconnect_count.saturating_add(1);
                 warn!(
                     url = %url,
                     attempt = attempt,
                     delay_ms = delay.as_millis() as u64,
                     error = %err,
+                    reconnect_count = state.reconnect_count,
                     "wRPC subscription error; backing off before reconnect"
                 );
+                emit_driver_event(
+                    &event_sender,
+                    SubscriptionDriverEvent::ReconnectScheduled {
+                        url: url.clone(),
+                        reconnect_count: state.reconnect_count,
+                        delay_ms: delay.as_millis() as u64,
+                        reason: err.to_string(),
+                        last_emitted_daa: state.last_emitted_daa,
+                    },
+                )
+                .await;
                 tokio::time::sleep(delay).await;
                 let scaled_ms = (delay.as_millis() as f64 * backoff.multiplier).max(1.0) as u64;
                 delay = std::cmp::min(Duration::from_millis(scaled_ms), backoff.max_delay);
@@ -514,13 +868,33 @@ fn max_daa_of(notification: &ChainNotification) -> Option<u64> {
     }
 }
 
+/// Lowest DAA in the payload strictly above `threshold`, or `None`
+/// when the notification carries no newer DAA-bearing data.
+fn next_daa_after(notification: &ChainNotification, threshold: u64) -> Option<u64> {
+    match notification {
+        ChainNotification::BlockAdded(block) => {
+            (block.daa_score > threshold).then_some(block.daa_score)
+        }
+        ChainNotification::VirtualChainChanged {
+            added_chain_blocks, ..
+        } => added_chain_blocks
+            .iter()
+            .map(|b| b.daa_score)
+            .filter(|daa| *daa > threshold)
+            .min(),
+        ChainNotification::RecoveryRequired { .. } => None,
+    }
+}
+
 async fn run_subscription_once(
     client: &MultiRpcClient,
     url: &str,
     served_by: &str,
     sender: &mpsc::Sender<ChainNotification>,
     state: &mut DriverState,
+    event_sender: &Option<mpsc::Sender<SubscriptionDriverEvent>>,
 ) -> Result<(), RpcError> {
+    ensure_rustls_provider_installed();
     let (stream, _) = connect_async(url)
         .await
         .map_err(|err| RpcError::Transport {
@@ -555,28 +929,39 @@ async fn run_subscription_once(
         };
 
         for notification in notifications {
-            // Gap-aware recovery: after every reconnect, the first
-            // DAA-bearing notification triggers a check. If its
-            // lowest DAA score is more than one beyond what we last
-            // emitted, synthesize a RecoveryRequired covering the
-            // missed range and send it first.
+            // Gap-aware recovery: after every reconnect, wait until
+            // we observe a DAA-bearing notification that actually
+            // advances beyond the highest DAA we already emitted.
+            // Replayed/stale notifications at or below `last` should
+            // not clear the pending gap check because a real gap may
+            // still appear on the next fresh notification.
             if state.pending_gap_check {
-                if let (Some(last), Some(first)) =
-                    (state.last_emitted_daa, first_daa_of(&notification))
-                {
-                    if first > last.saturating_add(1) {
-                        let gap = ChainNotification::RecoveryRequired {
-                            from_daa_score: last.saturating_add(1),
-                            to_daa_score: first.saturating_sub(1),
-                            reason: format!(
-                                "subscription gap after reconnect: last emitted DAA {last}, next observed DAA {first}"
-                            ),
-                        };
-                        if sender.send(gap).await.is_err() {
-                            return Ok(());
+                if let Some(last) = state.last_emitted_daa {
+                    if let Some(next_new_daa) = next_daa_after(&notification, last) {
+                        if next_new_daa > last.saturating_add(1) {
+                            let gap = ChainNotification::RecoveryRequired {
+                                from_daa_score: last.saturating_add(1),
+                                to_daa_score: next_new_daa.saturating_sub(1),
+                                reason: format!(
+                                    "subscription gap after reconnect: last emitted DAA {last}, next observed DAA {next_new_daa}"
+                                ),
+                            };
+                            emit_driver_event(
+                                event_sender,
+                                SubscriptionDriverEvent::GapDetected {
+                                    url: url.to_owned(),
+                                    reconnect_count: state.reconnect_count,
+                                    from_daa_score: last.saturating_add(1),
+                                    to_daa_score: next_new_daa.saturating_sub(1),
+                                },
+                            )
+                            .await;
+                            if sender.send(gap).await.is_err() {
+                                return Ok(());
+                            }
                         }
+                        state.pending_gap_check = false;
                     }
-                    state.pending_gap_check = false;
                 } else if first_daa_of(&notification).is_some() {
                     // First DAA-bearing notification ever observed:
                     // nothing to compare against, just clear the
@@ -586,11 +971,8 @@ async fn run_subscription_once(
             }
 
             if let Some(daa) = max_daa_of(&notification) {
-                state.last_emitted_daa = Some(
-                    state
-                        .last_emitted_daa
-                        .map_or(daa, |prev| prev.max(daa)),
-                );
+                state.last_emitted_daa =
+                    Some(state.last_emitted_daa.map_or(daa, |prev| prev.max(daa)));
             }
 
             if sender.send(notification).await.is_err() {
@@ -608,6 +990,7 @@ pub async fn read_notifications_ws(
     max_messages: usize,
     idle_timeout_ms: u64,
 ) -> Result<Vec<ChainNotification>, RpcError> {
+    ensure_rustls_provider_installed();
     let (stream, _) = connect_async(url)
         .await
         .map_err(|err| RpcError::Transport {
@@ -659,10 +1042,7 @@ pub async fn read_notifications_ws(
     Ok(notifications)
 }
 
-async fn send_notification_subscriptions<S>(
-    write: &mut S,
-    endpoint: &str,
-) -> Result<(), RpcError>
+async fn send_notification_subscriptions<S>(write: &mut S, endpoint: &str) -> Result<(), RpcError>
 where
     S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
@@ -670,18 +1050,19 @@ where
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "notifyBlockAdded",
+            "method": "subscribe",
             "params": {
-                "command": "start"
+                "BlockAdded": {}
             }
         }),
         json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "notifyVirtualChainChanged",
+            "method": "subscribe",
             "params": {
-                "includeAcceptedTransactionIds": false,
-                "command": "start"
+                "VirtualChainChanged": {
+                    "include_accepted_transaction_ids": false
+                }
             }
         }),
     ] {
@@ -711,8 +1092,8 @@ async fn parse_ws_message(
         return parse_notifications_jsonl(trimmed, served_by);
     }
 
-    let value: Value =
-        serde_json::from_str(trimmed).map_err(|err| RpcError::MalformedResponse(err.to_string()))?;
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|err| RpcError::MalformedResponse(err.to_string()))?;
 
     match parse_chain_notification_envelope(value, served_by)? {
         ParsedNotification::Ready(notification) => Ok(vec![notification]),
@@ -724,10 +1105,12 @@ async fn parse_ws_message(
             added_chain_blocks: client.fetch_blocks(&added_chain_block_hashes).await?,
         }]),
         ParsedNotification::SubscriptionAck => Ok(Vec::new()),
-        ParsedNotification::SubscriptionRejected { message } => Err(RpcError::SubscriptionRejected {
-            endpoint: served_by.to_owned(),
-            message,
-        }),
+        ParsedNotification::SubscriptionRejected { message } => {
+            Err(RpcError::SubscriptionRejected {
+                endpoint: served_by.to_owned(),
+                message,
+            })
+        }
         ParsedNotification::Ignore => Ok(Vec::new()),
     }
 }
@@ -739,7 +1122,9 @@ enum ParsedNotification {
         added_chain_block_hashes: Vec<String>,
     },
     SubscriptionAck,
-    SubscriptionRejected { message: String },
+    SubscriptionRejected {
+        message: String,
+    },
     Ignore,
 }
 
@@ -752,10 +1137,12 @@ fn parse_chain_notification(value: Value, served_by: &str) -> Result<ChainNotifi
         ParsedNotification::SubscriptionAck => Err(RpcError::MalformedResponse(
             "message only contained a subscription acknowledgement".to_owned(),
         )),
-        ParsedNotification::SubscriptionRejected { message } => Err(RpcError::SubscriptionRejected {
-            endpoint: served_by.to_owned(),
-            message,
-        }),
+        ParsedNotification::SubscriptionRejected { message } => {
+            Err(RpcError::SubscriptionRejected {
+                endpoint: served_by.to_owned(),
+                message,
+            })
+        }
         ParsedNotification::Ignore => Err(RpcError::MalformedResponse(
             "message did not contain a chain notification".to_owned(),
         )),
@@ -777,6 +1164,22 @@ fn parse_chain_notification_envelope(
                 .or_else(|| value.get("result"))
                 .unwrap_or(&value);
             return parse_chain_notification_kind(kind, payload, served_by);
+        }
+
+        if matches!(method, "subscribe" | "unsubscribe") {
+            if value.get("error").is_some() {
+                let message = value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| value.to_string());
+                return Ok(ParsedNotification::SubscriptionRejected { message });
+            }
+
+            if value.get("params").is_some() || value.get("result").is_some() {
+                return Ok(ParsedNotification::SubscriptionAck);
+            }
         }
 
         return Ok(ParsedNotification::Ignore);
@@ -812,12 +1215,14 @@ fn parse_chain_notification_kind(
     value: &Value,
     served_by: &str,
 ) -> Result<ParsedNotification, RpcError> {
+    let payload = value.get(kind).unwrap_or(value);
+
     match kind {
         "BlockAdded" => Ok(ParsedNotification::Ready(ChainNotification::BlockAdded(
-            parse_block_value(value.get("block").unwrap_or(value), served_by)?,
+            parse_block_value(payload.get("block").unwrap_or(payload), served_by)?,
         ))),
         "VirtualChainChanged" => {
-            let removed_chain_block_hashes = value
+            let removed_chain_block_hashes = payload
                 .get("removedChainBlockHashes")
                 .and_then(Value::as_array)
                 .map(|values| {
@@ -828,18 +1233,21 @@ fn parse_chain_notification_kind(
                 })
                 .unwrap_or_default();
 
-            if let Some(added_chain_blocks) = value.get("addedChainBlocks").and_then(Value::as_array)
+            if let Some(added_chain_blocks) =
+                payload.get("addedChainBlocks").and_then(Value::as_array)
             {
-                return Ok(ParsedNotification::Ready(ChainNotification::VirtualChainChanged {
-                    removed_chain_block_hashes,
-                    added_chain_blocks: added_chain_blocks
-                        .iter()
-                        .map(|value| parse_block_value(value, served_by))
-                        .collect::<Result<Vec<_>, _>>()?,
-                }));
+                return Ok(ParsedNotification::Ready(
+                    ChainNotification::VirtualChainChanged {
+                        removed_chain_block_hashes,
+                        added_chain_blocks: added_chain_blocks
+                            .iter()
+                            .map(|value| parse_block_value(value, served_by))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ));
             }
 
-            let added_chain_block_hashes = value
+            let added_chain_block_hashes = payload
                 .get("addedChainBlockHashes")
                 .and_then(Value::as_array)
                 .map(|values| {
@@ -855,44 +1263,117 @@ fn parse_chain_notification_kind(
                 added_chain_block_hashes,
             })
         }
-        "RecoveryRequired" => Ok(ParsedNotification::Ready(ChainNotification::RecoveryRequired {
-            from_daa_score: value
-                .get("fromDaaScore")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| RpcError::MalformedResponse(value.to_string()))?,
-            to_daa_score: value
-                .get("toDaaScore")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| RpcError::MalformedResponse(value.to_string()))?,
-            reason: value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("notification-stream")
-                .to_owned(),
-        })),
+        "RecoveryRequired" => Ok(ParsedNotification::Ready(
+            ChainNotification::RecoveryRequired {
+                from_daa_score: payload
+                    .get("fromDaaScore")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| RpcError::MalformedResponse(payload.to_string()))?,
+                to_daa_score: payload
+                    .get("toDaaScore")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| RpcError::MalformedResponse(payload.to_string()))?,
+                reason: payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("notification-stream")
+                    .to_owned(),
+            },
+        )),
         _ => Err(RpcError::MalformedResponse(value.to_string())),
     }
 }
 
 fn normalize_notification_kind(raw: &str) -> Option<&'static str> {
     match raw {
-        "BlockAdded" | "blockAdded" | "BlockAddedNotification" | "block-added" => {
-            Some("BlockAdded")
-        }
+        "BlockAdded"
+        | "blockAdded"
+        | "BlockAddedNotification"
+        | "blockAddedNotification"
+        | "block-added" => Some("BlockAdded"),
         "VirtualChainChanged"
         | "virtualChainChanged"
         | "VirtualChainChangedNotification"
+        | "virtualChainChangedNotification"
         | "virtual-chain-changed" => Some("VirtualChainChanged"),
-        "RecoveryRequired" | "recoveryRequired" | "recovery-required" => {
-            Some("RecoveryRequired")
-        }
+        "RecoveryRequired" | "recoveryRequired" | "recovery-required" => Some("RecoveryRequired"),
         _ => None,
     }
+}
+
+fn normalize_rpc_response_shape(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    if object.contains_key("result") || object.contains_key("error") {
+        return;
+    }
+
+    if let Some(params) = object.get("params").cloned() {
+        object.insert("result".to_owned(), params);
+    }
+}
+
+fn parse_server_info(value: Value) -> Result<ServerInfo, RpcError> {
+    let result = value
+        .get("result")
+        .or_else(|| value.get("params"))
+        .ok_or_else(|| RpcError::MalformedResponse(value.to_string()))?;
+
+    Ok(ServerInfo {
+        server_version: extract_string(&[result.get("serverVersion")], result)?,
+        network_id: extract_string(&[result.get("networkId")], result)?,
+        rpc_api_version: extract_u64(&[result.get("rpcApiVersion")], result)?,
+        rpc_api_revision: extract_u64(&[result.get("rpcApiRevision")], result)?,
+        is_synced: result
+            .get("isSynced")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?,
+        has_utxo_index: result
+            .get("hasUtxoIndex")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?,
+        virtual_daa_score: result.get("virtualDaaScore").and_then(Value::as_u64),
+    })
+}
+
+fn parse_node_info(value: Value) -> Result<NodeInfo, RpcError> {
+    let result = value
+        .get("result")
+        .or_else(|| value.get("params"))
+        .ok_or_else(|| RpcError::MalformedResponse(value.to_string()))?;
+
+    Ok(NodeInfo {
+        server_version: extract_string(&[result.get("serverVersion")], result)?,
+        is_synced: result
+            .get("isSynced")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?,
+        has_message_id: result
+            .get("hasMessageId")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?,
+        has_notify_command: result
+            .get("hasNotifyCommand")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?,
+        is_utxo_indexed: result
+            .get("isUtxoIndexed")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| RpcError::MalformedResponse(result.to_string()))?,
+        mempool_size: result.get("mempoolSize").and_then(Value::as_u64),
+        p2p_id: result
+            .get("p2pId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
 }
 
 fn parse_ingested_block(value: Value, served_by: &str) -> Result<IngestedBlock, RpcError> {
     let result = value
         .get("result")
+        .or_else(|| value.get("params"))
         .ok_or_else(|| RpcError::MalformedResponse(value.to_string()))?;
 
     let mut block = parse_block_value(result.get("block").unwrap_or(result), served_by)?;
@@ -902,13 +1383,47 @@ fn parse_ingested_block(value: Value, served_by: &str) -> Result<IngestedBlock, 
     Ok(block)
 }
 
+fn parse_virtual_chain_hashes(value: Value) -> Result<(Vec<String>, Vec<String>), RpcError> {
+    let result = value
+        .get("result")
+        .or_else(|| value.get("params"))
+        .ok_or_else(|| RpcError::MalformedResponse(value.to_string()))?;
+
+    let removed_chain_block_hashes = result
+        .get("removedChainBlockHashes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let added_chain_block_hashes = result
+        .get("addedChainBlockHashes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok((removed_chain_block_hashes, added_chain_block_hashes))
+}
+
 fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, RpcError> {
     let header = value.get("header").unwrap_or(value);
 
     let hash = extract_string(&[value.get("hash"), header.get("hash")], value)?;
     let daa_score = extract_u64(&[header.get("daaScore"), value.get("daaScore")], value)?;
     let blue_score = extract_u64(&[header.get("blueScore"), value.get("blueScore")], value)?;
-    let is_finalized = value.get("isFinalized").and_then(Value::as_bool).unwrap_or(false);
+    let is_finalized = value
+        .get("isFinalized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     Ok(IngestedBlock {
         hash,
@@ -958,11 +1473,31 @@ mod tests {
     #[derive(Clone)]
     enum MockBehavior {
         Healthy,
+        ServerInfoResponse {
+            server_version: &'static str,
+            network_id: &'static str,
+            rpc_api_version: u64,
+            rpc_api_revision: u64,
+            is_synced: bool,
+            has_utxo_index: bool,
+            virtual_daa_score: Option<u64>,
+        },
+        NodeInfoResponse {
+            server_version: &'static str,
+            is_synced: bool,
+            has_message_id: bool,
+            has_notify_command: bool,
+            is_utxo_indexed: bool,
+        },
         BlockResponse {
             hash: &'static str,
             daa_score: u64,
             blue_score: u64,
             finalized: bool,
+        },
+        VirtualChainResponse {
+            removed_hashes: Vec<&'static str>,
+            added_hashes: Vec<&'static str>,
         },
         Malformed,
         Timeout(Duration),
@@ -1005,13 +1540,65 @@ mod tests {
                             tokio::time::sleep(duration).await;
                         }
                         MockBehavior::Malformed => {
-                            write_http_json(&mut socket, json!({"jsonrpc": "2.0", "id": 1, "result": {"block": {}}})).await;
+                            write_http_json(
+                                &mut socket,
+                                json!({"jsonrpc": "2.0", "id": 1, "result": {"block": {}}}),
+                            )
+                            .await;
                         }
                         MockBehavior::Healthy => {
                             let payload = match method {
-                                "getBlockDagInfo" => json!({"jsonrpc": "2.0", "id": 1, "result": {"network": "kaspa-testnet"}}),
+                                "getBlockDagInfo" => {
+                                    json!({"jsonrpc": "2.0", "id": 1, "result": {"network": "kaspa-testnet"}})
+                                }
                                 _ => json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}),
                             };
+                            write_http_json(&mut socket, payload).await;
+                        }
+                        MockBehavior::ServerInfoResponse {
+                            server_version,
+                            network_id,
+                            rpc_api_version,
+                            rpc_api_revision,
+                            is_synced,
+                            has_utxo_index,
+                            virtual_daa_score,
+                        } => {
+                            let payload = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "serverVersion": server_version,
+                                    "networkId": network_id,
+                                    "rpcApiVersion": rpc_api_version,
+                                    "rpcApiRevision": rpc_api_revision,
+                                    "isSynced": is_synced,
+                                    "hasUtxoIndex": has_utxo_index,
+                                    "virtualDaaScore": virtual_daa_score
+                                }
+                            });
+                            write_http_json(&mut socket, payload).await;
+                        }
+                        MockBehavior::NodeInfoResponse {
+                            server_version,
+                            is_synced,
+                            has_message_id,
+                            has_notify_command,
+                            is_utxo_indexed,
+                        } => {
+                            let payload = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "serverVersion": server_version,
+                                    "isSynced": is_synced,
+                                    "hasMessageId": has_message_id,
+                                    "hasNotifyCommand": has_notify_command,
+                                    "isUtxoIndexed": is_utxo_indexed,
+                                    "mempoolSize": 0,
+                                    "p2pId": "mock-peer"
+                                }
+                            });
                             write_http_json(&mut socket, payload).await;
                         }
                         MockBehavior::BlockResponse {
@@ -1036,6 +1623,20 @@ mod tests {
                             });
                             write_http_json(&mut socket, payload).await;
                         }
+                        MockBehavior::VirtualChainResponse {
+                            removed_hashes,
+                            added_hashes,
+                        } => {
+                            let payload = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "removedChainBlockHashes": removed_hashes,
+                                    "addedChainBlockHashes": added_hashes
+                                }
+                            });
+                            write_http_json(&mut socket, payload).await;
+                        }
                     }
                 });
             }
@@ -1046,6 +1647,57 @@ mod tests {
 
     async fn spawn_mock_ws_server(messages: Vec<Value>) -> String {
         spawn_mock_ws_server_with_tail(messages, None).await
+    }
+
+    async fn spawn_mock_wrpc_rpc_server(expectations: Vec<(&'static str, Value)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Arc::new(TokioMutex::new(VecDeque::from(expectations)));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = accept_async(socket).await else {
+                        return;
+                    };
+                    let Some(Ok(message)) = ws.next().await else {
+                        return;
+                    };
+                    let text = message.into_text().unwrap();
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let method = request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+
+                    let next = {
+                        let mut guard = shared.lock().await;
+                        guard.pop_front()
+                    };
+                    let Some((expected_method, response_params)) = next else {
+                        return;
+                    };
+                    assert_eq!(method, expected_method);
+                    let id = request.get("id").cloned().unwrap_or_else(|| json!(1));
+                    let response = json!({
+                        "id": id,
+                        "method": expected_method,
+                        "params": response_params,
+                    });
+                    ws.send(Message::Text(response.to_string().into()))
+                        .await
+                        .unwrap();
+                    let _ = ws.close(None).await;
+                });
+            }
+        });
+
+        format!("ws://{}", addr)
     }
 
     /// Mock ws server that accepts a series of sequential
@@ -1130,18 +1782,26 @@ mod tests {
             let first_json: Value = serde_json::from_str(&first_text).unwrap();
             let second_json: Value = serde_json::from_str(&second_text).unwrap();
 
-            assert_eq!(first_json.get("method").and_then(Value::as_str), Some("notifyBlockAdded"));
-            assert_eq!(first_json.pointer("/params/command").and_then(Value::as_str), Some("start"));
-            assert_eq!(second_json.get("method").and_then(Value::as_str), Some("notifyVirtualChainChanged"));
+            assert_eq!(
+                first_json.get("method").and_then(Value::as_str),
+                Some("subscribe")
+            );
+            assert_eq!(first_json.pointer("/params/BlockAdded"), Some(&json!({})));
+            assert_eq!(
+                second_json.get("method").and_then(Value::as_str),
+                Some("subscribe")
+            );
             assert_eq!(
                 second_json
-                    .pointer("/params/includeAcceptedTransactionIds")
+                    .pointer("/params/VirtualChainChanged/include_accepted_transaction_ids")
                     .and_then(Value::as_bool),
                 Some(false)
             );
 
             for message in messages {
-                ws.send(Message::Text(message.to_string().into())).await.unwrap();
+                ws.send(Message::Text(message.to_string().into()))
+                    .await
+                    .unwrap();
             }
 
             if let Some(duration) = tail_sleep {
@@ -1186,7 +1846,8 @@ mod tests {
 
     #[tokio::test]
     async fn fails_over_to_backup_and_records_audit() {
-        let primary = spawn_mock_rpc_server(vec![MockBehavior::Timeout(Duration::from_millis(150))]).await;
+        let primary =
+            spawn_mock_rpc_server(vec![MockBehavior::Timeout(Duration::from_millis(150))]).await;
         let backup = spawn_mock_rpc_server(vec![MockBehavior::BlockResponse {
             hash: "backup-block",
             daa_score: 42,
@@ -1243,7 +1904,8 @@ mod tests {
     #[tokio::test]
     async fn health_probe_marks_each_endpoint() {
         let healthy = spawn_mock_rpc_server(vec![MockBehavior::Healthy]).await;
-        let unhealthy = spawn_mock_rpc_server(vec![MockBehavior::Timeout(Duration::from_millis(150))]).await;
+        let unhealthy =
+            spawn_mock_rpc_server(vec![MockBehavior::Timeout(Duration::from_millis(150))]).await;
         let client = client(healthy, vec![unhealthy]);
 
         let statuses = client.probe_health_once().await;
@@ -1265,6 +1927,161 @@ mod tests {
         let health = client.endpoint_health().await;
         assert_eq!(health.get("primary"), Some(&true));
         assert_eq!(health.get("backup-1"), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn probe_live_capabilities_reads_http_endpoint() {
+        let primary = spawn_mock_rpc_server(vec![
+            MockBehavior::ServerInfoResponse {
+                server_version: "1.2.3",
+                network_id: "mainnet",
+                rpc_api_version: 1,
+                rpc_api_revision: 4,
+                is_synced: true,
+                has_utxo_index: true,
+                virtual_daa_score: Some(123),
+            },
+            MockBehavior::NodeInfoResponse {
+                server_version: "1.2.3",
+                is_synced: true,
+                has_message_id: true,
+                has_notify_command: true,
+                is_utxo_indexed: true,
+            },
+        ])
+        .await;
+        let client = client(primary, vec![]);
+
+        let capabilities = client.probe_live_capabilities().await.unwrap();
+        assert_eq!(capabilities.endpoint, "primary");
+        assert_eq!(capabilities.server_info.server_version, "1.2.3");
+        assert_eq!(capabilities.server_info.network_id, "mainnet");
+        assert_eq!(capabilities.server_info.rpc_api_version, 1);
+        assert!(capabilities.node_info.has_message_id);
+        assert!(capabilities.node_info.has_notify_command);
+    }
+
+    #[tokio::test]
+    async fn fetch_block_supports_wrpc_json_endpoint() {
+        let primary = spawn_mock_wrpc_rpc_server(vec![(
+            "getBlock",
+            json!({
+                "block": {
+                    "header": {
+                        "hash": "block-ws",
+                        "daaScore": 33,
+                        "blueScore": 7
+                    },
+                    "isFinalized": true
+                }
+            }),
+        )])
+        .await;
+        let client = client(primary, vec![]);
+
+        let block = client.fetch_block("block-ws").await.unwrap();
+        assert_eq!(block.hash, "block-ws");
+        assert_eq!(block.daa_score, 33);
+        assert_eq!(block.blue_score, 7);
+        assert!(block.is_finalized);
+    }
+
+    #[tokio::test]
+    async fn probe_live_capabilities_reads_wrpc_json_endpoint() {
+        let primary = spawn_mock_wrpc_rpc_server(vec![
+            (
+                "getServerInfo",
+                json!({
+                    "serverVersion": "1.0.1",
+                    "networkId": "mainnet",
+                    "rpcApiVersion": 1,
+                    "rpcApiRevision": 0,
+                    "isSynced": true,
+                    "hasUtxoIndex": true,
+                    "virtualDaaScore": 444230560u64
+                }),
+            ),
+            (
+                "getInfo",
+                json!({
+                    "serverVersion": "1.0.1",
+                    "isSynced": true,
+                    "hasMessageId": true,
+                    "hasNotifyCommand": true,
+                    "isUtxoIndexed": true,
+                    "mempoolSize": 6,
+                    "p2pId": "peer-1"
+                }),
+            ),
+        ])
+        .await;
+        let client = client(primary, vec![]);
+
+        let capabilities = client.probe_live_capabilities().await.unwrap();
+        assert_eq!(capabilities.server_info.server_version, "1.0.1");
+        assert_eq!(capabilities.server_info.network_id, "mainnet");
+        assert_eq!(capabilities.server_info.rpc_api_version, 1);
+        assert_eq!(capabilities.server_info.virtual_daa_score, Some(444230560));
+        assert_eq!(capabilities.node_info.mempool_size, Some(6));
+        assert_eq!(capabilities.node_info.p2p_id.as_deref(), Some("peer-1"));
+    }
+
+    #[tokio::test]
+    async fn recover_blocks_in_daa_range_supports_wrpc_json_endpoint() {
+        let primary = spawn_mock_wrpc_rpc_server(vec![
+            (
+                "getVirtualChainFromBlock",
+                json!({
+                    "removedChainBlockHashes": ["old-a"],
+                    "addedChainBlockHashes": ["block-a", "block-b"]
+                }),
+            ),
+            (
+                "getBlock",
+                json!({
+                    "block": {
+                        "header": {
+                            "hash": "block-a",
+                            "daaScore": 9,
+                            "blueScore": 1
+                        },
+                        "isFinalized": false
+                    }
+                }),
+            ),
+            (
+                "getBlock",
+                json!({
+                    "block": {
+                        "header": {
+                            "hash": "block-b",
+                            "daaScore": 10,
+                            "blueScore": 2
+                        },
+                        "isFinalized": true
+                    }
+                }),
+            ),
+        ])
+        .await;
+        let client = client(primary, vec![]);
+
+        let notification = client
+            .recover_blocks_in_daa_range("anchor-hash", 10, 10)
+            .await
+            .unwrap();
+        match notification {
+            ChainNotification::VirtualChainChanged {
+                removed_chain_block_hashes,
+                added_chain_blocks,
+            } => {
+                assert_eq!(removed_chain_block_hashes, vec!["old-a".to_owned()]);
+                assert_eq!(added_chain_blocks.len(), 1);
+                assert_eq!(added_chain_blocks[0].hash, "block-b");
+                assert_eq!(added_chain_blocks[0].served_by, "primary");
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1337,6 +2154,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recover_blocks_in_daa_range_uses_virtual_chain_delta() {
+        let primary = spawn_mock_rpc_server(vec![
+            MockBehavior::VirtualChainResponse {
+                removed_hashes: vec!["old-a"],
+                added_hashes: vec!["block-a", "block-b"],
+            },
+            MockBehavior::BlockResponse {
+                hash: "block-a",
+                daa_score: 9,
+                blue_score: 1,
+                finalized: false,
+            },
+            MockBehavior::BlockResponse {
+                hash: "block-b",
+                daa_score: 10,
+                blue_score: 2,
+                finalized: true,
+            },
+        ])
+        .await;
+        let client = client(primary, vec![]);
+
+        let notification = client
+            .recover_blocks_in_daa_range("anchor-hash", 10, 10)
+            .await
+            .unwrap();
+        match notification {
+            ChainNotification::VirtualChainChanged {
+                removed_chain_block_hashes,
+                added_chain_blocks,
+            } => {
+                assert_eq!(removed_chain_block_hashes, vec!["old-a".to_owned()]);
+                assert_eq!(added_chain_blocks.len(), 1);
+                assert_eq!(added_chain_blocks[0].hash, "block-b");
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_notifications_jsonl_reads_live_style_events() {
         let jsonl = r#"
@@ -1354,7 +2211,10 @@ mod tests {
             other => panic!("unexpected first notification: {other:?}"),
         }
         match &parsed[1] {
-            ChainNotification::VirtualChainChanged { removed_chain_block_hashes, added_chain_blocks } => {
+            ChainNotification::VirtualChainChanged {
+                removed_chain_block_hashes,
+                added_chain_blocks,
+            } => {
                 assert_eq!(removed_chain_block_hashes, &vec!["a".to_owned()]);
                 assert_eq!(added_chain_blocks[0].hash, "b");
             }
@@ -1423,26 +2283,30 @@ mod tests {
         .await;
         let client = client(primary, vec![]);
         let ws_url = spawn_mock_ws_server(vec![
-            json!({"jsonrpc":"2.0","id":1,"result":{}}),
-            json!({"jsonrpc":"2.0","id":2,"result":{}}),
+            json!({"jsonrpc":"2.0","id":1,"method":"subscribe","params":{"id":1}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"subscribe","params":{"id":2}}),
             json!({
-                "method": "blockAdded",
+                "method": "blockAddedNotification",
                 "params": {
-                    "block": {
-                        "header": {
-                            "hash": "block-a",
-                            "daaScore": 21,
-                            "blueScore": 4
-                        },
-                        "isFinalized": false
+                    "BlockAdded": {
+                        "block": {
+                            "header": {
+                                "hash": "block-a",
+                                "daaScore": 21,
+                                "blueScore": 4
+                            },
+                            "isFinalized": false
+                        }
                     }
                 }
             }),
             json!({
-                "method": "virtualChainChanged",
+                "method": "virtualChainChangedNotification",
                 "params": {
-                    "removedChainBlockHashes": ["block-a"],
-                    "addedChainBlockHashes": ["block-b"]
+                    "VirtualChainChanged": {
+                        "removedChainBlockHashes": ["block-a"],
+                        "addedChainBlockHashes": ["block-b"]
+                    }
                 }
             }),
         ])
@@ -1550,6 +2414,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuous_subscription_emits_driver_events_for_reconnects() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-1", "daaScore": 1, "blueScore": 1},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-2", "daaScore": 2, "blueScore": 2},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription_with_events(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+            event_tx,
+        );
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("channel closed");
+        }
+
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("event recv timeout")
+                .expect("event channel closed");
+            events.push(event);
+        }
+
+        drop(rx);
+        drop(event_rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert!(matches!(
+            events[0],
+            SubscriptionDriverEvent::Connected {
+                reconnect_count: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            SubscriptionDriverEvent::ReconnectScheduled {
+                reconnect_count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            SubscriptionDriverEvent::Connected {
+                reconnect_count: 1,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn continuous_subscription_emits_recovery_required_when_reconnect_skips_daa() {
         let primary = spawn_mock_rpc_server(vec![]).await;
         let client = client(primary, vec![]);
@@ -1618,7 +2574,11 @@ mod tests {
             other => panic!("first should be BlockAdded(10), got {other:?}"),
         }
         match &got[1] {
-            ChainNotification::RecoveryRequired { from_daa_score, to_daa_score, reason } => {
+            ChainNotification::RecoveryRequired {
+                from_daa_score,
+                to_daa_score,
+                reason,
+            } => {
                 assert_eq!(*from_daa_score, 11);
                 assert_eq!(*to_daa_score, 14);
                 assert!(reason.contains("subscription gap"));
@@ -1701,6 +2661,197 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn continuous_subscription_keeps_gap_check_pending_across_stale_replay_after_reconnect() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+
+        // First batch commits DAA 10. After reconnect, the server
+        // first replays stale DAA 9 (which should NOT clear the
+        // pending gap check), then jumps to DAA 15. The driver must
+        // still synthesize RecoveryRequired [11, 14].
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-10", "daaScore": 10, "blueScore": 10},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-9-replay", "daaScore": 9, "blueScore": 9},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-15", "daaScore": 15, "blueScore": 15},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+        );
+
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let n = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("channel closed");
+            got.push(n);
+        }
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        match &got[0] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 10),
+            other => panic!("first should be BlockAdded(10), got {other:?}"),
+        }
+        match &got[1] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 9),
+            other => panic!("second should be stale replay BlockAdded(9), got {other:?}"),
+        }
+        match &got[2] {
+            ChainNotification::RecoveryRequired {
+                from_daa_score,
+                to_daa_score,
+                reason,
+            } => {
+                assert_eq!(*from_daa_score, 11);
+                assert_eq!(*to_daa_score, 14);
+                assert!(reason.contains("subscription gap"));
+            }
+            other => panic!("third should be synthetic RecoveryRequired, got {other:?}"),
+        }
+        match &got[3] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 15),
+            other => panic!("fourth should be BlockAdded(15), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_subscription_detects_gap_when_virtual_chain_delta_overlaps_old_daa() {
+        let primary = spawn_mock_rpc_server(vec![]).await;
+        let client = client(primary, vec![]);
+
+        // After reconnect, the selected-chain delta overlaps an old
+        // DAA (9) but the next fresh added block is DAA 15. The
+        // driver should detect the gap from the first DAA strictly
+        // above the prior watermark, not from the notification's
+        // absolute minimum DAA.
+        let ws_url = spawn_mock_ws_server_multi(vec![
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "blockAdded",
+                    "params": {
+                        "block": {
+                            "header": {"hash": "block-10", "daaScore": 10, "blueScore": 10},
+                            "isFinalized": true
+                        }
+                    }
+                }),
+            ],
+            vec![
+                json!({"jsonrpc":"2.0","id":1,"result":{}}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                json!({
+                    "method": "virtualChainChangedNotification",
+                    "params": {
+                        "VirtualChainChanged": {
+                            "removedChainBlockHashes": [],
+                            "addedChainBlocks": [
+                                {"header": {"hash": "block-9-overlap", "daaScore": 9, "blueScore": 9}, "isFinalized": true},
+                                {"header": {"hash": "block-15", "daaScore": 15, "blueScore": 15}, "isFinalized": true}
+                            ]
+                        }
+                    }
+                }),
+            ],
+        ])
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = client.spawn_continuous_subscription(
+            ws_url,
+            "wrpc".to_owned(),
+            tx,
+            SubscriptionBackoff {
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(100),
+                multiplier: 2.0,
+                max_attempts: 0,
+            },
+        );
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let n = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("recv timeout")
+                .expect("channel closed");
+            got.push(n);
+        }
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        match &got[0] {
+            ChainNotification::BlockAdded(b) => assert_eq!(b.daa_score, 10),
+            other => panic!("first should be BlockAdded(10), got {other:?}"),
+        }
+        match &got[1] {
+            ChainNotification::RecoveryRequired {
+                from_daa_score,
+                to_daa_score,
+                ..
+            } => {
+                assert_eq!(*from_daa_score, 11);
+                assert_eq!(*to_daa_score, 14);
+            }
+            other => panic!("second should be synthetic RecoveryRequired, got {other:?}"),
+        }
+        match &got[2] {
+            ChainNotification::VirtualChainChanged {
+                added_chain_blocks, ..
+            } => {
+                assert_eq!(added_chain_blocks.len(), 2);
+                assert!(added_chain_blocks.iter().any(|b| b.daa_score == 9));
+                assert!(added_chain_blocks.iter().any(|b| b.daa_score == 15));
+            }
+            other => panic!("third should be VirtualChainChanged, got {other:?}"),
+        }
+    }
     #[tokio::test]
     async fn continuous_subscription_exits_when_receiver_is_dropped_mid_stream() {
         let primary = spawn_mock_rpc_server(vec![]).await;

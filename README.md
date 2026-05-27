@@ -51,7 +51,7 @@ All four interfaces ship simultaneously. MCP is not a future addition.
 
 ## Status
 
-Phase 2 — Core Indexer (Rust) — **scaffold landed and starting to ingest real-shaped chain events**. Workspace plumbing is in place: seven Rust crates (`kasgraph-node` / `-store` / `-mapping` / `-rpc` / `-detectors` / `-poi` / `-stream`), four TypeScript packages (`sdk` / `cli` / `api` / `mcp`), CI, vitest, cargo workspace. The current Rust path already covers multi-RPC HTTP failover, health probes, RPC audit rows, scaffold POI writes, probabilistic-vs-committed block buffering, websocket subscription bootstrap for `notifyBlockAdded` / `notifyVirtualChainChanged`, upstream-style notification envelope parsing, hash-only virtual-chain hydration, idle-bounded websocket reads, and fail-fast handling for explicit subscription rejections. Phase 0 (ecosystem outreach) is intentionally deferred — implementation runs in parallel.
+Phase 2 — Core Indexer (Rust) — **scaffold landed and now includes a real continuous-ingestion spine**. Workspace plumbing is in place: seven Rust crates (`kasgraph-node` / `-store` / `-mapping` / `-rpc` / `-detectors` / `-poi` / `-stream`), four TypeScript packages (`sdk` / `cli` / `api` / `mcp`), CI, vitest, cargo workspace. The current Rust path already covers multi-RPC failover, health probes, RPC audit rows, scaffold POI writes, probabilistic-vs-committed block buffering, websocket subscription bootstrap using Kaspa's real generic `subscribe` payloads (`BlockAdded` / `VirtualChainChanged` scopes), upstream-style notification envelope parsing including live `blockAddedNotification` / `virtualChainChangedNotification` wrappers, point RPC over either HTTP JSON-RPC or JSON wRPC on the same websocket endpoint, explicit live capability preflight (`getServerInfo` + `getInfo`) before continuous ingestion starts, rustls-backed `wss://` support with an installed crypto provider for public-node access, checked-in live smoke examples, a subscription-driver event side-channel for soak/reconnect observability, hash-only virtual-chain hydration, idle-bounded websocket reads, fail-fast handling for explicit subscription rejections, long-lived continuous subscription with reconnect/backoff, reconnect gap detection that now survives stale replay / overlapping virtual-chain deltas after reconnect, committed-state unwind + POI re-anchor, and anchor-based active gap recovery via `getVirtualChainFromBlock` with the old hash-list path retained only as fallback. Phase 0 (ecosystem outreach) is intentionally deferred — implementation runs in parallel.
 
 See [`STATUS.md`](STATUS.md) for the live block.
 
@@ -95,7 +95,7 @@ npm install
 npm run verify              # tsc -b + vitest + cargo test --workspace
 ```
 
-Currently this builds the workspace and runs the scaffold smoke tests. The ingestion loop is partially real now: `kasgraph-node` can bootstrap store state, ingest JSONL notification feeds, or open a websocket notification stream, but it still reads into an in-memory batch rather than running as a forever process. The full continuous ingestion loop lands across the remaining Phase 2.3-2.8 work; the GraphQL/MCP/KasStream interfaces land in Phase 3.
+Currently this builds the workspace and runs the scaffold smoke tests. The ingestion loop is now partially continuous: `kasgraph-node` can bootstrap store state, ingest JSONL notification feeds, open a websocket notification stream, or run a long-lived `KASGRAPH_INGEST_MODE=continuous` loop with reconnect/backoff, gap detection, shared persist logic, active replay after reconnect gaps, and a capability preflight that checks the target node's advertised wRPC features before subscribing. Live-node validation has now confirmed one reachable public mainnet wRPC JSON endpoint (`wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`), the real subscription/notification JSON shape, and that point calls like `getBlock`, `getBlockDagInfo`, and `getVirtualChainFromBlock` work over that same websocket path. What still remains is deeper recovery validation against real reconnect/reorg traces and the Phase 3 query/stream surfaces.
 
 ## Runtime knobs already wired
 
@@ -116,15 +116,42 @@ These env vars are already meaningful in the current scaffold and matter for han
 | `KASGRAPH_NOTIFICATION_SOURCE_LABEL` | Logical label stamped into ingested blocks from the stream |
 | `KASGRAPH_NOTIFICATION_MAX_MESSAGES` | Maximum ingested notifications from a websocket read; `0` means unbounded until idle/close |
 | `KASGRAPH_NOTIFICATION_IDLE_TIMEOUT_MS` | Optional idle timeout for websocket reads so quiet streams terminate cleanly |
+| `KASGRAPH_INGEST_MODE` | `bootstrap` (default) or `continuous` |
+| `KASGRAPH_CONTINUOUS_MAX_MESSAGES` | Stop the continuous loop after N notifications; `0` means until Ctrl-C / channel close |
+| `KASGRAPH_CONTINUOUS_CHANNEL_CAPACITY` | Internal notification channel capacity for the continuous subscription driver |
+| `KASGRAPH_CONTINUOUS_BACKOFF_INITIAL_MS` | Initial reconnect backoff for the continuous websocket driver |
+| `KASGRAPH_CONTINUOUS_BACKOFF_MAX_MS` | Maximum reconnect backoff for the continuous websocket driver |
+| `KASGRAPH_CONTINUOUS_BACKOFF_MULTIPLIER` | Backoff multiplier for repeated websocket failures |
+| `KASGRAPH_CONTINUOUS_BACKOFF_MAX_ATTEMPTS` | `0` means retry forever; otherwise stop after N failed reconnect attempts |
+| `KASGRAPH_GAP_RECOVERY_BLOCK_HASHES` | Optional fallback hashes for runtime gap recovery when no local anchor hash can be derived |
+
+For direct live smoke against a public JSON wRPC node without running the full indexer yet:
+
+```bash
+cargo run -p kasgraph-rpc --example live_wrpc_smoke
+KASGRAPH_WRPC_DURATION_SECONDS=60 cargo run -p kasgraph-rpc --example continuous_wrpc_smoke
+KASGRAPH_WRPC_DURATION_SECONDS=60 \
+KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-summary.json \
+  cargo run -p kasgraph-rpc --example continuous_wrpc_smoke
+# optional overrides:
+#   KASGRAPH_WRPC_URL=wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json
+#   KASGRAPH_WRPC_MAX_MESSAGES=8          # 0 means duration-only stop
+#   KASGRAPH_WRPC_DURATION_SECONDS=120
+#   KASGRAPH_WRPC_SUMMARY_JSON=/tmp/kasgraph-wrpc-soak-summary.json
+#   KASGRAPH_WRPC_IDLE_TIMEOUT_MS=15000   # one-shot example only
+#   KASGRAPH_WRPC_CHANNEL_CAPACITY=64
+```
 
 ## Handoff note for the next agent
 
 If you are continuing Phase 2.3, the next gaps are now very specific:
 
-1. replace the current websocket read-into-`Vec<ChainNotification>` path with a continuous stream/loop
-2. verify Kaspa's real live wire framing and subscribe acknowledgements against an actual node, not just the current JSON assumption
-3. attach gap detection and replay recovery to real stream interruptions
-4. add committed-state rollback semantics for deeper reorgs
+1. exercise the validated live wRPC path against longer real runs and reconnects, not just single subscribe / point-call probes
+2. harden anchor-based recovery around real `getVirtualChainFromBlock` responses from live nodes, especially deeper reorg windows
+3. add committed-state rollback semantics for deeper reorgs beyond the current ordered unwind path
+4. keep pushing the continuous path toward production integration tests instead of unit-only coverage
+
+Current note: one real public node is now confirmed reachable from this environment (`wss://eric.kaspa.stream/kaspa/mainnet/wrpc/json`). The upstream resolver list was still mostly noisy/unreachable (`403` / `404` / `523` / SSL mismatch on other candidates), so discovery is not solved generally yet, but live wire validation is no longer fully blocked. The client now also supports point RPC over JSON wRPC, so the same public websocket endpoint can drive subscription, hydration, and anchor-based recovery flows, continuous mode now probes `getServerInfo` / `getInfo` up front so incompatible nodes fail fast, and the repo now has working `wss://` support plus checked-in `live_wrpc_smoke` and `continuous_wrpc_smoke` examples for repeatable public-node checks. Full `cargo test` is green, the continuous smoke example can now run by wall-clock duration and emit both terminal summaries and optional JSON artifacts, the latest real 10-second soak against that node captured 106 notifications with `highest_daa_seen=444251243`, `reconnects=0`, and `connections=1`, the first 60-second soak stayed stable at 465 notifications with `highest_daa_seen=444252802`, `reconnects=0`, `connections=1`, and `recovery_required=0`, the first 5-minute soak stayed clean at 2177 notifications with `blocks=1087`, `virtual_chain_changed=1090`, `highest_daa_seen=444258625`, `reconnects=0`, `connections=1`, and `recovery_required=0`, and the first 15-minute soak also stayed clean at 5597 notifications with `blocks=2800`, `virtual_chain_changed=2797`, `highest_daa_seen=444267105`, `reconnects=0`, `connections=1`, and `recovery_required=0`.
 
 The README, `STATUS.md`, and `NEXT_SESSION.md` should be updated whenever one of those moves lands so another agent can resume without spelunking through tests.
 
