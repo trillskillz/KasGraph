@@ -1,4 +1,4 @@
-// @kasgraph/api — GraphQL gateway scaffold.
+// @kasgraph/api — GraphQL gateway.
 //
 // Per PLAN.md Phase 3.1:
 //   - Auto-generate Postgres schema from a subgraph's schema.graphql
@@ -7,9 +7,35 @@
 //   - Block-specific queries: `block: { number: 123 }` for historical state
 //   - Cross-subgraph federation
 //
-// This module exports the gateway-config shape consumers feed into
-// the server. The actual server (Apollo/Yoga/Mercurius — choice
-// deferred to Phase 3.1) lands when the codegen pipeline is ready.
+// This module ships the canonical KasGraph schema (the entities the
+// indexer always writes — CommittedBlock, PoiCheckpoint,
+// DetectedPattern, CovenantLineage) plus a `GatewayResolvers`
+// contract and `executeGraphQLQuery` dispatcher. Per-subgraph
+// schemas extend this base via codegen in a later slice.
+//
+// The choice of GraphQL framework — Apollo vs Yoga vs Mercurius —
+// is deliberately *not* baked in here. This module talks directly
+// to the reference `graphql` engine; any of the frameworks can wrap
+// it as an HTTP transport (Yoga is the recommended default per
+// PLAN.md once the WebSocket subscriptions in Phase 3.4 land).
+
+import {
+  buildSchema,
+  execute,
+  GraphQLError,
+  GraphQLScalarType,
+  Kind,
+  parse,
+  validate,
+  type GraphQLSchema,
+  type ExecutionResult,
+} from 'graphql';
+
+export const KASGRAPH_API_VERSION = '0.1.0';
+
+// ---------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------
 
 export interface GatewayConfig {
   /** Postgres connection string (multi-tenant; per-subgraph schemas live inside). */
@@ -20,4 +46,318 @@ export interface GatewayConfig {
   rateLimitPerMinute?: number;
 }
 
-export const KASGRAPH_API_VERSION = '0.1.0';
+// ---------------------------------------------------------------
+// Entity types (mirrors the Phase 2.4 + 2.5 Postgres schema)
+// ---------------------------------------------------------------
+
+export interface CommittedBlock {
+  subgraph: string;
+  blockHash: string;
+  daaScore: string; // BigInt over the wire
+  servedBy: string;
+  committedAt: string; // ISO timestamp
+}
+
+export interface PoiCheckpoint {
+  subgraph: string;
+  blockDaaScore: string;
+  poiHashHex: string;
+}
+
+export interface DetectedPattern {
+  subgraph: string;
+  blockHash: string;
+  blockDaaScore: string;
+  txHash: string;
+  outputIndex: number;
+  detectorKind: string;
+  covenantId?: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface CovenantLineageEntry {
+  seq: number;
+  txHash: string;
+  outputIndex: number;
+  daaScore: string;
+  stateBytesHex?: string;
+}
+
+export interface CovenantLineage {
+  covenantId: string;
+  genesisTx: string;
+  currentUtxo: string;
+  lineageCount: number;
+  lastSeenDaa: string;
+  entries: CovenantLineageEntry[];
+}
+
+// ---------------------------------------------------------------
+// Query argument shapes
+// ---------------------------------------------------------------
+
+export interface CommittedBlockArgs {
+  subgraph: string;
+  hash: string;
+}
+
+export interface CommittedBlocksArgs {
+  subgraph: string;
+  first?: number;
+}
+
+export interface PoiCheckpointsArgs {
+  subgraph: string;
+  fromDaa?: string;
+  toDaa?: string;
+  first?: number;
+}
+
+export interface DetectedPatternsArgs {
+  subgraph: string;
+  kind?: string;
+  first?: number;
+}
+
+export interface CovenantLineageArgs {
+  covenantId: string;
+}
+
+// ---------------------------------------------------------------
+// Resolver contract — production impl talks to Postgres, test impl
+// is in-memory. Same dispatch either way.
+// ---------------------------------------------------------------
+
+export interface GatewayResolvers {
+  committedBlock(args: CommittedBlockArgs): Promise<CommittedBlock | null>;
+  committedBlocks(args: CommittedBlocksArgs): Promise<CommittedBlock[]>;
+  poiCheckpoints(args: PoiCheckpointsArgs): Promise<PoiCheckpoint[]>;
+  detectedPatterns(args: DetectedPatternsArgs): Promise<DetectedPattern[]>;
+  covenantLineage(args: CovenantLineageArgs): Promise<CovenantLineage | null>;
+}
+
+// ---------------------------------------------------------------
+// Schema. Kept in one place so introspection and codegen agree.
+// ---------------------------------------------------------------
+
+export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
+  scalar BigInt
+  scalar JSON
+
+  type CommittedBlock {
+    subgraph: String!
+    blockHash: String!
+    daaScore: BigInt!
+    servedBy: String!
+    committedAt: String!
+  }
+
+  type PoiCheckpoint {
+    subgraph: String!
+    blockDaaScore: BigInt!
+    poiHashHex: String!
+  }
+
+  type DetectedPattern {
+    subgraph: String!
+    blockHash: String!
+    blockDaaScore: BigInt!
+    txHash: String!
+    outputIndex: Int!
+    detectorKind: String!
+    covenantId: String
+    payload: JSON
+  }
+
+  type CovenantLineageEntry {
+    seq: Int!
+    txHash: String!
+    outputIndex: Int!
+    daaScore: BigInt!
+    stateBytesHex: String
+  }
+
+  type CovenantLineage {
+    covenantId: String!
+    genesisTx: String!
+    currentUtxo: String!
+    lineageCount: Int!
+    lastSeenDaa: BigInt!
+    entries: [CovenantLineageEntry!]!
+  }
+
+  type Query {
+    committedBlock(subgraph: String!, hash: String!): CommittedBlock
+    committedBlocks(subgraph: String!, first: Int = 50): [CommittedBlock!]!
+    poiCheckpoints(
+      subgraph: String!
+      fromDaa: BigInt
+      toDaa: BigInt
+      first: Int = 50
+    ): [PoiCheckpoint!]!
+    detectedPatterns(
+      subgraph: String!
+      kind: String
+      first: Int = 50
+    ): [DetectedPattern!]!
+    covenantLineage(covenantId: String!): CovenantLineage
+  }
+`;
+
+// BigInt scalar: parsed as a string both ways. Avoids JS
+// Number precision loss for DAA scores past 2^53.
+const BigIntScalar = new GraphQLScalarType<string, string>({
+  name: 'BigInt',
+  description:
+    'A 64-bit (or larger) unsigned integer, serialized as a decimal string.',
+  serialize(value): string {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') {
+      return String(value);
+    }
+    throw new GraphQLError(`BigInt cannot serialize value of type ${typeof value}`);
+  },
+  parseValue(value): string {
+    if (typeof value === 'string' || typeof value === 'number') {
+      return String(value);
+    }
+    throw new GraphQLError('BigInt must be a string or number on input');
+  },
+  parseLiteral(ast): string {
+    if (ast.kind === Kind.STRING || ast.kind === Kind.INT) {
+      return String(ast.value);
+    }
+    throw new GraphQLError('BigInt literal must be a string or int');
+  },
+});
+
+// JSON scalar: passes objects through. Used for the detector
+// payload which is shape-per-kind.
+const JSONScalar = new GraphQLScalarType<unknown, unknown>({
+  name: 'JSON',
+  description: 'Arbitrary JSON value, passed through as-is.',
+  serialize: (value) => value,
+  parseValue: (value) => value,
+  parseLiteral(ast): unknown {
+    return parseAstLiteral(ast);
+  },
+});
+
+function parseAstLiteral(ast: import('graphql').ValueNode): unknown {
+  switch (ast.kind) {
+    case Kind.STRING:
+    case Kind.BOOLEAN:
+      return ast.value;
+    case Kind.INT:
+    case Kind.FLOAT:
+      return Number(ast.value);
+    case Kind.OBJECT: {
+      const obj: Record<string, unknown> = {};
+      for (const field of ast.fields) {
+        obj[field.name.value] = parseAstLiteral(field.value);
+      }
+      return obj;
+    }
+    case Kind.LIST:
+      return ast.values.map(parseAstLiteral);
+    case Kind.NULL:
+      return null;
+    default:
+      return null;
+  }
+}
+
+let cachedSchema: GraphQLSchema | null = null;
+
+/** Returns the executable KasGraph base schema (lazily built once). */
+export function getKasGraphSchema(): GraphQLSchema {
+  if (cachedSchema !== null) {
+    return cachedSchema;
+  }
+  const schema = buildSchema(KASGRAPH_BASE_SCHEMA_SDL);
+  // Patch in the scalar implementations (buildSchema can't see
+  // them from SDL alone).
+  const bigIntType = schema.getType('BigInt');
+  if (bigIntType instanceof GraphQLScalarType) {
+    Object.assign(bigIntType, {
+      serialize: BigIntScalar.serialize,
+      parseValue: BigIntScalar.parseValue,
+      parseLiteral: BigIntScalar.parseLiteral,
+    });
+  }
+  const jsonType = schema.getType('JSON');
+  if (jsonType instanceof GraphQLScalarType) {
+    Object.assign(jsonType, {
+      serialize: JSONScalar.serialize,
+      parseValue: JSONScalar.parseValue,
+      parseLiteral: JSONScalar.parseLiteral,
+    });
+  }
+  cachedSchema = schema;
+  return schema;
+}
+
+// ---------------------------------------------------------------
+// Dispatcher. Builds the root-value lookup table from the
+// resolvers, validates the query, executes, and returns a
+// JSON-serializable result.
+// ---------------------------------------------------------------
+
+export interface ExecuteQueryRequest {
+  query: string;
+  variables?: Record<string, unknown>;
+  operationName?: string;
+}
+
+export interface ExecuteQueryResponse {
+  data?: ExecutionResult['data'];
+  errors?: Array<{ message: string }>;
+}
+
+export async function executeGraphQLQuery(
+  request: ExecuteQueryRequest,
+  resolvers: GatewayResolvers,
+): Promise<ExecuteQueryResponse> {
+  const schema = getKasGraphSchema();
+  let document;
+  try {
+    document = parse(request.query);
+  } catch (err) {
+    return {
+      errors: [
+        { message: err instanceof Error ? err.message : 'parse error' },
+      ],
+    };
+  }
+  const validationErrors = validate(schema, document);
+  if (validationErrors.length > 0) {
+    return {
+      errors: validationErrors.map((e) => ({ message: e.message })),
+    };
+  }
+
+  const rootValue = {
+    committedBlock: (args: CommittedBlockArgs) => resolvers.committedBlock(args),
+    committedBlocks: (args: CommittedBlocksArgs) => resolvers.committedBlocks(args),
+    poiCheckpoints: (args: PoiCheckpointsArgs) => resolvers.poiCheckpoints(args),
+    detectedPatterns: (args: DetectedPatternsArgs) => resolvers.detectedPatterns(args),
+    covenantLineage: (args: CovenantLineageArgs) => resolvers.covenantLineage(args),
+  };
+
+  const executeOptions: Parameters<typeof execute>[0] = {
+    schema,
+    document,
+    rootValue,
+    ...(request.variables !== undefined && { variableValues: request.variables }),
+    ...(request.operationName !== undefined && { operationName: request.operationName }),
+  };
+  const result = await execute(executeOptions);
+
+  const response: ExecuteQueryResponse = {};
+  if (result.data !== undefined) {
+    response.data = result.data;
+  }
+  if (result.errors && result.errors.length > 0) {
+    response.errors = result.errors.map((e) => ({ message: e.message }));
+  }
+  return response;
+}

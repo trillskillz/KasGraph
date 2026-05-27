@@ -2,7 +2,17 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — MCP tool surface + dispatch contract)
+## Latest commit arc (2026-05-26 — GraphQL gateway surface + dispatch)
+
+- `@kasgraph/api` now ships the canonical KasGraph base schema (`CommittedBlock`, `PoiCheckpoint`, `DetectedPattern`, `CovenantLineage`, `CovenantLineageEntry` plus `BigInt` + `JSON` scalars), an executable schema built lazily via `buildSchema`, a `GatewayResolvers` interface, and `executeGraphQLQuery(request, resolvers)` that uses the reference `graphql` engine for parse + validate + execute.
+- `BigInt` scalar serializes DAA scores as decimal strings (no JS Number precision loss past 2^53). `JSON` scalar passes payloads through as-is.
+- Framework choice (Apollo / Yoga / Mercurius per PLAN.md Phase 3.1) is intentionally NOT baked in. This module talks to `graphql/execute` directly; any framework can wrap it as an HTTP transport. Yoga is still the recommended default once Phase 3.4 WebSocket subscriptions land.
+- `tests/api.test.ts` adds 13 vitest cases against an in-memory `InMemoryResolvers` impl with seeded subgraphs/lineage/hits: schema-surface assertions, introspection round-trip, parse/validation error shapes, every query routes correctly with optional-arg omission honored, JSON-scalar payload pass-through, BigInt-as-string serialization.
+- `graphql ^16.10.0` added to `api/package.json` dependencies. `tsc --noEmit` clean across all four TS packages.
+- Total: 98 cargo + 34 TS = **132 tests** green.
+- Phase 3.1 (GraphQL gateway) goes from a 23-line config interface to a typed schema + resolver + dispatcher contract. Next slice: Postgres-backed `GatewayResolvers` impl talking to the Phase 2.4 schema, then a Yoga HTTP server wrapping it.
+
+## Previous commit arc (2026-05-26 — MCP tool surface + dispatch contract)
 
 - `@kasgraph/mcp` was a name-only enumeration; now declares per-tool `McpTool { name, description, inputSchema }` for all 8 tools with `additionalProperties:false` JSONSchema inputs.
 - Per-tool TypeScript Input/Output types capture the wire shapes (e.g. `SubgraphSummary`, `CovenantLineageEntry`, `AddressActivityEntry`) so production handlers and test handlers share one contract.
