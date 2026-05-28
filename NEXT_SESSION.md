@@ -1,8 +1,17 @@
 # Next-session queue
 
-Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
+Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (256 tests green: 101 cargo + 155 TS). **The single best next slice is per-detector payload codegen** in `@kasgraph/cli`, consuming the new `dump-registry` JSON bridge (see the latest commit arc below). After that, the big fork is the **Phase 2.6 WASM mapping runtime** — a framework decision that needs user input and gates the remaining Phase-4 CLI commands + real deployment. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-28 — Phase 6 complete: krc721 + network-stats + zk-proofs)
+## Latest commit arc (2026-05-28 — detector registry JSON export bridge)
+
+- `kasgraph-detectors` now exposes the live registry as a machine-readable schema, the bridge that unblocks per-detector payload codegen on the TS side.
+- New `registry_schema() -> RegistrySchema` walks `registry::all()` and emits `{ version, detectors: [{ kind, fields: [{ name, byte_len }] }] }`. Field names + byte widths come straight from each fingerprint's `masked_windows`. (Reminder: at runtime `payload_to_json` hex-encodes every field, so every field maps to a `string` in TS regardless of `byte_len`.)
+- New `src/bin/dump-registry.rs`: `cargo run -p kasgraph-detectors --bin dump-registry > detector-schema.json`. Pretty-prints the schema to stdout. Kept as an on-demand exporter, not a committed artifact, so it can't drift.
+- 3 new unit tests: schema covers every registered detector (count + non-empty + version + non-empty field names + positive widths); `OpenSilverMultisig` field shape pinned (`signer_pubkeys`/96, `threshold`/1); JSON round-trip. Detectors crate: 17 → 20 tests.
+- Total: 101 cargo + 155 TS = **256 tests** green. `cargo build --workspace --all-targets` clean (the new bin compiles).
+- **Next (the last self-contained slice before WASM):** wire `@kasgraph/cli` codegen to consume the `dump-registry` JSON and generate a typed payload interface per `pattern:` selector in a manifest, replacing `payload: unknown`. Every field → `string` (hex). Then the Phase 6 example mappings can drop their pseudo-code and decode typed payloads. After that, the big fork is the **Phase 2.6 WASM mapping runtime** — needs a user decision (wasmtime vs. wasmer vs. embedded JS), which gates the remaining Phase-4 CLI commands (`build`/`deploy`/`status`/`logs`/`remove`) and real subgraph deployment.
+
+## Previous commit arc (2026-05-28 — Phase 6 complete: krc721 + network-stats + zk-proofs)
 
 - `examples/` now ships **all six** reference subgraphs. Phase 6 is complete: 6.1 kasbonds ✓, 6.2 opensilver-patterns ✓, 6.3 krc20 ✓, 6.4 krc721 ✓, 6.5 network-stats ✓, 6.6 zk-proofs ✓.
 - **`examples/krc721/`** (Phase 6.4) — native covenant-era NFTs via `kind: krc721` with a `collection: "*"` firehose. Entities: `KRC721Collection` / `KRC721Token` / `KRC721Holder` / `KRC721Mint` / `KRC721Transfer`. NFT-semantic handlers (`handleCollectionDeployed` / `handleNftMinted` / `handleNftTransferred` / `handleNftBurned`) abstract the underlying collection + per-NFT covenant lineage per `docs/references/KRC20_KRC721_REFERENCE.md`. README flags the native spec as still firming up (krc721.stream maintainers canonical).

@@ -132,6 +132,56 @@ fn payload_to_json(payload: BTreeMap<&'static str, Vec<u8>>) -> serde_json::Valu
     serde_json::Value::Object(map)
 }
 
+/// One named state field a detector extracts, with the byte width of
+/// its masked window. Surfaced hex-encoded at runtime (see
+/// [`payload_to_json`]), so downstream codegen maps every field to a
+/// hex string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectorFieldSchema {
+    pub name: String,
+    pub byte_len: usize,
+}
+
+/// The extraction schema for one registered detector kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectorSchema {
+    pub kind: DetectorKind,
+    pub fields: Vec<DetectorFieldSchema>,
+}
+
+/// Machine-readable catalogue of every registered detector and the
+/// named fields it extracts. This is the source of truth downstream
+/// per-detector payload codegen (`@kasgraph/cli`) consumes; emit it
+/// with the `dump-registry` binary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrySchema {
+    pub version: String,
+    pub detectors: Vec<DetectorSchema>,
+}
+
+/// Build the [`RegistrySchema`] from the live [`registry::all`].
+pub fn registry_schema() -> RegistrySchema {
+    let detectors = registry::all()
+        .iter()
+        .map(|entry| DetectorSchema {
+            kind: entry.kind,
+            fields: entry
+                .fingerprint
+                .masked_windows
+                .iter()
+                .map(|w| DetectorFieldSchema {
+                    name: w.field.to_owned(),
+                    byte_len: w.len,
+                })
+                .collect(),
+        })
+        .collect();
+    RegistrySchema {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        detectors,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +232,45 @@ mod tests {
         assert!(hits
             .iter()
             .all(|h| h.kind != DetectorKind::OpenSilverOwnable));
+    }
+
+    #[test]
+    fn registry_schema_covers_every_registered_detector() {
+        let schema = registry_schema();
+        assert_eq!(schema.detectors.len(), registry::all().len());
+        assert!(!schema.detectors.is_empty());
+        assert_eq!(schema.version, env!("CARGO_PKG_VERSION"));
+        for d in &schema.detectors {
+            assert!(!d.fields.is_empty(), "{:?} has no fields", d.kind);
+            for f in &d.fields {
+                assert!(!f.name.is_empty(), "{:?} has an unnamed field", d.kind);
+                assert!(f.byte_len > 0, "{:?}/{} has zero width", d.kind, f.name);
+            }
+        }
+    }
+
+    #[test]
+    fn registry_schema_fields_match_masked_windows() {
+        let schema = registry_schema();
+        let multisig = schema
+            .detectors
+            .iter()
+            .find(|d| d.kind == DetectorKind::OpenSilverMultisig)
+            .expect("multisig in schema");
+        assert_eq!(
+            multisig.fields,
+            vec![
+                DetectorFieldSchema { name: "signer_pubkeys".to_owned(), byte_len: 96 },
+                DetectorFieldSchema { name: "threshold".to_owned(), byte_len: 1 },
+            ],
+        );
+    }
+
+    #[test]
+    fn registry_schema_round_trips_through_json() {
+        let schema = registry_schema();
+        let json = serde_json::to_string(&schema).unwrap();
+        let back: RegistrySchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, schema);
     }
 }
