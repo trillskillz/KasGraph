@@ -2,7 +2,19 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — kasgraph CLI `init` + `mcp-config`)
+## Latest commit arc (2026-05-28 — kasgraph CLI `codegen`)
+
+- `kasgraph codegen` is live. Reads `./subgraph.yaml` + `./schema.graphql` from the subgraph directory and writes `src/generated/{entities,events}.ts`.
+- Entity rendering walks every non-root `ObjectTypeDefinition` in the SDL; maps GraphQL scalars to TypeScript (`String`/`ID` → `string`, `Int`/`Float` → `number`, `Boolean` → `boolean`, `BigInt` → `bigint`, `Bytes` → hex `string`, `JSON` → `unknown`); preserves non-null vs optional (nullable becomes `?: T`); renders lists as `Array<T>` with inner nullability collapsing to `T | null`; object-type references stay as the referenced interface name (foreign-key style).
+- Event rendering walks every handler across every dataSource in the manifest and emits one interface per handler with a fixed envelope: `event` literal, `block { hash, daaScore (bigint), blueScore (bigint) }`, `tx { hash, index }`, and `payload: unknown` (per-detector payload codegen lands in a later slice).
+- Exit codes follow EX_ conventions: 66 (`EX_NOINPUT`) when `subgraph.yaml` or `schema.graphql` is missing; 65 (`EX_DATAERR`) on parse failure; 0 on success with a summary line.
+- The `init` → `codegen` flow now closes cleanly: the init template's `mapping.ts` imports `./generated/events.js` and codegen produces exactly that file with `CovenantLockedEvent` + `CovenantSpentEvent` matching the scaffolded handler names.
+- `tests/cli-codegen.test.ts` adds 12 vitest cases against tmp-dir fixtures: missing-input errors, malformed SDL error, every scalar mapping, list inner-nullability, object-type references, Query/Mutation skipping, multi-dataSource event rendering, no-handlers empty body, full init+codegen end-to-end, `runCommand("codegen")` path, regeneration over stale generated files.
+- `cli/package.json` gains `graphql ^16.10.0` + `yaml ^2.6.0`. Typecheck clean across all four TS packages.
+- Total: 98 cargo + 118 TS = **216 tests** green.
+- Phase 4 CLI status: `init` ✓, `codegen` ✓, `mcp-config` ✓. `build` / `deploy` / `status` / `logs` / `remove` still wait on the Phase 2.6 WASM mapping runtime (the next big framework decision).
+
+## Previous commit arc (2026-05-28 — kasgraph CLI `init` + `mcp-config`)
 
 - `@kasgraph/cli` goes from a dispatch shim to a real CLI. New `runCommand(argv, io)` returns a numeric exit code and routes to per-command bodies.
 - `kasgraph init <name>` scaffolds a working subgraph dir: `subgraph.yaml` (matching the `SubgraphManifest` shape from `@kasgraph/sdk`), `schema.graphql` (KasBonds-style placeholder), `src/mapping.ts` (handler stubs), `package.json`, `.gitignore`, `README.md`. Validates the name against `^[a-z0-9][a-z0-9_-]{0,63}$`. Refuses to clobber an existing directory.

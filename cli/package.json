@@ -9,7 +9,9 @@
     "kasgraph": "dist/cli.js"
   },
   "dependencies": {
-    "@kasgraph/sdk": "0.1.0"
+    "@kasgraph/sdk": "0.1.0",
+    "graphql": "^16.10.0",
+    "yaml": "^2.6.0"
   },
   "scripts": {
     "build": "tsc -b",

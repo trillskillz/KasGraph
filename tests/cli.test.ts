@@ -74,8 +74,11 @@ describe('runCommand dispatch', () => {
   });
 
   it('returns 64 for recognised-but-not-implemented commands', async () => {
+    // `codegen` was originally in this list but now lives — see
+    // tests/cli-codegen.test.ts. The remaining set still waits on
+    // the Phase 2.6 WASM pipeline.
     const io = new CapturedIo(await newScratch());
-    for (const cmd of ['codegen', 'build', 'deploy', 'status', 'logs', 'remove']) {
+    for (const cmd of ['build', 'deploy', 'status', 'logs', 'remove']) {
       io.stderrBuf = '';
       const code = await runCommand([cmd], io);
       expect(code).toBe(64);

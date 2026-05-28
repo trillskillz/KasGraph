@@ -17,11 +17,13 @@
 // Commands that still need the WASM mapping runtime (build,
 // codegen) print a clear "not yet implemented" notice.
 
+import { runCodegen } from './codegen.js';
 import { runInit } from './init.js';
 import { runMcpConfig } from './mcp-config.js';
 
 // Re-export per-command helpers so tests can exercise them
 // without spelunking subpaths.
+export { runCodegen, type CodegenResult } from './codegen.js';
 export { runInit } from './init.js';
 export {
   buildMcpConfig,
@@ -102,6 +104,7 @@ export async function runCommand(argv: string[], io: CliIo): Promise<number> {
     case 'mcp-config':
       return runMcpConfig(rest, io);
     case 'codegen':
+      return runCodegen(rest, io);
     case 'build':
     case 'deploy':
     case 'status':
