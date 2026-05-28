@@ -1,0 +1,14 @@
+{
+  "name": "@kasgraph/as-mapping",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AssemblyScript authoring SDK for KasGraph subgraph mappings — event decode + entity store over the kasgraph-mapping host ABI.",
+  "type": "module",
+  "ascMain": "assembly/index.ts",
+  "exports": {
+    "./assembly": "./assembly/index.ts"
+  },
+  "dependencies": {
+    "assemblyscript-json": "^1.1.0"
+  }
+}

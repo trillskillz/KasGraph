@@ -9,7 +9,8 @@
     "sdk",
     "cli",
     "api",
-    "mcp"
+    "mcp",
+    "as-mapping"
   ],
   "scripts": {
     "build": "tsc -b sdk cli api mcp",

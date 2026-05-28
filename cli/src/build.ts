@@ -8,6 +8,7 @@
 //                  one handler(ptr: i32, len: i32) per manifest handler
 //   guest imports  kasgraph.log(level: i32, ptr: i32, len: i32)
 //                  kasgraph.store_set(ptr: i32, len: i32)
+//                  kasgraph.store_get(ePtr,eLen,idPtr,idLen: i32) -> i64
 //
 // build resolves the handler names + mapping file(s) from subgraph.yaml,
 // generates a thin AssemblyScript entry module (`build/entry.ts`) that
@@ -56,7 +57,11 @@ export interface BuildResult {
 const ASC_FLAGS = ['--optimize', '--runtime', 'stub', '--use', 'abort='];
 
 // The only host imports the Phase 2.6 runtime linker defines.
-const ALLOWED_IMPORTS = new Set(['kasgraph.log', 'kasgraph.store_set']);
+const ALLOWED_IMPORTS = new Set([
+  'kasgraph.log',
+  'kasgraph.store_set',
+  'kasgraph.store_get',
+]);
 
 const DEFAULT_MAPPING_FILE = './src/mapping.ts';
 
@@ -142,9 +147,16 @@ export async function runBuild(_args: string[], io: CliIo): Promise<number> {
   const wasmName = `${sanitizeName(manifest.name) || 'subgraph'}.wasm`;
   const wasmPath = path.join(outDir, wasmName);
 
+  // asc resolves bare library imports (the AS SDK, assemblyscript-json)
+  // from `baseDir/node_modules` and any `--path` roots, and does NOT walk
+  // up the tree. A user's own subgraph install resolves via baseDir; the
+  // in-repo examples rely on hoisted deps further up, so add every
+  // ancestor node_modules as a search path.
+  const libPaths = ancestorNodeModules(root).flatMap((p) => ['--path', p]);
+
   const diagnostics = asc.createMemoryStream();
   const { error } = await asc.main(
-    [entryPath, '-o', wasmPath, '--baseDir', root, ...ASC_FLAGS],
+    [entryPath, '-o', wasmPath, '--baseDir', root, ...libPaths, ...ASC_FLAGS],
     { stdout: diagnostics, stderr: diagnostics },
   );
 
@@ -289,6 +301,21 @@ async function verifyAbi(
 
 function sanitizeName(name: string | undefined): string {
   return (name ?? '').replace(/[^A-Za-z0-9._-]/g, '-');
+}
+
+// Every existing `node_modules` directory from `start` up to the
+// filesystem root, nearest first.
+function ancestorNodeModules(start: string): string[] {
+  const found: string[] = [];
+  let dir = path.resolve(start);
+  for (;;) {
+    const candidate = path.join(dir, 'node_modules');
+    if (existsSync(candidate)) found.push(candidate);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return found;
 }
 
 function errText(err: unknown): string {
