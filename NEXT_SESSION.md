@@ -2,7 +2,17 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — GraphQL Subscription wiring)
+## Latest commit arc (2026-05-28 — Pg LISTEN/NOTIFY subscription source)
+
+- Closes the indexer → gateway live loop without in-process StreamHub coupling.
+- New migration `20260528120000_detector_hits_notify.sql` adds `kasgraph_notify_detected_pattern()` PL/pgSQL function + `AFTER INSERT` trigger on `kasgraph_detected_pattern`. Payload is `json_build_object(...)` matching the GraphQL `DetectedPattern` shape with BIGINT serialized as text to avoid JS Number precision loss. Any writer to the table participates — Rust indexer today, manual SQL, future writers — no app-side `pg_notify` call needed. Migrator test bumped to 4 migrations.
+- `api/src/pg-listen.ts`: `PgListenSource implements SubscriptionSource` built around a minimal `PgListenClient` interface (`connect/query/on/removeAllListeners/end`) so tests mock the client and production wires `new pg.Client(connectionString)`. Lazy-connect on first subscribe (LISTEN once, fan out via internal `InMemorySubscriptionSource`), UNLISTEN + `end()` when the last subscriber drops, lazy-reconnect when a new subscriber arrives after `close()`.
+- Payload normaliser: requires `subgraph` / `blockHash` / `blockDaaScore` / `txHash` / `outputIndex` / `detectorKind` (rejects malformed payloads silently rather than emitting half-shaped events). Optional `covenantId` / `payload` omitted from the response when null. BIGINT delivered as either string or number is coerced to string.
+- `tests/pg-listen.test.ts` adds 12 vitest cases using a `FakeListenClient` recording every call + holding the registered notification listener: lazy LISTEN on first subscribe; multiple subscribers share one LISTEN; UNLISTEN + end on last drop; payload routing in order; optional-field omission; required-field-missing dropped; empty-payload notification dropped; wrong-channel notification dropped; malformed JSON dropped via `onError`; subscriber stays usable after the malformed payload; `close()` UNLISTENs even with active subscribers; lazy-reconnect after close.
+- Total: 98 cargo + 141 TS = **239 tests** green. Typecheck clean across all four TS packages.
+- Phase 3.4 status: in-process source ✓, Postgres LISTEN/NOTIFY source ✓, schema + Yoga wiring ✓. The gateway can now stream every detector hit the indexer writes — no in-process coupling, no polling, no NOTIFY call on the Rust side. Wiring `PgListenSource` into the operator binary (so `kasgraph-api` autoconfigures subscriptions when a `LISTEN_DATABASE_URL` is set) is the next jump for that phase.
+
+## Previous commit arc (2026-05-28 — GraphQL Subscription wiring)
 
 - `@kasgraph/api` now ships a `Subscription` type + a pluggable `SubscriptionSource` contract. The gateway becomes the first end-to-end consumer of the Phase 3.4 "live event" model.
 - `KASGRAPH_BASE_SCHEMA_SDL` gains `type Subscription { detectedPatterns(subgraph, kind, covenantId): DetectedPattern! }` with all three args optional + AND-combined.

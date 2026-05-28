@@ -56,6 +56,15 @@ export {
   type SubscriptionSource,
 } from './subscriptions.js';
 
+// Postgres LISTEN/NOTIFY-backed subscription source.
+export {
+  DETECTED_PATTERN_CHANNEL,
+  PgListenSource,
+  type PgListenClient,
+  type PgListenSourceOptions,
+  type PgNotificationMessage,
+} from './pg-listen.js';
+
 // Operator entry: routing + healthz + env-driven bootstrap.
 export {
   createKasGraphHttpHandler,
