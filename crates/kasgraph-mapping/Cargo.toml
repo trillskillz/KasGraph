@@ -12,3 +12,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# WASM host engine. wasmtime is the chosen host (Bytecode Alliance
+# flagship): first-class determinism controls (fuel metering, NaN
+# canonicalization, SIMD/threads opt-out) for strict per-block
+# deterministic execution. Default features include the cranelift
+# compiler, the runtime, and `wat` text parsing (used by tests).
+wasmtime = "45"
