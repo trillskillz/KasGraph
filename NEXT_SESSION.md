@@ -2,7 +2,19 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — kasgraph CLI `codegen`)
+## Latest commit arc (2026-05-28 — GraphQL Subscription wiring)
+
+- `@kasgraph/api` now ships a `Subscription` type + a pluggable `SubscriptionSource` contract. The gateway becomes the first end-to-end consumer of the Phase 3.4 "live event" model.
+- `KASGRAPH_BASE_SCHEMA_SDL` gains `type Subscription { detectedPatterns(subgraph, kind, covenantId): DetectedPattern! }` with all three args optional + AND-combined.
+- `api/src/subscriptions.ts`: `SubscriptionSource` interface (`subscribeDetectedPatterns(filter) → AsyncIterable<DetectedPattern>`) + `InMemorySubscriptionSource` (process-local pub/sub on top of a custom AsyncIterable; back-pressure via an unbounded queue per subscriber; cleanly drops the subscriber on iterator `return()`). `matches(event, filter)` exported so a future PgListenSource reuses the same filter semantics.
+- `createKasGraphServer` switches schema construction from `buildSchema` + rootValue (which couldn't express subscriptions) to graphql-yoga's `createSchema` with field resolvers for `Query.*` + a `subscribe`/`resolve` resolver for `Subscription.detectedPatterns`. `executeGraphQLQuery` keeps using `getKasGraphSchema()` + rootValue for the in-process Query-only path.
+- Subscription field rejects every subscribe with a clear "subscriptions are not configured" error when `subscriptionSource` is omitted — clients see a cause instead of a silent hang.
+- Yoga ships SSE for subscriptions out of the box; WebSocket transport can layer on with `graphql-ws` in a later slice.
+- `tests/subscriptions.test.ts` adds 11 vitest cases: filter semantics across every key + AND combinations + "hit without covenantId vs filter with covenantId"; InMemory ordering, await-before-publish, iterator-return drops subscriber, pending-iterator-resolves-done-on-return, fan-out delivery; schema introspection round-trip confirms Subscription appears; subscribing without a source surfaces the expected error.
+- Total: 98 cargo + 129 TS = **227 tests** green. Typecheck clean across all four TS packages.
+- Phase 3.4 status: in-process subscription path complete. Next slice: a `PgListenSource` that LISTENs on a `kasgraph_detected_pattern` channel (paired with a tiny `NOTIFY` trigger or app-side `pg_notify` call from `kasgraph-node`) so the gateway streams hits the indexer writes — closing the loop without an in-process StreamHub coupling.
+
+## Previous commit arc (2026-05-28 — kasgraph CLI `codegen`)
 
 - `kasgraph codegen` is live. Reads `./subgraph.yaml` + `./schema.graphql` from the subgraph directory and writes `src/generated/{entities,events}.ts`.
 - Entity rendering walks every non-root `ObjectTypeDefinition` in the SDL; maps GraphQL scalars to TypeScript (`String`/`ID` → `string`, `Int`/`Float` → `number`, `Boolean` → `boolean`, `BigInt` → `bigint`, `Bytes` → hex `string`, `JSON` → `unknown`); preserves non-null vs optional (nullable becomes `?: T`); renders lists as `Array<T>` with inner nullability collapsing to `T | null`; object-type references stay as the referenced interface name (foreign-key style).

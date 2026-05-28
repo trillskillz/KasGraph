@@ -48,6 +48,14 @@ export {
   type KasGraphServerOptions,
 } from './server.js';
 
+// Subscription source contract + in-memory impl.
+export {
+  InMemorySubscriptionSource,
+  matches as detectedPatternsFilterMatches,
+  type DetectedPatternsFilter,
+  type SubscriptionSource,
+} from './subscriptions.js';
+
 // Operator entry: routing + healthz + env-driven bootstrap.
 export {
   createKasGraphHttpHandler,
@@ -229,6 +237,19 @@ export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
       first: Int = 50
     ): [DetectedPattern!]!
     covenantLineage(covenantId: String!): CovenantLineage
+  }
+
+  type Subscription {
+    """
+    Live stream of detector hits as the indexer commits blocks.
+    All three filter args are optional and AND-combined; pass
+    none to watch every hit.
+    """
+    detectedPatterns(
+      subgraph: String
+      kind: String
+      covenantId: String
+    ): DetectedPattern!
   }
 `;
 

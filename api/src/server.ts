@@ -11,13 +11,14 @@
 // `@kasgraph/api` stays framework-agnostic at the `executeGraphQLQuery`
 // layer, and only this module pulls Yoga in.
 
-import { createYoga, type Plugin } from 'graphql-yoga';
+import { createSchema, createYoga } from 'graphql-yoga';
 
 import {
-  getKasGraphSchema,
+  KASGRAPH_BASE_SCHEMA_SDL,
   type GatewayResolvers,
 } from './index.js';
 import { PgGatewayResolvers, type PgPoolLike } from './pg-resolvers.js';
+import type { SubscriptionSource } from './subscriptions.js';
 
 /** The handler `createKasGraphServer` returns. */
 export type KasGraphServer = ReturnType<typeof createYoga>;
@@ -35,6 +36,13 @@ export interface KasGraphServerOptions {
    * rate-limiting, multi-region routing) around the pg impl.
    */
   resolvers?: GatewayResolvers;
+  /**
+   * Event source for `Subscription.detectedPatterns`. When
+   * `undefined`, the field rejects every subscribe with a
+   * "subscriptions not configured" error so clients see a
+   * clear cause rather than a silent hang.
+   */
+  subscriptionSource?: SubscriptionSource;
   /** GraphQL endpoint path. Defaults to `/graphql`. */
   graphqlEndpoint?: string;
   /**
@@ -57,36 +65,62 @@ export function createKasGraphServer(
 ): KasGraphServer {
   const resolvers: GatewayResolvers =
     options.resolvers ?? new PgGatewayResolvers(options.pool);
-  const schema = getKasGraphSchema();
+  const subscriptionSource = options.subscriptionSource;
 
-  // Same `rootValue` shape `executeGraphQLQuery` builds — every
-  // top-level Query field looks up here. Keeping it in one place
-  // means the in-process executor and the HTTP server cannot
-  // drift.
-  const rootValue = {
-    committedBlock: resolvers.committedBlock.bind(resolvers),
-    committedBlocks: resolvers.committedBlocks.bind(resolvers),
-    poiCheckpoints: resolvers.poiCheckpoints.bind(resolvers),
-    detectedPatterns: resolvers.detectedPatterns.bind(resolvers),
-    covenantLineage: resolvers.covenantLineage.bind(resolvers),
-  };
-
-  // Inject our rootValue at request-execute time. Yoga's
-  // `createYoga` doesn't accept rootValue directly the way
-  // `execute` does — the cleanest hook is the `onExecute`
-  // plugin event. The plugin type is intentionally widened
-  // to `Plugin` (no context generic) to keep
-  // exactOptionalPropertyTypes from forcing a complete
-  // inferred-context shape on every caller.
-  const injectRootValue: Plugin = {
-    onExecute({ args }) {
-      (args as unknown as { rootValue: unknown }).rootValue = rootValue;
+  // Build schema via Yoga's `createSchema` (under the hood
+  // `@graphql-tools/schema.makeExecutableSchema`). Using field
+  // resolvers — instead of the rootValue path
+  // `executeGraphQLQuery` uses for the in-process executor —
+  // lets us attach a `Subscription.detectedPatterns.subscribe`
+  // resolver, which the rootValue model cannot express.
+  const schema = createSchema({
+    typeDefs: KASGRAPH_BASE_SCHEMA_SDL,
+    resolvers: {
+      Query: {
+        committedBlock: (_root, args) =>
+          resolvers.committedBlock(args as Parameters<GatewayResolvers['committedBlock']>[0]),
+        committedBlocks: (_root, args) =>
+          resolvers.committedBlocks(args as Parameters<GatewayResolvers['committedBlocks']>[0]),
+        poiCheckpoints: (_root, args) =>
+          resolvers.poiCheckpoints(args as Parameters<GatewayResolvers['poiCheckpoints']>[0]),
+        detectedPatterns: (_root, args) =>
+          resolvers.detectedPatterns(
+            args as Parameters<GatewayResolvers['detectedPatterns']>[0],
+          ),
+        covenantLineage: (_root, args) =>
+          resolvers.covenantLineage(
+            args as Parameters<GatewayResolvers['covenantLineage']>[0],
+          ),
+      },
+      Subscription: {
+        detectedPatterns: {
+          subscribe: (
+            _root: unknown,
+            args: { subgraph?: string; kind?: string; covenantId?: string },
+          ) => {
+            if (subscriptionSource === undefined) {
+              throw new Error(
+                'kasgraph-api: subscriptions are not configured on this gateway (pass `subscriptionSource` to createKasGraphServer)',
+              );
+            }
+            // Conditional spread keeps undefined fields off the
+            // filter object so `exactOptionalPropertyTypes: true`
+            // downstream stays happy.
+            const filter: { subgraph?: string; kind?: string; covenantId?: string } = {
+              ...(args.subgraph !== undefined && { subgraph: args.subgraph }),
+              ...(args.kind !== undefined && { kind: args.kind }),
+              ...(args.covenantId !== undefined && { covenantId: args.covenantId }),
+            };
+            return subscriptionSource.subscribeDetectedPatterns(filter);
+          },
+          resolve: (payload: unknown) => payload,
+        },
+      },
     },
-  };
+  });
 
   return createYoga({
     schema,
-    plugins: [injectRootValue],
     graphqlEndpoint: options.graphqlEndpoint ?? '/graphql',
     graphiql: options.graphiql ?? true,
     landingPage: false,
