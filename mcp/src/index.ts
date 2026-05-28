@@ -42,6 +42,19 @@ export {
   NOT_IMPLEMENTED_TOOLS,
 } from './pg-handlers.js';
 
+// MCP server scaffolding (stdio transport).
+export {
+  callToolToContent,
+  createKasGraphMcpServer,
+  runMcpStdioServer,
+  type McpToolCallContent,
+} from './server.js';
+
+// Operator binary entry — re-exported so tests can exercise the
+// env reader without spawning the binary.
+export { readOptionsFromEnv, runKasGraphMcpServer } from './main.js';
+export type { RunMcpOptions, RunningMcpServer } from './main.js';
+
 // ---------------------------------------------------------------
 // Tool definitions (name + description + JSONSchema for inputs).
 // ---------------------------------------------------------------

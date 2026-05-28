@@ -2,7 +2,18 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — kasgraph-api operator entry binary)
+## Latest commit arc (2026-05-28 — kasgraph-mcp operator binary on stdio)
+
+- `@kasgraph/mcp` now ships a real MCP server + operator binary (`bin: { kasgraph-mcp: dist/main.js }`) over the canonical `@modelcontextprotocol/sdk` Server with `StdioServerTransport`.
+- `mcp/src/server.ts`: `createKasGraphMcpServer(handlers)` registers `ListToolsRequestSchema` (returns `mcpToolListing()` in canonical order) and `CallToolRequestSchema` (routes through `dispatchMcpTool` → MCP text-content blocks). `runMcpStdioServer(handlers)` connects stdio.
+- `callToolToContent(name, args, handlers)` factored out as the pure helper that wraps results (or structured errors with codes `unknown_tool` / `invalid_input` / `handler_error`) in the MCP `{content: [{type:'text', text: JSON}]}` shape. Pure-function design means vitest exercises it without a transport.
+- `mcp/src/main.ts`: env-driven entry mirroring `kasgraph-api`. Reads `DATABASE_URL` (or `KASGRAPH_DATABASE_URL`), builds `pg.Pool` + `PgMcpHandlers`, connects to stdio, registers SIGINT/SIGTERM handlers that close transport + server + pool. Logs to **stderr** so stdout stays clean for the MCP protocol frames.
+- `tests/mcp-main.test.ts` adds 10 vitest cases: server constructs without throwing; success/route paths produce one text content block; unknown tool / missing required field / handler-thrown-error each map to `isError:true` with the right structured code; env reader honors precedence + both env-var names.
+- `@modelcontextprotocol/sdk ^1.0.0` and `pg ^8.13.0` added to `mcp/package.json` deps. Typecheck clean across all four TS packages.
+- Total: 98 cargo + 90 TS = **188 tests** green.
+- Phase 3.2 (MCP, CRITICAL per PLAN.md) is now operationally complete: typed contract → in-memory handlers → Postgres handlers → MCP server scaffolding → env-driven stdio binary. A container running `kasgraph-mcp` with just `DATABASE_URL` set is reachable from any MCP client (Claude Desktop, IDE plugins, custom LLM agents).
+
+## Previous commit arc (2026-05-28 — kasgraph-api operator entry binary)
 
 - `@kasgraph/api` now ships a real operator binary at `dist/main.js` (exposed via `bin: { kasgraph-api: ... }`). Reads `DATABASE_URL` / `KASGRAPH_DATABASE_URL` (required), `HOST` (default `0.0.0.0`), `PORT` (default `4000`), `GRAPHQL_ENDPOINT` (default `/graphql`), `GRAPHIQL` (default `true`).
 - Splits cleanly so the routing + healthz logic is unit-testable without binding sockets:
