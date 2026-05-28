@@ -2,7 +2,20 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — Yoga HTTP transport for the GraphQL gateway)
+## Latest commit arc (2026-05-28 — kasgraph-api operator entry binary)
+
+- `@kasgraph/api` now ships a real operator binary at `dist/main.js` (exposed via `bin: { kasgraph-api: ... }`). Reads `DATABASE_URL` / `KASGRAPH_DATABASE_URL` (required), `HOST` (default `0.0.0.0`), `PORT` (default `4000`), `GRAPHQL_ENDPOINT` (default `/graphql`), `GRAPHIQL` (default `true`).
+- Splits cleanly so the routing + healthz logic is unit-testable without binding sockets:
+    - `healthzResponse(pool)` → `{ status, body, contentType }` (200 on `SELECT 1` success; 503 with error message on throw)
+    - `createKasGraphHttpHandler(yoga, healthCheck)` → Node `(req, res) => void`. Routes `GET/HEAD /healthz` to the health check, 405s anything else on that path, forwards everything else to Yoga.
+    - `runKasGraphServer(options)` → starts http server, returns `{ address, shutdown() }`
+    - `main()` → `readOptionsFromEnv` → `runKasGraphServer` → SIGINT/SIGTERM handlers that cleanly close the http server and end the pg pool
+- Structured JSON-line logging to stdout (info/warn) and stderr (error) — operators can pipe through `jq` or redirect without parsing.
+- `tests/main.test.ts` adds 13 vitest cases against actual Node http servers bound to port 0 + a `StubPool` and a recording sentinel Yoga handler. Covers: healthz 200/503 shape, GET/HEAD/POST routing, `/healthz?qs` matching, 405 on POST, non-healthz forwarding to Yoga, env defaults + overrides for every read knob, `KASGRAPH_DATABASE_URL` fallback, non-numeric PORT degradation.
+- Total: 98 cargo + 80 TS = **178 tests** green. Typecheck clean across all four TS packages.
+- Phase 3.1 (GraphQL gateway) is now operationally complete: typed contract → in-memory resolvers → Postgres resolvers → HTTP transport → env-driven binary with healthz and graceful shutdown. Hosted-service infra (Phase 5) can wrap this binary directly in a container.
+
+## Previous commit arc (2026-05-28 — Yoga HTTP transport for the GraphQL gateway)
 
 - `@kasgraph/api` now ships `createKasGraphServer({ pool, resolvers?, graphqlEndpoint?, graphiql? })` returning a Yoga handler (Fetch-API `(Request) => Response` function — slots into Node `http`, Workers, Deno, or `yoga.fetch` for tests).
 - Schema construction stays in `getKasGraphSchema()` (rootValue-based); Yoga injects `rootValue` at execute time via a tiny `onExecute` plugin. The same schema definition + resolvers feed both `executeGraphQLQuery` (in-process) and the HTTP handler, so they cannot drift.

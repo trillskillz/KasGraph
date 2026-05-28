@@ -48,6 +48,19 @@ export {
   type KasGraphServerOptions,
 } from './server.js';
 
+// Operator entry: routing + healthz + env-driven bootstrap.
+export {
+  createKasGraphHttpHandler,
+  healthzResponse,
+  readOptionsFromEnv,
+  runKasGraphServer,
+  type HealthzResponse,
+  type HealthCheck,
+  type NodeHttpHandler,
+  type RunServerOptions,
+  type RunningServer,
+} from './main.js';
+
 // ---------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------

@@ -5,6 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "kasgraph-api": "dist/main.js"
+  },
   "dependencies": {
     "@kasgraph/sdk": "0.1.0",
     "graphql": "^16.10.0",
