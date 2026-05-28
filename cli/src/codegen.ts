@@ -18,13 +18,18 @@
 //                 Object-type references stay as the referenced
 //                 interface name (foreign-key-style).
 //
-//   events.ts     one interface per (handler) in the manifest,
+//   events.ts     one interface per event name in the manifest,
 //                 carrying a `block: { hash, daaScore, blueScore }`
-//                 plus a `tx: { hash, index }` envelope. Handler
-//                 bodies decode the typed payload from there. The
-//                 payload shape is detector-kind-specific and
-//                 lands in a later slice; today the envelope is
-//                 enough for the init-template handlers to type-check.
+//                 plus a `tx: { hash, index }` envelope. The payload
+//                 is typed per detector pattern: each `pattern:`
+//                 selector that maps to a registered detector emits a
+//                 `<Kind>State` interface (covenant-state fields, all
+//                 hex `string`, discriminated on `detectorKind`), and
+//                 an event's payload is the union of its data source's
+//                 detector states. Pattern-less sources (krc721
+//                 `collection`, utxo `addresses`) and unregistered
+//                 selectors leave the payload `unknown`. The detector
+//                 schema is sourced from `./detector-schema.ts`.
 
 import { parse, Kind, type DocumentNode, type TypeNode } from 'graphql';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -33,15 +38,25 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
 import type { CliIo } from './index.js';
+import { DETECTOR_SCHEMA_BY_KIND } from './detector-schema.js';
+
+interface SubgraphDataSource {
+  name: string;
+  source?: {
+    // covenant_id sources carry an `ids` list whose entries are
+    // either a literal id string or a `{ pattern: <DetectorKind> }`
+    // selector. Other kinds (krc721 `collection`, utxo `addresses`)
+    // carry no detector patterns, so their payloads stay `unknown`.
+    ids?: Array<{ pattern?: string } | string>;
+  };
+  mapping: {
+    handlers: Array<{ event: string; handler: string }>;
+  };
+}
 
 interface SubgraphManifest {
   name: string;
-  dataSources: Array<{
-    name: string;
-    mapping: {
-      handlers: Array<{ event: string; handler: string }>;
-    };
-  }>;
+  dataSources: SubgraphDataSource[];
 }
 
 export interface CodegenResult {
@@ -150,12 +165,55 @@ function renderEntities(doc: DocumentNode): string {
 
 function renderEvents(manifest: SubgraphManifest): string {
   const sources = manifest.dataSources ?? [];
-  const interfaces = sources.flatMap((source) =>
-    (source.mapping?.handlers ?? []).map((h) => {
-      const eventInterfaceName = `${h.event}Event`;
-      return `export interface ${eventInterfaceName} {
+
+  // Map every event name to the union of detector kinds that can feed
+  // it. A covenant_id dataSource's `pattern:` selectors apply to all
+  // of that dataSource's handlers (a CovenantLocked / CovenantSpent on
+  // that source can carry any of the patterns it watches). Only kinds
+  // present in the detector schema contribute a typed payload; unknown
+  // selectors (e.g. ZK-aware patterns not yet registered) and
+  // pattern-less sources (krc721 `collection`, utxo `addresses`) leave
+  // the payload `unknown`.
+  const eventKinds = new Map<string, Set<string>>();
+  const eventOrder: string[] = [];
+  const allKinds = new Set<string>();
+
+  for (const source of sources) {
+    const kinds = detectorKindsForSource(source);
+    for (const kind of kinds) allKinds.add(kind);
+    for (const handler of source.mapping?.handlers ?? []) {
+      if (!eventKinds.has(handler.event)) {
+        eventKinds.set(handler.event, new Set());
+        eventOrder.push(handler.event);
+      }
+      const set = eventKinds.get(handler.event)!;
+      for (const kind of kinds) set.add(kind);
+    }
+  }
+
+  const stateInterfaces = [...allKinds]
+    .sort()
+    .map((kind) => renderStateInterface(kind));
+
+  const eventInterfaces = eventOrder.map((event) => {
+    const kinds = [...(eventKinds.get(event) ?? [])].sort();
+    const payloadType =
+      kinds.length === 0 ? 'unknown' : kinds.map((k) => `${k}State`).join(' | ');
+    const payloadDoc =
+      kinds.length === 0
+        ? `  /**
+   * Detector-specific payload. This event's data source watches no
+   * registered detector pattern, so the payload is left \`unknown\`;
+   * cast to a specific shape inside the handler.
+   */`
+        : `  /**
+   * Detector covenant-state payload, discriminated on \`detectorKind\`.
+   * Fields are the lock-time state windows, hex-encoded. Spend-semantic
+   * fields (operation, amount, …) layer on in a later slice.
+   */`;
+    return `export interface ${event}Event {
   /** Logical event name, matches the manifest handler entry. */
-  event: ${JSON.stringify(h.event)};
+  event: ${JSON.stringify(event)};
   /** Block envelope: identifies which block produced this event. */
   block: {
     hash: string;
@@ -167,21 +225,44 @@ function renderEvents(manifest: SubgraphManifest): string {
     hash: string;
     index: number;
   };
-  /**
-   * Detector-specific payload. Stays \`unknown\` until per-detector
-   * payload codegen lands; cast to a specific shape inside the
-   * handler in the meantime.
-   */
-  payload: unknown;
+${payloadDoc}
+  payload: ${payloadType};
 }`;
-    }),
-  );
+  });
 
   const banner = headerBanner('events');
-  if (interfaces.length === 0) {
+  const blocks = [...stateInterfaces, ...eventInterfaces];
+  if (blocks.length === 0) {
     return `${banner}\nexport {};\n`;
   }
-  return `${banner}\n${interfaces.join('\n\n')}\n`;
+  return `${banner}\n${blocks.join('\n\n')}\n`;
+}
+
+// Detector kinds referenced by a dataSource's `pattern:` selectors,
+// filtered to those present in the registry schema.
+function detectorKindsForSource(source: SubgraphDataSource): string[] {
+  const ids = source.source?.ids ?? [];
+  const kinds = new Set<string>();
+  for (const entry of ids) {
+    if (typeof entry === 'object' && entry !== null && typeof entry.pattern === 'string') {
+      if (DETECTOR_SCHEMA_BY_KIND.has(entry.pattern)) {
+        kinds.add(entry.pattern);
+      }
+    }
+  }
+  return [...kinds];
+}
+
+// Typed covenant-state interface for one detector kind. Every field
+// is hex-encoded at runtime, so every field is a `string`.
+function renderStateInterface(kind: string): string {
+  const schema = DETECTOR_SCHEMA_BY_KIND.get(kind)!;
+  const fields = schema.fields.map((f) => `  ${f.name}: string;`).join('\n');
+  return `export interface ${kind}State {
+  /** Discriminator — names the matched detector pattern. */
+  detectorKind: ${JSON.stringify(kind)};
+${fields}
+}`;
 }
 
 function headerBanner(kind: 'entities' | 'events'): string {

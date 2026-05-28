@@ -215,6 +215,74 @@ dataSources:
     expect(out).toContain('event: "KCC20Mint";');
   });
 
+  it('types payloads from registered detector patterns as a discriminated union', async () => {
+    const root = await scratch();
+    await writeFixture(
+      root,
+      `name: x
+dataSources:
+  - name: ds
+    kind: covenant_id
+    source:
+      ids:
+        - pattern: OpenSilverVault
+        - pattern: OpenSilverMultisig
+    mapping:
+      handlers:
+        - event: CovenantLocked
+          handler: handleLock
+`,
+      `type Bond { id: ID! }`,
+    );
+    const code = await runCodegen([], new CapturedIo(root));
+    expect(code).toBe(0);
+    const out = await readFile(path.join(root, 'src/generated/events.ts'), 'utf8');
+    // One State interface per referenced pattern, hex fields as strings.
+    expect(out).toContain('export interface OpenSilverVaultState');
+    expect(out).toContain('detectorKind: "OpenSilverVault";');
+    expect(out).toContain('  owner_pubkey: string;');
+    expect(out).toContain('export interface OpenSilverMultisigState');
+    expect(out).toContain('  signer_pubkeys: string;');
+    // Payload is the union of the data source's pattern states.
+    expect(out).toContain(
+      'payload: OpenSilverMultisigState | OpenSilverVaultState;',
+    );
+    expect(out).not.toContain('payload: unknown;');
+  });
+
+  it('leaves payload `unknown` for unregistered patterns and pattern-less sources', async () => {
+    const root = await scratch();
+    await writeFixture(
+      root,
+      `name: x
+dataSources:
+  - name: zk
+    kind: covenant_id
+    source:
+      ids:
+        - pattern: ZkVerifierGroth16
+    mapping:
+      handlers:
+        - event: CovenantSpent
+          handler: handleProvenSpend
+  - name: stats
+    kind: utxo
+    source:
+      addresses: ["*"]
+    mapping:
+      handlers:
+        - event: UtxoChanged
+          handler: handleUtxoChanged
+`,
+      `type Bond { id: ID! }`,
+    );
+    const code = await runCodegen([], new CapturedIo(root));
+    expect(code).toBe(0);
+    const out = await readFile(path.join(root, 'src/generated/events.ts'), 'utf8');
+    expect(out).not.toContain('State');
+    expect(out).toContain('payload: unknown;');
+  });
+
   it('emits `export {};` when the manifest has no handlers', async () => {
     const root = await scratch();
     await writeFixture(

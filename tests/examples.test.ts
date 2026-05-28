@@ -139,6 +139,11 @@ describe('examples — kasgraph codegen', () => {
         expect(entities).toContain('export interface KCC20Holder');
         expect(entities).toContain('export interface KCC20Transfer');
         expect(entities).toContain('export interface KCC20Mint');
+        // All five KCC20 patterns are registered → typed payload union.
+        expect(events).toContain('export interface KCC20AssetState');
+        expect(events).toContain('detectorKind: "KCC20Asset";');
+        expect(events).toContain('| KCC20VestingControllerState;');
+        expect(events).not.toContain('payload: unknown;');
       }
       if (name === 'krc721') {
         expect(entities).toContain('export interface KRC721Collection');
@@ -151,6 +156,8 @@ describe('examples — kasgraph codegen', () => {
         expect(events).toContain('export interface NftMintedEvent');
         expect(events).toContain('export interface NftTransferredEvent');
         expect(events).toContain('export interface NftBurnedEvent');
+        // `krc721` collection source carries no detector patterns.
+        expect(events).toContain('payload: unknown;');
       }
       if (name === 'network-stats') {
         expect(entities).toContain('export interface BlockStat');
@@ -158,6 +165,8 @@ describe('examples — kasgraph codegen', () => {
         expect(entities).toContain('export interface AddressActivity');
         expect(events).toContain('export interface BlockAddedEvent');
         expect(events).toContain('export interface UtxoChangedEvent');
+        // `utxo` firehose carries no detector patterns.
+        expect(events).toContain('payload: unknown;');
       }
       if (name === 'zk-proofs') {
         expect(entities).toContain('export interface ZkVerifyingKey');
@@ -166,6 +175,8 @@ describe('examples — kasgraph codegen', () => {
         expect(entities).toContain('export interface ZkVerification');
         expect(events).toContain('export interface CovenantLockedEvent');
         expect(events).toContain('export interface CovenantSpentEvent');
+        // ZK-aware detector patterns aren't registered yet → unknown.
+        expect(events).toContain('payload: unknown;');
       }
     },
   );
