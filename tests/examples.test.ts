@@ -144,6 +144,9 @@ describe('examples — kasgraph codegen', () => {
         expect(events).toContain('detectorKind: "KCC20Asset";');
         expect(events).toContain('| KCC20VestingControllerState;');
         expect(events).not.toContain('payload: unknown;');
+        // CovenantSpent carries the protocol-level spend envelope.
+        expect(events).toContain('export interface CovenantSpend');
+        expect(events).toContain('payload: { spend: CovenantSpend; state:');
       }
       if (name === 'krc721') {
         expect(entities).toContain('export interface KRC721Collection');
@@ -175,8 +178,13 @@ describe('examples — kasgraph codegen', () => {
         expect(entities).toContain('export interface ZkVerification');
         expect(events).toContain('export interface CovenantLockedEvent');
         expect(events).toContain('export interface CovenantSpentEvent');
-        // ZK-aware detector patterns aren't registered yet → unknown.
+        // ZK-aware detector patterns aren't registered yet, so the
+        // CovenantLocked state stays `unknown`...
         expect(events).toContain('payload: unknown;');
+        // ...but the CovenantSpent event still gets the spend envelope
+        // (protocol-level, registry-independent) with `state: unknown`.
+        expect(events).toContain('export interface CovenantSpend');
+        expect(events).toContain('payload: { spend: CovenantSpend; state: unknown };');
       }
     },
   );

@@ -250,7 +250,7 @@ dataSources:
     expect(out).not.toContain('payload: unknown;');
   });
 
-  it('leaves payload `unknown` for unregistered patterns and pattern-less sources', async () => {
+  it('leaves state `unknown` for unregistered patterns and pattern-less sources', async () => {
     const root = await scratch();
     await writeFixture(
       root,
@@ -279,8 +279,50 @@ dataSources:
     const code = await runCodegen([], new CapturedIo(root));
     expect(code).toBe(0);
     const out = await readFile(path.join(root, 'src/generated/events.ts'), 'utf8');
-    expect(out).not.toContain('State');
+    // Unregistered pattern → no `<Kind>State` interface emitted.
+    expect(out).not.toContain('detectorKind');
+    // A covenant_id spend still carries the protocol-level spend
+    // envelope, with `state: unknown` because the pattern is unregistered.
+    expect(out).toContain('export interface CovenantSpend');
+    expect(out).toContain('payload: { spend: CovenantSpend; state: unknown };');
+    // The utxo firehose carries no covenant semantics → plain `unknown`.
     expect(out).toContain('payload: unknown;');
+  });
+
+  it('attaches the spend envelope only to CovenantSpent, not CovenantLocked', async () => {
+    const root = await scratch();
+    await writeFixture(
+      root,
+      `name: x
+dataSources:
+  - name: ds
+    kind: covenant_id
+    source:
+      ids:
+        - pattern: OpenSilverVault
+    mapping:
+      handlers:
+        - event: CovenantLocked
+          handler: handleLock
+        - event: CovenantSpent
+          handler: handleSpend
+`,
+      `type Bond { id: ID! }`,
+    );
+    const code = await runCodegen([], new CapturedIo(root));
+    expect(code).toBe(0);
+    const out = await readFile(path.join(root, 'src/generated/events.ts'), 'utf8');
+    // Shared envelope emitted once with the protocol-level fields.
+    expect(out).toContain('export interface CovenantSpend');
+    expect(out).toContain('operation: string;');
+    expect(out).toContain('spentValueSompi: string;');
+    expect(out).toContain('successorCovenantId: string | null;');
+    // Lock event: plain state union, no spend envelope.
+    expect(out).toContain('payload: OpenSilverVaultState;');
+    // Spend event: state union wrapped in the spend envelope.
+    expect(out).toContain(
+      'payload: { spend: CovenantSpend; state: OpenSilverVaultState };',
+    );
   });
 
   it('emits `export {};` when the manifest has no handlers', async () => {

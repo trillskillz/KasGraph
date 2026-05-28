@@ -28,8 +28,12 @@
 //                 an event's payload is the union of its data source's
 //                 detector states. Pattern-less sources (krc721
 //                 `collection`, utxo `addresses`) and unregistered
-//                 selectors leave the payload `unknown`. The detector
-//                 schema is sourced from `./detector-schema.ts`.
+//                 selectors leave the state `unknown`. A `CovenantSpent`
+//                 event on a `covenant_id` source additionally wraps its
+//                 payload in `{ spend: CovenantSpend; state: … }`, where
+//                 `CovenantSpend` is the protocol-level spend envelope
+//                 (operation, consumed value, lineage successor). The
+//                 detector schema is sourced from `./detector-schema.ts`.
 
 import { parse, Kind, type DocumentNode, type TypeNode } from 'graphql';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -42,6 +46,10 @@ import { DETECTOR_SCHEMA_BY_KIND } from './detector-schema.js';
 
 interface SubgraphDataSource {
   name: string;
+  // One of the documented data-source kinds (covenant_id, krc20,
+  // krc721, address, utxo). Covenant spends carry the typed spend
+  // envelope only on `covenant_id` sources.
+  kind?: string;
   source?: {
     // covenant_id sources carry an `ids` list whose entries are
     // either a literal id string or a `{ pattern: <DetectorKind> }`
@@ -163,6 +171,11 @@ function renderEntities(doc: DocumentNode): string {
   return `${banner}\n${types.join('\n\n')}\n`;
 }
 
+// KIP-20 covenant lifecycle event names. A `covenant_id` data source's
+// spend event additionally carries the protocol-level spend envelope.
+const COVENANT_KIND = 'covenant_id';
+const COVENANT_SPEND_EVENT = 'CovenantSpent';
+
 function renderEvents(manifest: SubgraphManifest): string {
   const sources = manifest.dataSources ?? [];
 
@@ -170,17 +183,24 @@ function renderEvents(manifest: SubgraphManifest): string {
   // it. A covenant_id dataSource's `pattern:` selectors apply to all
   // of that dataSource's handlers (a CovenantLocked / CovenantSpent on
   // that source can carry any of the patterns it watches). Only kinds
-  // present in the detector schema contribute a typed payload; unknown
-  // selectors (e.g. ZK-aware patterns not yet registered) and
+  // present in the detector schema contribute a typed state payload;
+  // unknown selectors (e.g. ZK-aware patterns not yet registered) and
   // pattern-less sources (krc721 `collection`, utxo `addresses`) leave
-  // the payload `unknown`.
+  // the state `unknown`.
   const eventKinds = new Map<string, Set<string>>();
   const eventOrder: string[] = [];
   const allKinds = new Set<string>();
+  // Event names that are a covenant spend on a `covenant_id` source.
+  // These carry the protocol-level `CovenantSpend` envelope regardless
+  // of whether the source watches a registered detector pattern, since
+  // the spend operation / consumed value / lineage successor are
+  // observable from the spend transaction, not the detector registry.
+  const spendEvents = new Set<string>();
 
   for (const source of sources) {
     const kinds = detectorKindsForSource(source);
     for (const kind of kinds) allKinds.add(kind);
+    const isCovenant = source.kind === COVENANT_KIND;
     for (const handler of source.mapping?.handlers ?? []) {
       if (!eventKinds.has(handler.event)) {
         eventKinds.set(handler.event, new Set());
@@ -188,6 +208,9 @@ function renderEvents(manifest: SubgraphManifest): string {
       }
       const set = eventKinds.get(handler.event)!;
       for (const kind of kinds) set.add(kind);
+      if (isCovenant && handler.event === COVENANT_SPEND_EVENT) {
+        spendEvents.add(handler.event);
+      }
     }
   }
 
@@ -197,10 +220,20 @@ function renderEvents(manifest: SubgraphManifest): string {
 
   const eventInterfaces = eventOrder.map((event) => {
     const kinds = [...(eventKinds.get(event) ?? [])].sort();
-    const payloadType =
+    const stateType =
       kinds.length === 0 ? 'unknown' : kinds.map((k) => `${k}State`).join(' | ');
-    const payloadDoc =
-      kinds.length === 0
+    const isSpend = spendEvents.has(event);
+    const payloadType = isSpend
+      ? `{ spend: CovenantSpend; state: ${stateType} }`
+      : stateType;
+    const payloadDoc = isSpend
+      ? `  /**
+   * Covenant spend payload: the protocol-level \`spend\` envelope
+   * (operation, consumed value, lineage successor) plus the lock-time
+   * covenant \`state\` of the UTXO being spent. \`state\` is \`unknown\`
+   * when the data source watches no registered detector pattern.
+   */`
+      : kinds.length === 0
         ? `  /**
    * Detector-specific payload. This event's data source watches no
    * registered detector pattern, so the payload is left \`unknown\`;
@@ -208,8 +241,7 @@ function renderEvents(manifest: SubgraphManifest): string {
    */`
         : `  /**
    * Detector covenant-state payload, discriminated on \`detectorKind\`.
-   * Fields are the lock-time state windows, hex-encoded. Spend-semantic
-   * fields (operation, amount, …) layer on in a later slice.
+   * Fields are the lock-time state windows, hex-encoded.
    */`;
     return `export interface ${event}Event {
   /** Logical event name, matches the manifest handler entry. */
@@ -231,11 +263,38 @@ ${payloadDoc}
   });
 
   const banner = headerBanner('events');
-  const blocks = [...stateInterfaces, ...eventInterfaces];
+  const spendInterface =
+    spendEvents.size > 0 ? [renderCovenantSpendInterface()] : [];
+  const blocks = [...stateInterfaces, ...spendInterface, ...eventInterfaces];
   if (blocks.length === 0) {
     return `${banner}\nexport {};\n`;
   }
   return `${banner}\n${blocks.join('\n\n')}\n`;
+}
+
+// Protocol-level covenant spend envelope, shared across every
+// CovenantSpent event. These fields are observable from the spend
+// transaction + the KIP-20 lineage tracker (Phase 2.4), independent of
+// any detector pattern: the invoked spend path, the consumed output's
+// value, and the continuation covenant id (or null for a terminal
+// spend). Subgraph-specific quantities (transfer amount, new controller,
+// coupon payout, …) are derived by the mapping from these primitives.
+function renderCovenantSpendInterface(): string {
+  return `export interface CovenantSpend {
+  /**
+   * The covenant operation (spend path / method) this spend invoked,
+   * observable from the revealed spend branch.
+   */
+  operation: string;
+  /** Value of the consumed covenant output, in sompi (decimal string). */
+  spentValueSompi: string;
+  /**
+   * Continuation covenant id when the spend produced a successor
+   * covenant output; \`null\` for a terminal spend (redemption / burn).
+   * Sourced from the KIP-20 lineage tracker.
+   */
+  successorCovenantId: string | null;
+}`;
 }
 
 // Detector kinds referenced by a dataSource's `pattern:` selectors,
