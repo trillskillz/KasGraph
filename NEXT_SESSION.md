@@ -2,7 +2,18 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — kasgraph-mcp operator binary on stdio)
+## Latest commit arc (2026-05-28 — kasgraph CLI `init` + `mcp-config`)
+
+- `@kasgraph/cli` goes from a dispatch shim to a real CLI. New `runCommand(argv, io)` returns a numeric exit code and routes to per-command bodies.
+- `kasgraph init <name>` scaffolds a working subgraph dir: `subgraph.yaml` (matching the `SubgraphManifest` shape from `@kasgraph/sdk`), `schema.graphql` (KasBonds-style placeholder), `src/mapping.ts` (handler stubs), `package.json`, `.gitignore`, `README.md`. Validates the name against `^[a-z0-9][a-z0-9_-]{0,63}$`. Refuses to clobber an existing directory.
+- `kasgraph mcp-config` prints a Claude Desktop / Cursor / OpenClaw `mcpServers` JSON snippet wiring `kasgraph-mcp` over stdio. Flags: `--database-url`, `--command`, `--server-name`.
+- Commands recognized but not yet implemented (`codegen`, `build`, `deploy`, `status`, `logs`, `remove`) surface a clear "not implemented yet (Phase 4 WASM pipeline pending)" message and exit 64.
+- `cli/src/cli.ts` is now a thin shim wiring `process.argv/env/stdout/stderr` into `runCommand`; everything else lives in modules that tests exercise without spawning a child process.
+- `tests/cli.test.ts` adds 18 vitest cases against a `CapturedIo` + per-test tmpdir: dispatch shape, init validation (missing name / bad regex / clobber refusal), scaffolded-file assertions (subgraph.yaml + package.json shape, placeholder schema entity), mcp-config flag parsing, JSON shape, and an end-to-end runCommand path for both subcommands.
+- Total: 98 cargo + 106 TS = **204 tests** green. Typecheck clean across all four TS packages.
+- Phase 4 (developer CLI) now has its two no-WASM-required commands live. `codegen` + `build` + `deploy` wait on the WASM mapping runtime (Phase 2.6 — the next big framework decision).
+
+## Previous commit arc (2026-05-28 — kasgraph-mcp operator binary on stdio)
 
 - `@kasgraph/mcp` now ships a real MCP server + operator binary (`bin: { kasgraph-mcp: dist/main.js }`) over the canonical `@modelcontextprotocol/sdk` Server with `StdioServerTransport`.
 - `mcp/src/server.ts`: `createKasGraphMcpServer(handlers)` registers `ListToolsRequestSchema` (returns `mcpToolListing()` in canonical order) and `CallToolRequestSchema` (routes through `dispatchMcpTool` → MCP text-content blocks). `runMcpStdioServer(handlers)` connects stdio.

@@ -1,33 +1,24 @@
 #!/usr/bin/env node
-// kasgraph CLI entry — thin dispatcher over the command surface in
-// src/index.ts. Per-command bodies land in Phase 4.
+// kasgraph CLI entry — thin shim that wires process I/O into
+// `runCommand`. All command logic lives in src/index.ts and its
+// siblings so vitest can exercise it without spawning a child
+// process.
 
-import { parseCommand } from './index.js';
+import process from 'node:process';
+
+import { runCommand } from './index.js';
 
 const argv = process.argv.slice(2);
-const command = parseCommand(argv);
 
-switch (command) {
-  case 'help':
-  default:
-    process.stdout.write(
-      [
-        'kasgraph — subgraph-style indexing for Kaspa',
-        '',
-        'Commands:',
-        '  kasgraph init <name>            Scaffold a new subgraph',
-        '  kasgraph init --from-thegraph   Migrate from a The Graph subgraph',
-        '  kasgraph codegen                Generate types from schema.graphql',
-        '  kasgraph build                  Compile mappings to WASM',
-        '  kasgraph deploy --node <url>    Deploy to hosted node',
-        '  kasgraph status <subgraph>      Check indexing status',
-        '  kasgraph logs <subgraph>        Tail mapping logs',
-        '  kasgraph remove <subgraph>      Remove a deployed subgraph',
-        '  kasgraph mcp-config             Generate MCP config for Claude/Cursor/OpenClaw',
-        '',
-        'Status: Phase 2 scaffold. Command bodies land in Phase 4.',
-        '',
-      ].join('\n'),
-    );
-    break;
-}
+runCommand(argv, {
+  stdout: process.stdout,
+  stderr: process.stderr,
+  cwd: process.cwd(),
+}).then(
+  (code) => process.exit(code),
+  (err: unknown) => {
+    const message = err instanceof Error ? err.stack ?? err.message : String(err);
+    process.stderr.write(`kasgraph: unexpected error\n${message}\n`);
+    process.exit(70); // EX_SOFTWARE
+  },
+);

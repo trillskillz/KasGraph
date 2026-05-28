@@ -11,8 +11,24 @@
 //   kasgraph remove <subgraph>        remove a deployed subgraph
 //   kasgraph mcp-config               generate MCP config for Claude/Cursor/OpenClaw
 //
-// This module exports the dispatch surface; the per-command bodies
-// land in Phase 4 alongside the WASM build pipeline.
+// This module exports a typed dispatch surface and the
+// `runCommand` entry that tests + the bin both use. Per-command
+// bodies live in sibling files (`init.ts`, `mcp-config.ts`, …).
+// Commands that still need the WASM mapping runtime (build,
+// codegen) print a clear "not yet implemented" notice.
+
+import { runInit } from './init.js';
+import { runMcpConfig } from './mcp-config.js';
+
+// Re-export per-command helpers so tests can exercise them
+// without spelunking subpaths.
+export { runInit } from './init.js';
+export {
+  buildMcpConfig,
+  parseMcpConfigArgs,
+  runMcpConfig,
+  type McpConfigOptions,
+} from './mcp-config.js';
 
 export type Command =
   | 'init'
@@ -40,5 +56,64 @@ export function parseCommand(argv: string[]): Command {
       return first;
     default:
       return 'help';
+  }
+}
+
+/**
+ * I/O surface every command works against. Production code wires
+ * this to process.stdout/process.stderr/process.cwd(); tests
+ * provide capturing buffers and a tmp dir.
+ */
+export interface CliIo {
+  stdout: { write: (s: string) => boolean | void };
+  stderr: { write: (s: string) => boolean | void };
+  /** Working directory commands resolve relative paths against. */
+  cwd: string;
+}
+
+export const HELP_TEXT = [
+  'kasgraph — subgraph-style indexing for Kaspa',
+  '',
+  'Commands:',
+  '  kasgraph init <name>            Scaffold a new subgraph',
+  '  kasgraph init --from-thegraph   Migrate from a The Graph subgraph',
+  '  kasgraph codegen                Generate types from schema.graphql',
+  '  kasgraph build                  Compile mappings to WASM',
+  '  kasgraph deploy --node <url>    Deploy to hosted node',
+  '  kasgraph status <subgraph>      Check indexing status',
+  '  kasgraph logs <subgraph>        Tail mapping logs',
+  '  kasgraph remove <subgraph>      Remove a deployed subgraph',
+  '  kasgraph mcp-config             Generate MCP config for Claude/Cursor/OpenClaw',
+  '',
+].join('\n');
+
+/**
+ * Dispatch entry. Returns a process exit code (0 success,
+ * non-zero failure). Never throws — every error path returns a
+ * numeric code and writes a diagnostic to `io.stderr`.
+ */
+export async function runCommand(argv: string[], io: CliIo): Promise<number> {
+  const command = parseCommand(argv);
+  const rest = argv.slice(1);
+
+  switch (command) {
+    case 'init':
+      return runInit(rest, io);
+    case 'mcp-config':
+      return runMcpConfig(rest, io);
+    case 'codegen':
+    case 'build':
+    case 'deploy':
+    case 'status':
+    case 'logs':
+    case 'remove':
+      io.stderr.write(
+        `kasgraph: \`${command}\` is not implemented yet (Phase 4 WASM pipeline pending)\n`,
+      );
+      return 64; // EX_USAGE-ish — recognized but not actionable.
+    case 'help':
+    default:
+      io.stdout.write(HELP_TEXT);
+      return 0;
   }
 }
