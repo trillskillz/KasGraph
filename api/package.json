@@ -8,6 +8,7 @@
   "dependencies": {
     "@kasgraph/sdk": "0.1.0",
     "graphql": "^16.10.0",
+    "graphql-yoga": "^5.10.0",
     "pg": "^8.13.0"
   },
   "devDependencies": {

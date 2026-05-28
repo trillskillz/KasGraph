@@ -41,6 +41,13 @@ export {
   type QueryResultRow,
 } from './pg-resolvers.js';
 
+// HTTP transport (graphql-yoga).
+export {
+  createKasGraphServer,
+  type KasGraphServer,
+  type KasGraphServerOptions,
+} from './server.js';
+
 // ---------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------

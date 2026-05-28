@@ -2,7 +2,18 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — Postgres-backed McpHandlers)
+## Latest commit arc (2026-05-28 — Yoga HTTP transport for the GraphQL gateway)
+
+- `@kasgraph/api` now ships `createKasGraphServer({ pool, resolvers?, graphqlEndpoint?, graphiql? })` returning a Yoga handler (Fetch-API `(Request) => Response` function — slots into Node `http`, Workers, Deno, or `yoga.fetch` for tests).
+- Schema construction stays in `getKasGraphSchema()` (rootValue-based); Yoga injects `rootValue` at execute time via a tiny `onExecute` plugin. The same schema definition + resolvers feed both `executeGraphQLQuery` (in-process) and the HTTP handler, so they cannot drift.
+- Vitest config gained a `graphql` → `node_modules/graphql/index.js` alias plus `dedupe: ['graphql', 'graphql-yoga']`. Without this, vitest holds both CJS and ESM copies of `graphql` in the same process and Yoga errors with "Cannot use GraphQLSchema from another module or realm."
+- `tests/server.test.ts` adds 7 vitest cases using `yoga.fetch` directly (no socket binding): GraphiQL HTML served on GET, POST query execution against in-memory resolvers, end-to-end POST through `PgGatewayResolvers` against the same `MockPool` pattern as `pg-handlers`/`pg-resolvers`, GraphQL-validation errors surface with the right body, `__schema` introspection round-trip, `graphiql:false` disables the UI, and `graphqlEndpoint` override routes the handler to a custom path.
+- Tests honor the GraphQL-over-HTTP spec: `Accept: application/graphql-response+json, application/json` on POSTs; validation errors accepted as either 200 or 400 (Yoga returns 400 per spec when the spec-compliant Accept is sent).
+- `graphql-yoga ^5.10.0` added to `api/package.json`.
+- Total: 98 cargo + 67 TS = **165 tests** green. Typecheck clean across all four TS packages.
+- Phase 3.1 (GraphQL gateway) is now end-to-end reachable: typed contract → in-memory resolvers → Postgres resolvers → HTTP transport. Next slice for that phase is the operator entry binary (read `DATABASE_URL` / `PORT` from env and start a Node `http` server wrapping the Yoga handler).
+
+## Previous commit arc (2026-05-28 — Postgres-backed McpHandlers)
 
 - `@kasgraph/mcp` now ships `PgMcpHandlers` implementing every `McpHandlers` method against the Phase 2.4 + 2.5 schema, mirroring `PgGatewayResolvers` from `@kasgraph/api`.
 - Fully backed by Postgres: `list_subgraphs` (GROUP BY with optional `LOWER(subgraph) LIKE` filter), `search_by_pattern` (kind filter + bounded limit + ordered), `get_covenant_lineage` (head + ordered entries; returns empty lineage when head missing instead of throwing).
