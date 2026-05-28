@@ -1,0 +1,35 @@
+specVersion: 0.1.0
+name: krc721
+description: |
+  Native KRC-721 (post-Toccata covenant era) indexing — every
+  collection, every mint, every transfer, every holder. Complements
+  krc721.stream with covenant-aware, lineage-backed NFT indexing.
+schema:
+  file: ./schema.graphql
+dataSources:
+  - name: krc721-collections
+    network: kaspa-testnet-12
+    kind: krc721
+    source:
+      # Per PLAN.md the `krc721` kind takes a `collection` selector.
+      # `*` tracks every native collection on the network; pin a
+      # literal collection covenant id to scope a single collection.
+      collection: "*"
+    mapping:
+      kind: typescript
+      file: ./src/mapping.ts
+      entities:
+        - KRC721Collection
+        - KRC721Token
+        - KRC721Transfer
+        - KRC721Holder
+        - KRC721Mint
+      handlers:
+        - event: CollectionDeployed
+          handler: handleCollectionDeployed
+        - event: NftMinted
+          handler: handleNftMinted
+        - event: NftTransferred
+          handler: handleNftTransferred
+        - event: NftBurned
+          handler: handleNftBurned

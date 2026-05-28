@@ -97,7 +97,7 @@ describe('examples — registry shape', () => {
 });
 
 describe('examples — kasgraph codegen', () => {
-  it.each(['kasbonds', 'opensilver-patterns', 'krc20'])(
+  it.each(['kasbonds', 'opensilver-patterns', 'krc20', 'krc721', 'network-stats', 'zk-proofs'])(
     'codegen against examples/%s produces generated entities + events',
     async (name) => {
       const dir = path.join(EXAMPLES_DIR, name);
@@ -139,6 +139,33 @@ describe('examples — kasgraph codegen', () => {
         expect(entities).toContain('export interface KCC20Holder');
         expect(entities).toContain('export interface KCC20Transfer');
         expect(entities).toContain('export interface KCC20Mint');
+      }
+      if (name === 'krc721') {
+        expect(entities).toContain('export interface KRC721Collection');
+        expect(entities).toContain('export interface KRC721Token');
+        expect(entities).toContain('export interface KRC721Holder');
+        expect(entities).toContain('export interface KRC721Mint');
+        expect(entities).toContain('export interface KRC721Transfer');
+        // NFT-semantic handlers → event interfaces.
+        expect(events).toContain('export interface CollectionDeployedEvent');
+        expect(events).toContain('export interface NftMintedEvent');
+        expect(events).toContain('export interface NftTransferredEvent');
+        expect(events).toContain('export interface NftBurnedEvent');
+      }
+      if (name === 'network-stats') {
+        expect(entities).toContain('export interface BlockStat');
+        expect(entities).toContain('export interface DailyStat');
+        expect(entities).toContain('export interface AddressActivity');
+        expect(events).toContain('export interface BlockAddedEvent');
+        expect(events).toContain('export interface UtxoChangedEvent');
+      }
+      if (name === 'zk-proofs') {
+        expect(entities).toContain('export interface ZkVerifyingKey');
+        expect(entities).toContain('export interface ZkProof');
+        expect(entities).toContain('export interface ZkWitness');
+        expect(entities).toContain('export interface ZkVerification');
+        expect(events).toContain('export interface CovenantLockedEvent');
+        expect(events).toContain('export interface CovenantSpentEvent');
       }
     },
   );

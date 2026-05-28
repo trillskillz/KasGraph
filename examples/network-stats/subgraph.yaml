@@ -1,0 +1,30 @@
+specVersion: 0.1.0
+name: network_stats
+description: |
+  Network-wide Kaspa statistics — block production, transaction
+  volume, address activity, and fees — rolled up from the chain
+  firehose into queryable per-block and per-day aggregates.
+schema:
+  file: ./schema.graphql
+dataSources:
+  - name: chain-firehose
+    network: kaspa-testnet-12
+    kind: utxo
+    source:
+      # `*` is the chain-wide UTXO firehose: every output created
+      # or spent. Transaction volume, address activity, and fees
+      # all derive from it. Block production comes from the block
+      # stream the indexer already consumes (BlockAdded handler).
+      addresses: ["*"]
+    mapping:
+      kind: typescript
+      file: ./src/mapping.ts
+      entities:
+        - BlockStat
+        - DailyStat
+        - AddressActivity
+      handlers:
+        - event: BlockAdded
+          handler: handleBlockAdded
+        - event: UtxoChanged
+          handler: handleUtxoChanged

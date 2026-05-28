@@ -2,7 +2,17 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — Phase 6 reference subgraphs)
+## Latest commit arc (2026-05-28 — Phase 6 complete: krc721 + network-stats + zk-proofs)
+
+- `examples/` now ships **all six** reference subgraphs. Phase 6 is complete: 6.1 kasbonds ✓, 6.2 opensilver-patterns ✓, 6.3 krc20 ✓, 6.4 krc721 ✓, 6.5 network-stats ✓, 6.6 zk-proofs ✓.
+- **`examples/krc721/`** (Phase 6.4) — native covenant-era NFTs via `kind: krc721` with a `collection: "*"` firehose. Entities: `KRC721Collection` / `KRC721Token` / `KRC721Holder` / `KRC721Mint` / `KRC721Transfer`. NFT-semantic handlers (`handleCollectionDeployed` / `handleNftMinted` / `handleNftTransferred` / `handleNftBurned`) abstract the underlying collection + per-NFT covenant lineage per `docs/references/KRC20_KRC721_REFERENCE.md`. README flags the native spec as still firming up (krc721.stream maintainers canonical).
+- **`examples/network-stats/`** (Phase 6.5) — chain-wide aggregates via `kind: utxo` with `addresses: ["*"]` (the firehose). Entities: `BlockStat` (per-block production + tx/fee totals), `DailyStat` (per-UTC-day rollup), `AddressActivity` (per-address lifetime counters). Handlers `handleBlockAdded` (block production from the block stream) + `handleUtxoChanged` (tx volume / fees / address activity from the firehose). Chosen `utxo` because there is no block-level data-source kind; block-production counters ride the block stream the indexer already consumes.
+- **`examples/zk-proofs/`** (Phase 6.6, KIP-16) — Groth16 proofs in covenant spends via `kind: covenant_id`. Entities: `ZkVerifyingKey` (registered at covenant lock) / `ZkProof` / `ZkWitness` (blob in object storage, row holds URI + sha256 per Phase 2.7 storage split) / `ZkVerification` (verify outcome recorded at index time). Handlers `handleVerifyingKeyRegistered` (CovenantLocked) + `handleProvenSpend` (CovenantSpent). Pattern selectors `ZkVerifierGroth16` / `ZkRollupCommit` / `ZkPrivateTransfer` are committed names; their detector-registry entries land when OpenSilver exports the ZK-aware pattern family (same pending posture as the placeholder fingerprint bytes).
+- `tests/examples.test.ts` `it.each` extended from 3 → 6 examples; each new subgraph gets per-example entity + event-interface assertions. The generic registry/manifest/kind/handler-match checks already covered the new dirs automatically (they iterate `examples/`).
+- Total: 98 cargo + 155 TS = **253 tests** green. Typecheck clean across all four TS packages. No Rust touched.
+- Next: Phase 6 is done; the remaining Phase-4 CLI commands (`build` / `deploy` / `status` / `logs` / `remove`) and any real deployment of these subgraphs both gate on the **Phase 2.6 WASM mapping runtime** — the next big framework decision — and Phase 5 hosted infra.
+
+## Previous commit arc (2026-05-28 — Phase 6 reference subgraphs)
 
 - `examples/` was empty; now ships three reference subgraphs that double as integration smoke tests for the CLI pipeline.
 - **`examples/kasbonds/`** (Phase 6.1) — first dogfooding customer; Bond / Holding / Coupon entities; `OpenSilverVault` + `OpenSilverEscrowMilestone` pattern source; `handleBondIssued` + `handleBondTransition` handlers with documented pseudo-code for the full impl.

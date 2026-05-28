@@ -1,0 +1,41 @@
+# Network-stats reference schema.
+#
+# BlockStat   — one row per accepted block (production + per-block
+#               tx volume and fee totals).
+# DailyStat   — rolling per-day aggregate keyed on the UTC day.
+# AddressActivity — per-address lifetime counters derived from the
+#               UTXO firehose.
+
+type BlockStat @entity {
+  id: ID!
+  blockHash: String!
+  daaScore: BigInt!
+  blueScore: BigInt!
+  timestamp: BigInt!
+  txCount: Int!
+  totalFees: BigInt!
+  totalOutputAmount: BigInt!
+  parentCount: Int!
+}
+
+type DailyStat @entity {
+  id: ID!
+  day: String!
+  blockCount: Int!
+  txCount: BigInt!
+  totalFees: BigInt!
+  totalVolume: BigInt!
+  activeAddressCount: Int!
+  avgBlockIntervalMs: Float!
+}
+
+type AddressActivity @entity {
+  id: ID!
+  address: String!
+  txCount: BigInt!
+  totalReceived: BigInt!
+  totalSent: BigInt!
+  utxoCount: Int!
+  firstSeenAtDaa: BigInt!
+  lastSeenAtDaa: BigInt!
+}

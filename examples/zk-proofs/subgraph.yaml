@@ -1,0 +1,34 @@
+specVersion: 0.1.0
+name: zk_proofs
+description: |
+  On-chain ZK proofs and witnesses (per KIP-16). Detects Groth16
+  proofs carried in covenant spends, indexes their verifying keys
+  and public inputs, and links witness blobs held in object
+  storage. Foundation for vProgs queries.
+schema:
+  file: ./schema.graphql
+dataSources:
+  - name: zk-covenants
+    network: kaspa-testnet-12
+    kind: covenant_id
+    source:
+      # ZK-aware detector patterns. The detector registry entries
+      # land once OpenSilver exports its ZK-aware pattern family
+      # (PLAN.md Task 2.7); these selectors are the committed names.
+      ids:
+        - pattern: ZkVerifierGroth16
+        - pattern: ZkRollupCommit
+        - pattern: ZkPrivateTransfer
+    mapping:
+      kind: typescript
+      file: ./src/mapping.ts
+      entities:
+        - ZkVerifyingKey
+        - ZkProof
+        - ZkWitness
+        - ZkVerification
+      handlers:
+        - event: CovenantLocked
+          handler: handleVerifyingKeyRegistered
+        - event: CovenantSpent
+          handler: handleProvenSpend

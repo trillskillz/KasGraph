@@ -7,13 +7,13 @@ PHASE_2_STATUS: IN_PROGRESS (Phase 2.1 scaffold complete; Phase 2.2 initial mult
 PHASE_3_STATUS: NOT_STARTED (GraphQL + MCP + KasStream + WebSocket; ships simultaneously)
 PHASE_4_STATUS: NOT_STARTED (CLI surface scaffolded; command bodies pending)
 PHASE_5_STATUS: NOT_STARTED (hosted service)
-PHASE_6_STATUS: NOT_STARTED (six reference subgraphs)
+PHASE_6_STATUS: COMPLETE (all six reference subgraphs landed under examples/: 6.1 kasbonds, 6.2 opensilver-patterns, 6.3 krc20, 6.4 krc721, 6.5 network-stats, 6.6 zk-proofs — each ships subgraph.yaml + schema.graphql + src/mapping.ts + README.md and is exercised by tests/examples.test.ts via runCodegen)
 PHASE_7_STATUS: NOT_STARTED (integrations)
 PHASE_8_STATUS: NOT_STARTED (Toccata-window mainnet launch)
 PHASE_9_STATUS: DEFERRED (post-launch roadmap; documented, not executed)
 COMPONENTS_LIVE: workspace scaffold (cargo + npm workspaces, CI, vitest, basic test surface) + initial kasgraph-rpc failover client with health probes and audit log + ChainNotification / recovery helpers plus JSONL parsing, websocket subscription bootstrap, notification-envelope parsing, and virtual-chain hash hydration in kasgraph-rpc + first kasgraph-store migration slice for covenant lineage, POI, and RPC audit tables + kasgraph-node path that runs migrations, ensures a subgraph schema, can ingest parsed live-style notifications, buffers probabilistic blocks separately from committed blocks, rolls back conflicting probabilistic ranges, requests small recovery replays, and persists scaffold POI/audit records for committed blocks + kasgraph-detectors fingerprint engine (masked-state-window matching with field-named extraction) and registry covering 12 OpenSilver core patterns plus 5 KCC20 variants
 TESTNET_INDEXED_BLOCKS: 0
-SUBGRAPHS_DEPLOYED: 0
+SUBGRAPHS_DEPLOYED: 0 (6 reference subgraphs authored in examples/; deployment awaits Phase 5 hosted infra + Phase 2.6 WASM mapping runtime)
 QUERY_LATENCY_P95: N/A
 MCP_TOOLS_LIVE: 0 (8 typed names exposed; bodies pending)
 BLOCKERS: NONE for continuing Phase 1 / Phase 2.2-2.8 autonomously. Phase 5 (hosted service) needs infrastructure decisions before it can start.

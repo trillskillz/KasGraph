@@ -1,0 +1,46 @@
+# ZK-proofs reference schema (KIP-16).
+#
+# A verifying key is registered when a ZK-aware covenant is locked.
+# Each subsequent spend carries a Groth16 proof + public inputs
+# that satisfy that key; the proof bytes and witness blob are
+# stored (witness in object storage, referenced by URI) and a
+# ZkVerification row records the verify outcome.
+
+type ZkVerifyingKey @entity {
+  id: ID!
+  covenantId: String!
+  scheme: String!
+  circuitHash: String!
+  publicInputCount: Int!
+  registeredAtDaa: BigInt!
+  proofCount: Int!
+  proofs: [ZkProof!]
+}
+
+type ZkProof @entity {
+  id: ID!
+  verifyingKey: ZkVerifyingKey!
+  covenantId: String!
+  proofBytes: Bytes!
+  publicInputs: [String!]!
+  witness: ZkWitness
+  daaScore: BigInt!
+  txHash: String!
+  verification: ZkVerification
+}
+
+type ZkWitness @entity {
+  id: ID!
+  proof: ZkProof!
+  storageUri: String!
+  byteLength: BigInt!
+  sha256: String!
+}
+
+type ZkVerification @entity {
+  id: ID!
+  proof: ZkProof!
+  verified: Boolean!
+  verifierVersion: String!
+  verifiedAtDaa: BigInt!
+}

@@ -1,0 +1,64 @@
+# Native KRC-721 reference schema.
+#
+# One Collection entity per collection covenant; one Token per
+# per-NFT covenant (its covenant id is the permanent token name);
+# one Holder per (Collection, address) pair; Transfer + Mint history.
+# Per-NFT transfers are lineage transitions on the per-NFT covenant
+# (see docs/references/KRC20_KRC721_REFERENCE.md).
+
+type KRC721Collection @entity {
+  id: ID!
+  collectionCovenantId: String!
+  name: String!
+  mintAuthorityPubkey: String
+  baseUri: String
+  maxSupply: BigInt!
+  mintedSupply: BigInt!
+  burnedSupply: BigInt!
+  holderCount: Int!
+  deployedAtDaa: BigInt!
+  tokens: [KRC721Token!]
+  holders: [KRC721Holder!]
+}
+
+type KRC721Token @entity {
+  id: ID!
+  collection: KRC721Collection!
+  tokenCovenantId: String!
+  tokenId: BigInt!
+  owner: KRC721Holder
+  metadataUri: String
+  mintedAtDaa: BigInt!
+  burned: Boolean!
+  transferCount: Int!
+  transfers: [KRC721Transfer!]
+}
+
+type KRC721Holder @entity {
+  id: ID!
+  collection: KRC721Collection!
+  holderPubkey: String!
+  balance: Int!
+  firstSeenAtDaa: BigInt!
+  lastSeenAtDaa: BigInt!
+}
+
+type KRC721Mint @entity {
+  id: ID!
+  collection: KRC721Collection!
+  token: KRC721Token!
+  toHolder: KRC721Holder!
+  metadataUri: String
+  daaScore: BigInt!
+  txHash: String!
+}
+
+type KRC721Transfer @entity {
+  id: ID!
+  collection: KRC721Collection!
+  token: KRC721Token!
+  fromHolder: KRC721Holder
+  toHolder: KRC721Holder!
+  daaScore: BigInt!
+  txHash: String!
+}
