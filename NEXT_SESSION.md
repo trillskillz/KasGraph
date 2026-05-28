@@ -2,7 +2,19 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-26 — Postgres-backed GatewayResolvers)
+## Latest commit arc (2026-05-28 — Postgres-backed McpHandlers)
+
+- `@kasgraph/mcp` now ships `PgMcpHandlers` implementing every `McpHandlers` method against the Phase 2.4 + 2.5 schema, mirroring `PgGatewayResolvers` from `@kasgraph/api`.
+- Fully backed by Postgres: `list_subgraphs` (GROUP BY with optional `LOWER(subgraph) LIKE` filter), `search_by_pattern` (kind filter + bounded limit + ordered), `get_covenant_lineage` (head + ordered entries; returns empty lineage when head missing instead of throwing).
+- `get_schema` returns the canonical `KASGRAPH_BASE_SCHEMA_SDL` for any subgraph id — per-subgraph SDL wires in when the codegen pipeline lands.
+- `execute_query` delegates to `executeGraphQLQuery + PgGatewayResolvers` against the *same* pool so an MCP client and a GraphQL client see identical results for the same query.
+- Three unbacked tools — `get_address_activity`, `find_subgraphs_for_address`, `query_natural_language` — throw `McpHandlerNotImplementedError` with a clear reason. `NOT_IMPLEMENTED_TOOLS` exported for `tools/list` consumers that want to surface a "coming soon" hint.
+- `@kasgraph/api` added as a dep + tsconfig reference of `@kasgraph/mcp` so the gateway pieces (`PgPoolLike`, `executeGraphQLQuery`, `PgGatewayResolvers`, `KASGRAPH_BASE_SCHEMA_SDL`) are usable.
+- 14 new vitest cases in `tests/pg-handlers.test.ts` pin: SQL shape per handler, parameter binding, keyword-LIKE lowercasing, limit clamping, head-missing branch, two-query lineage sequence, end-to-end GraphQL round-trip through the same mock pool, GraphQL parse errors flow through cleanly, each not-implemented tool throws the right error.
+- Total: 98 cargo + 60 TS = **158 tests** green. Typecheck clean across all four TS packages.
+- Phase 3.2 now has a real Postgres-backed production handler. The 5 fully-backed tools are production-ready; the 3 unbacked ones surface a clear error. Next slice for Phase 3.2: stdio/SSE transport via `@modelcontextprotocol/sdk` so the handlers are reachable from LLM clients.
+
+## Previous commit arc (2026-05-26 — Postgres-backed GatewayResolvers)
 
 - `@kasgraph/api` now ships `PgGatewayResolvers` implementing every `GatewayResolvers` method against the Phase 2.4 + 2.5 schema: `committedBlock`, `committedBlocks`, `poiCheckpoints` (with optional `fromDaa`/`toDaa` bounds), `detectedPatterns` (with optional `kind` filter), `covenantLineage` (head + ordered entries).
 - Constructed against a minimal `PgPoolLike` interface — production code passes a real `pg.Pool`; tests use a recording mock that captures `(sql, values)` tuples and replays canned `rows[]`.

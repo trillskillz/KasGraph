@@ -5,6 +5,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../sdk" }],
+  "references": [{ "path": "../sdk" }, { "path": "../api" }],
   "include": ["src/**/*.ts"]
 }

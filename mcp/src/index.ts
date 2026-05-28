@@ -35,6 +35,13 @@ export type McpToolName = (typeof MCP_TOOL_NAMES)[number];
 
 export const KASGRAPH_MCP_VERSION = '0.1.0';
 
+// Postgres-backed handler impl (Phase 2.4 + 2.5 schema).
+export {
+  PgMcpHandlers,
+  McpHandlerNotImplementedError,
+  NOT_IMPLEMENTED_TOOLS,
+} from './pg-handlers.js';
+
 // ---------------------------------------------------------------
 // Tool definitions (name + description + JSONSchema for inputs).
 // ---------------------------------------------------------------
