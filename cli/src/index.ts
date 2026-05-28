@@ -13,16 +13,19 @@
 //
 // This module exports a typed dispatch surface and the
 // `runCommand` entry that tests + the bin both use. Per-command
-// bodies live in sibling files (`init.ts`, `mcp-config.ts`, …).
-// Commands that still need the WASM mapping runtime (build,
-// codegen) print a clear "not yet implemented" notice.
+// bodies live in sibling files (`init.ts`, `codegen.ts`,
+// `build.ts`, `mcp-config.ts`, …). The hosted-node commands
+// (deploy/status/logs/remove) still print a "not yet implemented"
+// notice pending Phase 5 infrastructure.
 
+import { runBuild } from './build.js';
 import { runCodegen } from './codegen.js';
 import { runInit } from './init.js';
 import { runMcpConfig } from './mcp-config.js';
 
 // Re-export per-command helpers so tests can exercise them
 // without spelunking subpaths.
+export { runBuild, type BuildResult } from './build.js';
 export { runCodegen, type CodegenResult } from './codegen.js';
 export { runInit } from './init.js';
 export {
@@ -106,6 +109,7 @@ export async function runCommand(argv: string[], io: CliIo): Promise<number> {
     case 'codegen':
       return runCodegen(rest, io);
     case 'build':
+      return runBuild(rest, io);
     case 'deploy':
     case 'status':
     case 'logs':
