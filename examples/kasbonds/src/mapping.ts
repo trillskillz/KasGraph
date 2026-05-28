@@ -1,76 +1,82 @@
-// KasBonds mapping handlers.
+// KasBonds mapping handlers (AssemblyScript).
 //
-// `kasgraph codegen` regenerates ./generated/{entities,events}.ts
-// from schema.graphql + subgraph.yaml. Handlers below import
-// from those generated files.
+// Compiled to WASM by `kasgraph build` and dispatched by the
+// `kasgraph-mapping` runtime. The runtime hands each handler a (ptr, len)
+// into a UTF-8 JSON event document `{ block: { daaScore, hash }, payload }`;
+// `decodeEvent` turns it into a typed `Event`. Handlers read payload fields
+// via the `obj*` accessors and persist entities through `store.set` /
+// `store.get`.
 //
-// The named exports must match the `handler:` keys in
-// subgraph.yaml — the mapping runtime resolves them by name when
-// it dispatches a typed event.
+// The exported names must match the `handler:` keys in subgraph.yaml — the
+// runtime resolves them by name. The build glue re-exports each one under
+// the (ptr, len) ABI signature.
 
-import type { CovenantLockedEvent, CovenantSpentEvent } from './generated/events.js';
+import {
+  decodeEvent,
+  store,
+  log,
+  LOG_INFO,
+  objStr,
+  objU64,
+  JSON,
+} from "@kasgraph/as-mapping/assembly";
 
-/**
- * Fires the first time a covenant matching `OpenSilverVault` or
- * `OpenSilverEscrowMilestone` enters the chain. Creates the Bond
- * entity + the initial Holding row.
- */
-export async function handleBondIssued(event: CovenantLockedEvent): Promise<void> {
-  // TODO: pull issuer + face value + coupon from the detector
-  // payload once per-detector payload codegen lands. For now
-  // payload is typed as `unknown` — cast inside the handler.
-  void event;
-  // Pseudo-code:
-  //   const bond = new Bond(event.payload.covenantId);
-  //   bond.covenantId      = event.payload.covenantId;
-  //   bond.issuer          = event.payload.issuer;
-  //   bond.faceValueSompi  = event.payload.faceValue;
-  //   bond.couponBps       = event.payload.couponBps;
-  //   bond.issuedAtDaa     = event.block.daaScore;
-  //   bond.redeemed        = false;
-  //   bond.currentHolder   = event.payload.issuer;
-  //   await bond.save();
-  //
-  //   const holding = new Holding(`${bond.id}-${event.payload.issuer}`);
-  //   holding.bond          = bond.id;
-  //   holding.holder        = event.payload.issuer;
-  //   holding.acquiredAtDaa = event.block.daaScore;
-  //   holding.amountSompi   = bond.faceValueSompi;
-  //   await holding.save();
+// Fires the first time a covenant matching `OpenSilverVault` or
+// `OpenSilverEscrowMilestone` enters the chain. Creates the Bond entity plus
+// the initial Holding row. The bond is keyed on the block hash of its first
+// appearance (the lock-time state payload carries no covenant id of its own).
+export function handleBondIssued(ptr: i32, len: i32): void {
+  const ev = decodeEvent(ptr, len);
+  const p = ev.payload;
+  const id = ev.blockHash;
+  const issuer = objStr(p, "owner_pubkey");
+
+  const bond = new JSON.Obj();
+  bond.set<string>("covenantId", id);
+  bond.set<string>("issuer", issuer);
+  bond.set<string>("patternKind", objStr(p, "detectorKind"));
+  bond.set<i64>("issuedAtDaa", <i64>ev.daaScore);
+  bond.set<bool>("redeemed", false);
+  bond.set<string>("currentHolder", issuer);
+  store.set("Bond", id, bond);
+
+  const holding = new JSON.Obj();
+  holding.set<string>("bond", id);
+  holding.set<string>("holder", issuer);
+  holding.set<i64>("acquiredAtDaa", <i64>ev.daaScore);
+  holding.set<string>("amountSompi", "0");
+  store.set("Holding", id + "-" + issuer, holding);
+
+  log(LOG_INFO, "kasbonds: issued bond " + id);
 }
 
-/**
- * Fires on every spend of a covenant in the bond's lineage.
- * Distinguishes coupon payouts (the bond covenant id persists)
- * from redemption (a final spend with no successor covenant
- * output) by inspecting the manifest detector's typed payload.
- */
-export async function handleBondTransition(event: CovenantSpentEvent): Promise<void> {
-  void event;
-  // Pseudo-code:
-  //   const bond = await Bond.load(event.payload.covenantId);
-  //   if (bond === null) return;            // not one of ours
-  //   if (event.payload.successorCovenantId !== null) {
-  //     // Coupon payout: amount comes from the inputs/outputs
-  //     // delta on the spend tx.
-  //     const coupon = new Coupon(`${bond.id}-${event.tx.hash}`);
-  //     coupon.bond        = bond.id;
-  //     coupon.paidAtDaa   = event.block.daaScore;
-  //     coupon.amountSompi = event.payload.couponAmount;
-  //     coupon.payer       = event.payload.signer;
-  //     coupon.recipient   = event.payload.recipient;
-  //     coupon.txHash      = event.tx.hash;
-  //     await coupon.save();
-  //   } else {
-  //     // Final redemption.
-  //     bond.redeemed      = true;
-  //     bond.currentHolder = null;
-  //     await bond.save();
-  //
-  //     const lastHolding = await Holding.loadActive(bond.id);
-  //     if (lastHolding !== null) {
-  //       lastHolding.releasedAtDaa = event.block.daaScore;
-  //       await lastHolding.save();
-  //     }
-  //   }
+// Fires on every spend of a covenant in the bond's lineage. A spend with a
+// successor covenant output is a coupon payout; a terminal spend (no
+// successor) is the final redemption.
+export function handleBondTransition(ptr: i32, len: i32): void {
+  const ev = decodeEvent(ptr, len);
+  const p = ev.payload;
+  const spend = p != null ? p.getObj("spend") : null;
+
+  const bondId = ev.blockHash;
+  const bond = store.get("Bond", bondId);
+  if (bond == null) return; // not one of ours
+
+  const successor = objStr(spend, "successorCovenantId");
+  if (successor.length > 0) {
+    // Coupon payout: amount is the consumed covenant value on the spend.
+    const coupon = new JSON.Obj();
+    coupon.set<string>("bond", bondId);
+    coupon.set<i64>("paidAtDaa", <i64>ev.daaScore);
+    coupon.set<string>("amountSompi", objStr(spend, "spentValueSompi"));
+    store.set("Coupon", bondId + "-" + successor, coupon);
+  } else {
+    // Final redemption.
+    const redeemed = new JSON.Obj();
+    redeemed.set<string>("covenantId", bondId);
+    redeemed.set<string>("issuer", objStr(bond, "issuer"));
+    redeemed.set<i64>("issuedAtDaa", <i64>objU64(bond, "issuedAtDaa"));
+    redeemed.set<bool>("redeemed", true);
+    store.set("Bond", bondId, redeemed);
+  }
 }

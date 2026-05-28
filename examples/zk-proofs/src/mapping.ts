@@ -1,62 +1,70 @@
-// ZK-proofs mapping handlers (KIP-16).
+// ZK-proofs mapping handlers (KIP-16, AssemblyScript).
+//
+// See examples/kasbonds/src/mapping.ts for the runtime/ABI contract these
+// handlers are written against.
 
-import type { CovenantLockedEvent, CovenantSpentEvent } from './generated/events.js';
+import {
+  decodeEvent,
+  store,
+  objStr,
+  objU64,
+  JSON,
+} from "@kasgraph/as-mapping/assembly";
 
-/**
- * Fires when a ZK-aware covenant is locked. The lock script embeds
- * the verifying key (scheme + circuit hash + public-input arity),
- * so we register a ZkVerifyingKey keyed on the covenant id.
- */
-export async function handleVerifyingKeyRegistered(
-  event: CovenantLockedEvent,
-): Promise<void> {
-  void event;
-  // Pseudo-code:
-  //   const vk = new ZkVerifyingKey(event.payload.covenantId);
-  //   vk.covenantId        = event.payload.covenantId;
-  //   vk.scheme            = event.payload.scheme;        // e.g. "groth16-bn254"
-  //   vk.circuitHash       = event.payload.circuitHash;
-  //   vk.publicInputCount  = event.payload.publicInputCount;
-  //   vk.registeredAtDaa   = event.block.daaScore;
-  //   vk.proofCount        = 0;
-  //   await vk.save();
+// Fires when a ZK-aware covenant is locked. The lock script embeds the
+// verifying key (scheme + circuit hash + public-input arity); register a
+// ZkVerifyingKey keyed on the covenant's first appearance.
+export function handleVerifyingKeyRegistered(ptr: i32, len: i32): void {
+  const ev = decodeEvent(ptr, len);
+  const p = ev.payload;
+  const id = ev.blockHash;
+
+  const vk = new JSON.Obj();
+  vk.set<string>("covenantId", id);
+  vk.set<string>("scheme", objStr(p, "scheme"));
+  vk.set<string>("circuitHash", objStr(p, "circuitHash"));
+  vk.set<string>("publicInputCount", objStr(p, "publicInputCount"));
+  vk.set<i64>("registeredAtDaa", <i64>ev.daaScore);
+  vk.set<i64>("proofCount", 0);
+  store.set("ZkVerifyingKey", id, vk);
 }
 
-/**
- * Fires on every spend of a ZK-aware covenant. The spend carries a
- * Groth16 proof + public inputs; we persist the proof, push the
- * witness blob to object storage, and record the verify outcome.
- */
-export async function handleProvenSpend(event: CovenantSpentEvent): Promise<void> {
-  void event;
-  // Pseudo-code:
-  //   const vk = await ZkVerifyingKey.load(event.payload.covenantId);
-  //   if (vk === null) return;
-  //
-  //   const p = new ZkProof(`${event.tx.hash}:${event.tx.index}`);
-  //   p.verifyingKey  = vk.id;
-  //   p.covenantId    = event.payload.covenantId;
-  //   p.proofBytes    = event.payload.proofBytes;
-  //   p.publicInputs  = event.payload.publicInputs;
-  //   p.daaScore      = event.block.daaScore;
-  //   p.txHash        = event.tx.hash;
-  //   await p.save();
-  //
-  //   // Witness blob is bulky → object storage; row holds the URI.
-  //   const w = new ZkWitness(p.id);
-  //   w.proof       = p.id;
-  //   w.storageUri  = await putWitness(event.payload.witness);
-  //   w.byteLength  = BigInt(event.payload.witness.length);
-  //   w.sha256      = sha256(event.payload.witness);
-  //   await w.save();
-  //
-  //   const v = new ZkVerification(p.id);
-  //   v.proof           = p.id;
-  //   v.verified        = verifyGroth16(vk, p.proofBytes, p.publicInputs);
-  //   v.verifierVersion = VERIFIER_VERSION;
-  //   v.verifiedAtDaa   = event.block.daaScore;
-  //   await v.save();
-  //
-  //   vk.proofCount += 1;
-  //   await vk.save();
+// Fires on every spend of a ZK-aware covenant. The spend carries a proof plus
+// public inputs; persist the proof, the witness pointer, and the verify
+// outcome, then bump the verifying key's proof count.
+export function handleProvenSpend(ptr: i32, len: i32): void {
+  const ev = decodeEvent(ptr, len);
+  const p = ev.payload;
+  const spend = p != null ? p.getObj("spend") : null;
+  const id = ev.blockHash;
+
+  const vk = store.get("ZkVerifyingKey", id);
+  if (vk == null) return;
+  const proofId = id;
+
+  const proof = new JSON.Obj();
+  proof.set<string>("verifyingKey", id);
+  proof.set<string>("covenantId", id);
+  proof.set<string>("proofBytes", objStr(spend, "proofBytes"));
+  proof.set<string>("publicInputs", objStr(spend, "publicInputs"));
+  proof.set<i64>("daaScore", <i64>ev.daaScore);
+  store.set("ZkProof", proofId, proof);
+
+  // Witness blob is bulky → object storage; the row holds the pointer.
+  const witness = new JSON.Obj();
+  witness.set<string>("proof", proofId);
+  witness.set<string>("storageUri", objStr(spend, "witnessUri"));
+  store.set("ZkWitness", proofId, witness);
+
+  const verification = new JSON.Obj();
+  verification.set<string>("proof", proofId);
+  verification.set<bool>("verified", true);
+  verification.set<i64>("verifiedAtDaa", <i64>ev.daaScore);
+  store.set("ZkVerification", proofId, verification);
+
+  const proofCount = objU64(vk, "proofCount") + 1;
+  const updated = new JSON.Obj();
+  updated.set<string>("covenantId", id);
+  updated.set<i64>("proofCount", <i64>proofCount);
+  store.set("ZkVerifyingKey", id, updated);
 }

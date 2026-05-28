@@ -72,6 +72,33 @@ export class Event {
   }
 }
 
+// ---- JSON.Obj field accessors ------------------------------------------
+//
+// Convenience readers handlers use to pull typed fields off a payload or a
+// loaded entity without repeating the null/`valueOf()` dance. A missing key
+// (or a null receiver) yields the type's zero value.
+
+/** Read a string field off `obj`, or "" if absent / not a string. */
+export function objStr(obj: JSON.Obj | null, key: string): string {
+  if (obj == null) return "";
+  const v = obj.getString(key);
+  return v != null ? v.valueOf() : "";
+}
+
+/** Read an integer field off `obj` as u64, or 0 if absent / not an integer. */
+export function objU64(obj: JSON.Obj | null, key: string): u64 {
+  if (obj == null) return 0;
+  const v = obj.getInteger(key);
+  return v != null ? <u64>v.valueOf() : 0;
+}
+
+/** Read a boolean field off `obj`, or false if absent / not a boolean. */
+export function objBool(obj: JSON.Obj | null, key: string): bool {
+  if (obj == null) return false;
+  const v = obj.getBool(key);
+  return v != null ? v.valueOf() : false;
+}
+
 /** Decode the JSON event the host wrote at `ptr..ptr+len`. */
 export function decodeEvent(ptr: i32, len: i32): Event {
   const root = <JSON.Obj>JSON.parse(String.UTF8.decodeUnsafe(ptr, len));

@@ -1,79 +1,84 @@
-// Native KRC-20 (KCC20) mapping handlers.
+// Native KRC-20 (KCC20) mapping handlers (AssemblyScript).
+//
+// See examples/kasbonds/src/mapping.ts for the runtime/ABI contract these
+// handlers are written against.
 
-import type { CovenantLockedEvent, CovenantSpentEvent } from './generated/events.js';
+import {
+  decodeEvent,
+  store,
+  objStr,
+  JSON,
+} from "@kasgraph/as-mapping/assembly";
 
-/**
- * Fires on the first appearance of every KCC20 covenant — both
- * asset contracts and any of the four controller variants.
- */
-export async function handleAssetOrControllerDeployed(
-  event: CovenantLockedEvent,
-): Promise<void> {
-  void event;
-  // Pseudo-code:
-  //   const kind = event.payload.detectorKind;
-  //   if (kind === 'KCC20Asset') {
-  //     const a = new KCC20Asset(event.payload.assetCovenantId);
-  //     a.assetCovenantId      = event.payload.assetCovenantId;
-  //     a.controllerCovenantId = event.payload.controllerCovenantId;
-  //     a.decimals             = event.payload.decimals;
-  //     a.totalSupply          = event.payload.totalSupply;
-  //     a.mintNonce            = event.payload.mintNonce;
-  //     a.deployedAtDaa        = event.block.daaScore;
-  //     a.holderCount          = 0;
-  //     await a.save();
-  //   } else {
-  //     // KCC20{Ownable|Pausable|Capped|Vesting}Controller
-  //     const c = new KCC20Controller(event.payload.controllerCovenantId);
-  //     c.controllerCovenantId = event.payload.controllerCovenantId;
-  //     c.assetCovenantId      = event.payload.assetCovenantId;
-  //     c.controllerKind       = kind;
-  //     c.ownerPubkey          = event.payload.ownerPubkey ?? null;
-  //     c.pausedFlag           = event.payload.pausedFlag ?? null;
-  //     c.remainingAllowance   = event.payload.remainingAllowance ?? null;
-  //     c.scheduleRoot         = event.payload.scheduleRoot ?? null;
-  //     c.active               = true;
-  //     await c.save();
-  //   }
+// Fires on the first appearance of every KCC20 covenant — both asset
+// contracts and any of the four controller variants. Branches on the
+// detector kind to write either a KCC20Asset or a KCC20Controller.
+export function handleAssetOrControllerDeployed(ptr: i32, len: i32): void {
+  const ev = decodeEvent(ptr, len);
+  const p = ev.payload;
+  const kind = objStr(p, "detectorKind");
+  const id = ev.blockHash;
+
+  if (kind == "KCC20Asset") {
+    const a = new JSON.Obj();
+    a.set<string>("assetCovenantId", id);
+    a.set<string>("controllerCovenantId", objStr(p, "controller_covenant_id"));
+    a.set<string>("decimals", objStr(p, "decimals"));
+    a.set<string>("totalSupply", objStr(p, "total_supply"));
+    a.set<string>("mintNonce", objStr(p, "mint_nonce"));
+    a.set<i64>("deployedAtDaa", <i64>ev.daaScore);
+    a.set<i64>("holderCount", 0);
+    store.set("KCC20Asset", id, a);
+  } else {
+    const c = new JSON.Obj();
+    c.set<string>("controllerCovenantId", id);
+    c.set<string>("assetCovenantId", objStr(p, "asset_covenant_id"));
+    c.set<string>("controllerKind", kind);
+    c.set<string>("ownerPubkey", objStr(p, "owner_pubkey"));
+    c.set<bool>("active", true);
+    store.set("KCC20Controller", id, c);
+  }
 }
 
-/**
- * Fires on every spend of a KCC20 covenant. Distinguishes:
- *   - Transfer: holder balance delta + Transfer entity
- *   - Mint    : asset.totalSupply delta + Mint entity
- *   - Burn    : asset.totalSupply delta, no Transfer
- *   - Controller rotation: KCC20Asset.controllerCovenantId update
- */
-export async function handleAssetTransition(event: CovenantSpentEvent): Promise<void> {
-  void event;
-  // Pseudo-code. `event.payload` carries the protocol-level spend envelope
-  // (`event.payload.spend`) plus the decoded covenant state (`event.payload.state`).
-  // Amounts/balances are *derived by the mapping* from the spend + lineage —
-  // they are not surfaced verbatim on the typed payload.
-  //   const asset = await KCC20Asset.load(event.payload.state.assetCovenantId);
-  //   if (asset === null) return;
-  //
-  //   switch (event.payload.spend.operation) {
-  //     case 'transfer': {
-  //       // Update from/to holders + emit a KCC20Transfer.
-  //       break;
-  //     }
-  //     case 'mint': {
-  //       asset.totalSupply += deriveMintedAmount(event.payload.spend);
-  //       await asset.save();
-  //       // Emit a KCC20Mint linking the controller.
-  //       break;
-  //     }
-  //     case 'burn': {
-  //       asset.totalSupply -= deriveBurnedAmount(event.payload.spend);
-  //       await asset.save();
-  //       // Update sender's holder row.
-  //       break;
-  //     }
-  //     case 'rotate_controller': {
-  //       asset.controllerCovenantId = event.payload.spend.successorCovenantId;
-  //       await asset.save();
-  //       break;
-  //     }
-  //   }
+// Fires on every spend of a KCC20 covenant. The protocol-level operation on
+// the spend envelope selects the effect: transfer, mint, burn, or controller
+// rotation.
+export function handleAssetTransition(ptr: i32, len: i32): void {
+  const ev = decodeEvent(ptr, len);
+  const p = ev.payload;
+  const spend = p != null ? p.getObj("spend") : null;
+
+  const assetId = ev.blockHash;
+  const asset = store.get("KCC20Asset", assetId);
+  if (asset == null) return; // spend of a covenant we don't track as an asset
+
+  const operation = objStr(spend, "operation");
+  const valueSompi = objStr(spend, "spentValueSompi");
+
+  if (operation == "transfer") {
+    const t = new JSON.Obj();
+    t.set<string>("asset", assetId);
+    t.set<string>("amountSompi", valueSompi);
+    t.set<i64>("atDaa", <i64>ev.daaScore);
+    store.set("KCC20Transfer", assetId + "-" + ev.blockHash, t);
+  } else if (operation == "mint") {
+    const m = new JSON.Obj();
+    m.set<string>("asset", assetId);
+    m.set<string>("amountSompi", valueSompi);
+    m.set<i64>("atDaa", <i64>ev.daaScore);
+    store.set("KCC20Mint", assetId + "-" + ev.blockHash, m);
+  } else if (operation == "burn") {
+    const updated = new JSON.Obj();
+    updated.set<string>("assetCovenantId", assetId);
+    updated.set<string>("lastBurnSompi", valueSompi);
+    store.set("KCC20Asset", assetId, updated);
+  } else if (operation == "rotate_controller") {
+    const updated = new JSON.Obj();
+    updated.set<string>("assetCovenantId", assetId);
+    updated.set<string>(
+      "controllerCovenantId",
+      objStr(spend, "successorCovenantId"),
+    );
+    store.set("KCC20Asset", assetId, updated);
+  }
 }
