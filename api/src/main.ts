@@ -15,10 +15,11 @@
 //   - main()                              → CLI entry point
 
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 
 import { createKasGraphServer, type KasGraphServer } from './server.js';
 import type { PgPoolLike } from './pg-resolvers.js';
+import { PgListenSource, type PgListenClient } from './pg-listen.js';
 
 // ---------------------------------------------------------------
 // Structured logging — JSON lines to stdout, errors to stderr.
@@ -137,6 +138,20 @@ export interface RunServerOptions {
   port: number;
   graphqlEndpoint: string;
   graphiql: boolean;
+  /**
+   * Enable GraphQL `Subscription.detectedPatterns` over the
+   * Postgres LISTEN/NOTIFY channel. When `false`, the gateway
+   * starts without a subscription source; subscribe calls
+   * surface a clear "subscriptions are not configured" error.
+   */
+  subscriptionsEnabled: boolean;
+  /**
+   * Connection string for the dedicated listener client. Defaults
+   * to `databaseUrl` so a single env var is enough in the common
+   * case; operators that want to point listens at a read replica
+   * (or a different role with NOTIFY privileges) override this.
+   */
+  listenDatabaseUrl: string;
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {
@@ -159,12 +174,15 @@ export function readOptionsFromEnv(): RunServerOptions {
       'DATABASE_URL (or KASGRAPH_DATABASE_URL) must be set so the gateway can connect to Postgres',
     );
   }
+  const listenDatabaseUrl = process.env.LISTEN_DATABASE_URL ?? databaseUrl;
   return {
     databaseUrl,
     host: process.env.HOST ?? '0.0.0.0',
     port: envInt('PORT', 4000),
     graphqlEndpoint: process.env.GRAPHQL_ENDPOINT ?? '/graphql',
     graphiql: envBoolean('GRAPHIQL', true),
+    subscriptionsEnabled: envBoolean('KASGRAPH_SUBSCRIPTIONS_ENABLED', true),
+    listenDatabaseUrl,
   };
 }
 
@@ -182,10 +200,33 @@ export interface RunningServer {
  */
 export async function runKasGraphServer(options: RunServerOptions): Promise<RunningServer> {
   const pool = new Pool({ connectionString: options.databaseUrl });
+
+  // Build the LISTEN/NOTIFY-backed subscription source when
+  // enabled. The connect factory returns a fresh dedicated
+  // client every time PgListenSource lazy-reconnects.
+  const subscriptionSource = options.subscriptionsEnabled
+    ? new PgListenSource({
+        connect: async () => {
+          const client = new Client({ connectionString: options.listenDatabaseUrl });
+          // `pg.Client` shape satisfies our PgListenClient
+          // interface; cast through unknown to drop the extra
+          // signatures pg exposes (parameterised query
+          // overloads, events we don't subscribe to, etc.).
+          return client as unknown as PgListenClient;
+        },
+        onError: (message, err) => {
+          log('warn', `PgListenSource: ${message}`, {
+            error: err === undefined ? undefined : String(err),
+          });
+        },
+      })
+    : undefined;
+
   const yoga = createKasGraphServer({
     pool,
     graphqlEndpoint: options.graphqlEndpoint,
     graphiql: options.graphiql,
+    ...(subscriptionSource !== undefined && { subscriptionSource }),
   });
   const handler = createKasGraphHttpHandler(yoga, () => healthzResponse(pool));
   const server = http.createServer(handler);
@@ -206,12 +247,16 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
     port: boundPort,
     graphqlEndpoint: options.graphqlEndpoint,
     graphiql: options.graphiql,
+    subscriptionsEnabled: options.subscriptionsEnabled,
   });
 
   return {
     address: { host: options.host, port: boundPort },
     async shutdown(): Promise<void> {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (subscriptionSource !== undefined) {
+        await subscriptionSource.close();
+      }
       await pool.end();
     },
   };

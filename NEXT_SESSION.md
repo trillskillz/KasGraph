@@ -2,7 +2,19 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — Pg LISTEN/NOTIFY subscription source)
+## Latest commit arc (2026-05-28 — kasgraph-api binary auto-wires LISTEN subscriptions)
+
+- `kasgraph-api` operator binary now autoconfigures GraphQL subscriptions from env. A container with just `DATABASE_URL` set serves Query, healthz, AND live `Subscription.detectedPatterns` over SSE — no extra wiring.
+- `RunServerOptions` gains `subscriptionsEnabled` + `listenDatabaseUrl`. `readOptionsFromEnv`:
+    - `KASGRAPH_SUBSCRIPTIONS_ENABLED` (default `true`; flip to `false` to disable cleanly)
+    - `LISTEN_DATABASE_URL` (default falls back to `DATABASE_URL`; override for a read replica or a different role with NOTIFY privileges)
+- `runKasGraphServer` builds a `PgListenSource` with a `connect` factory returning a fresh `pg.Client` each lazy-reconnect; passes it to `createKasGraphServer` via conditional spread (honors `exactOptionalPropertyTypes:true`); `shutdown()` calls `source.close()` before ending the pool.
+- `PgListenSource.onError` routed through the same structured JSON-line logger as the rest of the binary, prefixed with `PgListenSource:` for grep-ability.
+- `tests/main.test.ts` adds 4 new vitest cases: defaults assert `subscriptionsEnabled=true` + `listenDatabaseUrl=DATABASE_URL`; `KASGRAPH_SUBSCRIPTIONS_ENABLED=false` disables; every standard truthy value (`1/true/TRUE/True/yes`) enables; `LISTEN_DATABASE_URL` falls back + overrides.
+- Total: 98 cargo + 145 TS = **243 tests** green. Typecheck clean across all four TS packages.
+- Phase 3.4 status: in-process source ✓, Postgres LISTEN/NOTIFY source ✓, schema + Yoga wiring ✓, operator binary auto-wiring ✓. The gateway can now stream every detector hit the indexer writes — no app-side `pg_notify` call, no extra setup beyond `DATABASE_URL`. Live SSE: hit a `Subscription` against `GET /graphql?query=subscription{...}` with `Accept: text/event-stream` and events stream as Postgres notifications arrive.
+
+## Previous commit arc (2026-05-28 — Pg LISTEN/NOTIFY subscription source)
 
 - Closes the indexer → gateway live loop without in-process StreamHub coupling.
 - New migration `20260528120000_detector_hits_notify.sql` adds `kasgraph_notify_detected_pattern()` PL/pgSQL function + `AFTER INSERT` trigger on `kasgraph_detected_pattern`. Payload is `json_build_object(...)` matching the GraphQL `DetectedPattern` shape with BIGINT serialized as text to avoid JS Number precision loss. Any writer to the table participates — Rust indexer today, manual SQL, future writers — no app-side `pg_notify` call needed. Migrator test bumped to 4 migrations.

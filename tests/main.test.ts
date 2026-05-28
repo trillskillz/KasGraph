@@ -188,6 +188,8 @@ describe('readOptionsFromEnv', () => {
     delete process.env.PORT;
     delete process.env.GRAPHQL_ENDPOINT;
     delete process.env.GRAPHIQL;
+    delete process.env.KASGRAPH_SUBSCRIPTIONS_ENABLED;
+    delete process.env.LISTEN_DATABASE_URL;
   });
 
   afterEach(() => {
@@ -211,6 +213,8 @@ describe('readOptionsFromEnv', () => {
     expect(opts.port).toBe(4000);
     expect(opts.graphqlEndpoint).toBe('/graphql');
     expect(opts.graphiql).toBe(true);
+    expect(opts.subscriptionsEnabled).toBe(true);
+    expect(opts.listenDatabaseUrl).toBe('postgres://x');
   });
 
   it('honors PORT/HOST/GRAPHQL_ENDPOINT/GRAPHIQL overrides', () => {
@@ -231,6 +235,33 @@ describe('readOptionsFromEnv', () => {
     process.env.PORT = 'twelve';
     const opts = readOptionsFromEnv();
     expect(opts.port).toBe(4000);
+  });
+
+  it('KASGRAPH_SUBSCRIPTIONS_ENABLED=false disables subscriptions', () => {
+    process.env.DATABASE_URL = 'postgres://x';
+    process.env.KASGRAPH_SUBSCRIPTIONS_ENABLED = 'false';
+    expect(readOptionsFromEnv().subscriptionsEnabled).toBe(false);
+  });
+
+  it('KASGRAPH_SUBSCRIPTIONS_ENABLED accepts the standard truthy values', () => {
+    process.env.DATABASE_URL = 'postgres://x';
+    for (const truthy of ['1', 'true', 'TRUE', 'True', 'yes']) {
+      process.env.KASGRAPH_SUBSCRIPTIONS_ENABLED = truthy;
+      expect(readOptionsFromEnv().subscriptionsEnabled).toBe(true);
+    }
+  });
+
+  it('LISTEN_DATABASE_URL falls back to DATABASE_URL when unset', () => {
+    process.env.DATABASE_URL = 'postgres://primary';
+    expect(readOptionsFromEnv().listenDatabaseUrl).toBe('postgres://primary');
+  });
+
+  it('LISTEN_DATABASE_URL overrides DATABASE_URL for the listener client', () => {
+    process.env.DATABASE_URL = 'postgres://primary';
+    process.env.LISTEN_DATABASE_URL = 'postgres://replica';
+    const opts = readOptionsFromEnv();
+    expect(opts.databaseUrl).toBe('postgres://primary');
+    expect(opts.listenDatabaseUrl).toBe('postgres://replica');
   });
 });
 
