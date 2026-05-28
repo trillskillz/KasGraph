@@ -1,0 +1,44 @@
+specVersion: 0.1.0
+name: opensilver_patterns
+description: |
+  Index every UTXO matching a known OpenSilver covenant pattern.
+  Powers "find all OpenSilver vaults" / "show me every multisig
+  with > N signers" / "stream every milestone-escrow transition"
+  queries from a single subgraph.
+schema:
+  file: ./schema.graphql
+dataSources:
+  - name: opensilver-all-patterns
+    network: kaspa-testnet-12
+    kind: covenant_id
+    source:
+      # The detector registry resolves each `pattern:` selector
+      # at ingest time. New OpenSilver pattern releases just
+      # need a new entry here — no schema migration.
+      ids:
+        - pattern: OpenSilverOwnable
+        - pattern: OpenSilverMultisig
+        - pattern: OpenSilverTimeLock
+        - pattern: OpenSilverVault
+        - pattern: OpenSilverEscrowBilateral
+        - pattern: OpenSilverEscrowMilestone
+        - pattern: OpenSilverStreamingPayment
+        - pattern: OpenSilverVesting
+        - pattern: OpenSilverDeadMansSwitch
+        - pattern: OpenSilverSocialRecovery
+        - pattern: OpenSilverAtomicSwapHTLC
+        - pattern: OpenSilverFreelancePayroll
+    mapping:
+      kind: typescript
+      file: ./src/mapping.ts
+      entities:
+        - PatternInstance
+        - PatternTransition
+        - VaultInstance
+        - MultisigInstance
+        - EscrowInstance
+      handlers:
+        - event: CovenantLocked
+          handler: handlePatternEntry
+        - event: CovenantSpent
+          handler: handlePatternTransition

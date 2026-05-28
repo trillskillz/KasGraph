@@ -1,0 +1,61 @@
+# Native KRC-20 (KCC20) reference schema.
+#
+# One Asset entity per token contract; one Controller per
+# governance covenant bound to that asset; one Holder per
+# (Asset, address) pair; Transfer + Mint history.
+
+type KCC20Asset @entity {
+  id: ID!
+  assetCovenantId: String!
+  controllerCovenantId: String
+  decimals: Int!
+  totalSupply: BigInt!
+  mintNonce: BigInt!
+  deployedAtDaa: BigInt!
+  holderCount: Int!
+  controller: KCC20Controller
+  holders: [KCC20Holder!]
+  transfers: [KCC20Transfer!]
+  mints: [KCC20Mint!]
+}
+
+type KCC20Controller @entity {
+  id: ID!
+  controllerCovenantId: String!
+  assetCovenantId: String!
+  controllerKind: String!
+  ownerPubkey: String
+  pausedFlag: Boolean
+  remainingAllowance: BigInt
+  scheduleRoot: String
+  active: Boolean!
+}
+
+type KCC20Holder @entity {
+  id: ID!
+  asset: KCC20Asset!
+  holderPubkey: String!
+  balance: BigInt!
+  firstSeenAtDaa: BigInt!
+  lastSeenAtDaa: BigInt!
+}
+
+type KCC20Transfer @entity {
+  id: ID!
+  asset: KCC20Asset!
+  fromHolder: KCC20Holder!
+  toHolder: KCC20Holder!
+  amount: BigInt!
+  daaScore: BigInt!
+  txHash: String!
+}
+
+type KCC20Mint @entity {
+  id: ID!
+  asset: KCC20Asset!
+  toHolder: KCC20Holder!
+  amount: BigInt!
+  daaScore: BigInt!
+  txHash: String!
+  via: KCC20Controller!
+}

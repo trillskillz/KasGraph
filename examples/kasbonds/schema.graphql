@@ -1,0 +1,43 @@
+# KasBonds reference schema.
+#
+# Three entities. The walking pattern is canonical KIP-20:
+#   Bond     — one per covenant-id, tracks lifecycle
+#   Holding  — one per (Bond, holder address) pair; current
+#              owners derive from the Bond's most recent
+#              lineage row
+#   Coupon   — every interest payout; derived from the
+#              spend tx that decremented the Bond's remaining
+#              coupon budget
+
+type Bond @entity {
+  id: ID!
+  covenantId: String!
+  issuer: String!
+  faceValueSompi: BigInt!
+  couponBps: Int!
+  issuedAtDaa: BigInt!
+  matures: BigInt
+  redeemed: Boolean!
+  currentHolder: String
+  holdings: [Holding!]
+  coupons: [Coupon!]
+}
+
+type Holding @entity {
+  id: ID!
+  bond: Bond!
+  holder: String!
+  acquiredAtDaa: BigInt!
+  releasedAtDaa: BigInt
+  amountSompi: BigInt!
+}
+
+type Coupon @entity {
+  id: ID!
+  bond: Bond!
+  paidAtDaa: BigInt!
+  amountSompi: BigInt!
+  payer: String!
+  recipient: String!
+  txHash: String!
+}

@@ -1,0 +1,53 @@
+# OpenSilver patterns reference schema.
+#
+# Generic catalogue (PatternInstance, PatternTransition) plus
+# specialised projections for the three highest-traffic kinds.
+# Subgraphs that only need a single pattern can import this and
+# subscribe to the matching specialised view.
+
+type PatternInstance @entity {
+  id: ID!
+  covenantId: String!
+  patternKind: String!
+  firstSeenAtDaa: BigInt!
+  lastSeenAtDaa: BigInt!
+  transitionCount: Int!
+  active: Boolean!
+  transitions: [PatternTransition!]
+}
+
+type PatternTransition @entity {
+  id: ID!
+  instance: PatternInstance!
+  daaScore: BigInt!
+  txHash: String!
+  outputIndex: Int!
+  payload: JSON
+}
+
+type VaultInstance @entity {
+  id: ID!
+  covenantId: String!
+  ownerPubkey: String!
+  recoveryPubkey: String
+  recoveryDelayBlocks: BigInt!
+  drained: Boolean!
+}
+
+type MultisigInstance @entity {
+  id: ID!
+  covenantId: String!
+  signerCount: Int!
+  threshold: Int!
+  active: Boolean!
+}
+
+type EscrowInstance @entity {
+  id: ID!
+  covenantId: String!
+  buyer: String!
+  seller: String!
+  arbiter: String
+  milestoneCount: Int
+  released: Boolean!
+}

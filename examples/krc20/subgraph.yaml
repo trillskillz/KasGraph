@@ -1,0 +1,33 @@
+specVersion: 0.1.0
+name: krc20
+description: |
+  Native KRC-20 (KCC20) indexing — every deployment, every
+  transfer, every holder. Powers replacement for the Kasplex
+  inscription-style indexer in the post-Toccata era.
+schema:
+  file: ./schema.graphql
+dataSources:
+  - name: kcc20-assets
+    network: kaspa-testnet-12
+    kind: covenant_id
+    source:
+      ids:
+        - pattern: KCC20Asset
+        - pattern: KCC20OwnableController
+        - pattern: KCC20PausableController
+        - pattern: KCC20CappedController
+        - pattern: KCC20VestingController
+    mapping:
+      kind: typescript
+      file: ./src/mapping.ts
+      entities:
+        - KCC20Asset
+        - KCC20Controller
+        - KCC20Holder
+        - KCC20Transfer
+        - KCC20Mint
+      handlers:
+        - event: CovenantLocked
+          handler: handleAssetOrControllerDeployed
+        - event: CovenantSpent
+          handler: handleAssetTransition

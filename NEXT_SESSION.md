@@ -2,7 +2,23 @@
 
 Autonomous work picked up by the next agent run. Phase 1 reference docs are now all real; Phase 2.5 detector engine + per-pattern registry is scaffolded with 17 unit tests. Next jumps are live-node wRPC validation, deeper recovery semantics, and the OpenSilver fingerprint sync.
 
-## Latest commit arc (2026-05-28 — kasgraph-api binary auto-wires LISTEN subscriptions)
+## Latest commit arc (2026-05-28 — Phase 6 reference subgraphs)
+
+- `examples/` was empty; now ships three reference subgraphs that double as integration smoke tests for the CLI pipeline.
+- **`examples/kasbonds/`** (Phase 6.1) — first dogfooding customer; Bond / Holding / Coupon entities; `OpenSilverVault` + `OpenSilverEscrowMilestone` pattern source; `handleBondIssued` + `handleBondTransition` handlers with documented pseudo-code for the full impl.
+- **`examples/opensilver-patterns/`** (Phase 6.2) — every detector kind in `crates/kasgraph-detectors/src/registry.rs` as a `pattern:` selector; generic `PatternInstance` + specialised projections for Vault / Multisig / Escrow.
+- **`examples/krc20/`** (Phase 6.3, native KCC20) — replaces Kasplex for the post-Toccata era; KCC20Asset + KCC20Controller (with controllerKind discriminator) + KCC20Holder + KCC20Transfer + KCC20Mint entities; one handler each for asset/controller deployment and asset transitions covering transfer/mint/burn/rotate-controller.
+- Every example follows the same layout: `subgraph.yaml` + `schema.graphql` + `src/mapping.ts` + `README.md`.
+- `tests/examples.test.ts` adds 7 vitest cases that double as CLI integration tests:
+    - Registry shape: every example dir has the four expected files.
+    - Manifest shape: every subgraph.yaml parses + carries the right top-level fields + uses only documented dataSource kinds.
+    - `it.each(['kasbonds', 'opensilver-patterns', 'krc20'])` runs `runCodegen` against the example dir and asserts the produced entities + events have the expected interfaces.
+    - Cross-cutting check: every `handler.event` name in every manifest gets a matching `${event}Event` interface in the generated `events.ts`.
+- `.gitignore` adds `examples/**/src/generated/` so the regenerated files don't pollute commits.
+- Total: 98 cargo + 152 TS = **250 tests** green. Typecheck clean across all four TS packages.
+- Phase 6 status: 3 of 6 reference subgraphs landed (6.1 KasBonds ✓, 6.2 OpenSilver Patterns ✓, 6.3 KRC-20 ✓). 6.4 KRC-721, 6.5 Network Stats, 6.6 ZK Proofs queue up the same template — each is a clean ~60-line slice once their data-source schemas firm up.
+
+## Previous commit arc (2026-05-28 — kasgraph-api binary auto-wires LISTEN subscriptions)
 
 - `kasgraph-api` operator binary now autoconfigures GraphQL subscriptions from env. A container with just `DATABASE_URL` set serves Query, healthz, AND live `Subscription.detectedPatterns` over SSE — no extra wiring.
 - `RunServerOptions` gains `subscriptionsEnabled` + `listenDatabaseUrl`. `readOptionsFromEnv`:

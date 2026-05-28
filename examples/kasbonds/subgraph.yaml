@@ -1,0 +1,34 @@
+specVersion: 0.1.0
+name: kasbonds
+description: |
+  Index all KasBonds activity. First reference subgraph; replaces
+  KasBonds' custom indexing with a thin KIP-20 covenant lineage
+  walk on top of KasGraph.
+schema:
+  file: ./schema.graphql
+dataSources:
+  - name: kasbonds-covenants
+    network: kaspa-testnet-12
+    kind: covenant_id
+    source:
+      # KasBonds uses the OpenSilver Vault + Escrow patterns under
+      # the hood; once the covenant ids are minted the subgraph
+      # follows the lineage natively. The `pattern:` selector
+      # resolves to every UTXO whose redeem script matches the
+      # registered fingerprint (see
+      # crates/kasgraph-detectors/src/registry.rs).
+      ids:
+        - pattern: OpenSilverVault
+        - pattern: OpenSilverEscrowMilestone
+    mapping:
+      kind: typescript
+      file: ./src/mapping.ts
+      entities:
+        - Bond
+        - Holding
+        - Coupon
+      handlers:
+        - event: CovenantLocked
+          handler: handleBondIssued
+        - event: CovenantSpent
+          handler: handleBondTransition
