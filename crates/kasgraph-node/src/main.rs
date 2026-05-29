@@ -49,6 +49,11 @@ mod mapping_host;
 // resolves which handler fires for a detector hit.
 mod subgraph_manifest;
 
+// Reconstructs legacy KRC-20/721 inscriptions from journaled op rows and
+// replays them into a ledger — the read-back inverse of the store journal,
+// used on startup and after a reorg unwind to rebuild in-memory state.
+mod legacy_ledger;
+
 const DEFAULT_SUBGRAPH: &str = "kasgraph_scaffold";
 const DEFAULT_BLOCK_HASH: &str = "scaffold-block-0001";
 const DEFAULT_SERVED_BY: &str = "bootstrap";
