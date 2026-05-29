@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-29 — tx payloads in the wire model for legacy KRC-20)
+## Latest commit arc (2026-05-29 — legacy KRC-20 ledger acceptance state machine)
+
+Third legacy-KRC-20 slice: a **pure** (no-Postgres) state machine that applies the Kasplex inscription rules over a stream of `(Krc20Inscription, sender)`. Commit `83fd12f` (`kasgraph-detectors::krc20_ledger`).
+
+- **`Krc20Ledger`** — `apply(&inscription, sender) -> ApplyOutcome` dispatching deploy/mint/transfer/burn over a `BTreeMap<tick, TokenState>`. Rules: **deploy** first-writer-wins (a second deploy of the same tick is `Rejected("tick already deployed")`); **mint** requires `amt <= lim` AND `minted + amt <= max` (rejected *wholesale*, never partial), then credits sender + bumps `minted`; **transfer** requires `sender_balance >= amt`; **burn** requires `sender_balance >= amt`, then decrements *both* balance and `minted` (saturating) so the `supply == sum(balances)` invariant holds. Zero-balance entries pruned on debit.
+- **`TokenState`** exposes `max`/`lim`/`minted`/`balances`; `ApplyOutcome` is `Accepted` | `Rejected(&'static str)`. 11 unit tests cover each rule, each rejection path, and the supply invariant → detectors at **44**.
+- **Sender** = the tx's first input address; resolving it at wire time still needs input→address resolution (prior-output `scriptPublicKey` → address), deferred to node wiring.
+- **Next slices (in order, both need Postgres to verify):** (1) a dedicated `kasgraph_krc20_legacy_ledger` store table keyed `(tick, accepting_block_hash, seq)` with **reverse-acceptance-order** reorg unwind — the lineage-row model does NOT apply (`KRC20_KRC721_REFERENCE.md:54`). (2) node wiring: scan `committed.block.payloads`, `parse_krc20_inscription`, resolve sender, `Krc20Ledger::apply`, persist accepted ops + reorg-unwind.
+
+## Previous commit arc (2026-05-29 — tx payloads in the wire model for legacy KRC-20)
 
 Second legacy-KRC-20 slice: the inscription parser (below) had nothing to read because the wire model carried only outputs + inputs. Commit `9394e8c` (`kasgraph-rpc`, with literal-site updates in `kasgraph-node`).
 
