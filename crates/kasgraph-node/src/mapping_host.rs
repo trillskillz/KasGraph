@@ -436,7 +436,10 @@ mod tests {
             successor_covenant_id: None,
         };
         let ev = spend_mapping_event(&terminal, serde_json::Value::Null, 1, "b", "handleSpent");
-        assert_eq!(ev.payload["spend"]["successorCovenantId"], serde_json::Value::Null);
+        assert_eq!(
+            ev.payload["spend"]["successorCovenantId"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

@@ -1470,8 +1470,12 @@ fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, Rp
         .unwrap_or(false);
 
     let txs = value.get("transactions").and_then(Value::as_array);
-    let outputs = txs.map(|t| extract_transaction_outputs(t)).unwrap_or_default();
-    let inputs = txs.map(|t| extract_transaction_inputs(t)).unwrap_or_default();
+    let outputs = txs
+        .map(|t| extract_transaction_outputs(t))
+        .unwrap_or_default();
+    let inputs = txs
+        .map(|t| extract_transaction_inputs(t))
+        .unwrap_or_default();
 
     Ok(IngestedBlock {
         hash,
@@ -1511,18 +1515,18 @@ fn extract_transaction_outputs(txs: &[Value]) -> Vec<IngestedTransactionOutput> 
             let script_hex = output
                 .pointer("/scriptPublicKey/scriptPublicKey")
                 .and_then(Value::as_str)
-                .or_else(|| {
-                    output
-                        .get("scriptPublicKey")
-                        .and_then(Value::as_str)
-                })
+                .or_else(|| output.get("scriptPublicKey").and_then(Value::as_str))
                 .unwrap_or("");
             let script_public_key = hex::decode(script_hex).unwrap_or_default();
 
             // `value` is usually a stringified u64 in wRPC JSON.
             let value = output
                 .get("value")
-                .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()))
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.as_u64())
+                })
                 .unwrap_or(0);
 
             out.push(IngestedTransactionOutput {
@@ -1568,7 +1572,10 @@ fn extract_transaction_inputs(txs: &[Value]) -> Vec<IngestedTransactionInput> {
             // `index` is usually a JSON number but tolerate a stringified one.
             let previous_output_index = input
                 .pointer("/previousOutpoint/index")
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
                 .unwrap_or(0) as u32;
 
             out.push(IngestedTransactionInput {
@@ -2396,12 +2403,18 @@ mod tests {
         assert_eq!(block.outputs[0].tx_hash, "tx-1");
         assert_eq!(block.outputs[0].output_index, 0);
         assert_eq!(block.outputs[0].value, 1500);
-        assert_eq!(block.outputs[0].script_public_key, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            block.outputs[0].script_public_key,
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
 
         assert_eq!(block.outputs[1].tx_hash, "tx-1");
         assert_eq!(block.outputs[1].output_index, 1);
         assert_eq!(block.outputs[1].value, 2500);
-        assert_eq!(block.outputs[1].script_public_key, vec![0xCA, 0xFE, 0xBA, 0xBE]);
+        assert_eq!(
+            block.outputs[1].script_public_key,
+            vec![0xCA, 0xFE, 0xBA, 0xBE]
+        );
 
         assert_eq!(block.outputs[2].tx_hash, "tx-2");
         assert_eq!(block.outputs[2].output_index, 0);
@@ -2958,17 +2971,35 @@ mod tests {
 
         // --- Event stream assertions ---
         assert!(
-            matches!(events[0], SubscriptionDriverEvent::Connected { reconnect_count: 0, .. }),
+            matches!(
+                events[0],
+                SubscriptionDriverEvent::Connected {
+                    reconnect_count: 0,
+                    ..
+                }
+            ),
             "events[0] expected Connected(0), got {:?}",
             events[0]
         );
         assert!(
-            matches!(events[1], SubscriptionDriverEvent::ReconnectScheduled { reconnect_count: 1, .. }),
+            matches!(
+                events[1],
+                SubscriptionDriverEvent::ReconnectScheduled {
+                    reconnect_count: 1,
+                    ..
+                }
+            ),
             "events[1] expected ReconnectScheduled(1), got {:?}",
             events[1]
         );
         assert!(
-            matches!(events[2], SubscriptionDriverEvent::Connected { reconnect_count: 1, .. }),
+            matches!(
+                events[2],
+                SubscriptionDriverEvent::Connected {
+                    reconnect_count: 1,
+                    ..
+                }
+            ),
             "events[2] expected Connected(1), got {:?}",
             events[2]
         );

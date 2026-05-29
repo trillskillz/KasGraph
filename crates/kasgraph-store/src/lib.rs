@@ -551,10 +551,7 @@ impl Store {
     /// spend of `(tx_hash, output_index)` can be recognized. Idempotent on
     /// the outpoint, so re-applying a block during recovery overwrites
     /// rather than duplicates.
-    pub async fn track_covenant_utxo(
-        &self,
-        record: &CovenantUtxoRecord,
-    ) -> Result<(), StoreError> {
+    pub async fn track_covenant_utxo(&self, record: &CovenantUtxoRecord) -> Result<(), StoreError> {
         sqlx::query(&track_covenant_utxo_sql(record.subgraph.schema_name()))
             .bind(&record.tx_hash)
             .bind(record.output_index)
@@ -588,11 +585,13 @@ impl Store {
                 .await
                 .map_err(|err| StoreError::Query(err.to_string()))?;
 
-        Ok(row.map(|(detector_kind, covenant_id, locked_state)| CovenantUtxoMatch {
-            detector_kind,
-            covenant_id,
-            locked_state,
-        }))
+        Ok(row.map(
+            |(detector_kind, covenant_id, locked_state)| CovenantUtxoMatch {
+                detector_kind,
+                covenant_id,
+                locked_state,
+            },
+        ))
     }
 
     /// Drop every covenant UTXO locked at or above `from_daa`, part of a
@@ -856,7 +855,9 @@ mod tests {
     fn track_covenant_utxo_sql_targets_the_schema_and_is_idempotent_on_outpoint() {
         let sql = track_covenant_utxo_sql("kasbonds");
         assert!(sql.contains("\"kasbonds\".covenant_utxos"));
-        assert!(sql.contains("(tx_hash, output_index, block_daa_score, detector_kind, covenant_id, locked_state)"));
+        assert!(sql.contains(
+            "(tx_hash, output_index, block_daa_score, detector_kind, covenant_id, locked_state)"
+        ));
         assert!(sql.contains("ON CONFLICT (tx_hash, output_index)"));
         assert!(sql.contains("locked_state = EXCLUDED.locked_state"));
     }

@@ -32,8 +32,8 @@ use kasgraph_rpc::{
     MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
 };
 use kasgraph_store::{
-    CommittedBlockRecord, DetectedPatternRecord, PoiCheckpoint, RpcBlockAuditRecord, Store,
-    SubgraphId,
+    CommittedBlockRecord, CovenantUtxoRecord, DetectedPatternRecord, PoiCheckpoint,
+    RpcBlockAuditRecord, Store, SubgraphId,
 };
 use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
@@ -69,6 +69,10 @@ struct BootstrapBlock {
     /// Empty for synthetic/scaffold blocks that have no real wire
     /// payload. Drives the detector pass on the committed-write path.
     outputs: Vec<kasgraph_rpc::IngestedTransactionOutput>,
+    /// Per-input previous-outpoint references forwarded from
+    /// `IngestedBlock`. Empty for synthetic/scaffold blocks. Drives
+    /// spend matching against the covenant-UTXO tracker.
+    inputs: Vec<kasgraph_rpc::IngestedTransactionInput>,
     /// Detector matches computed from `outputs` once, when the
     /// block leaves `block_from_rpc`. Reused by both the
     /// canonical-bytes builder (POI input) and the persist loop
@@ -345,6 +349,7 @@ impl NodeConfig {
                     .map(|value| value.into_bytes())
                     .unwrap_or_else(|_| b"scaffold-entity-state".to_vec()),
                 outputs: Vec::new(),
+                inputs: Vec::new(),
                 detector_hits: Vec::new(),
             },
         }
@@ -795,10 +800,18 @@ async fn apply_and_persist_notification(
                     .unwind_entity_versions(subgraph, cutoff)
                     .await
                     .context("unwinding entity versions for reorg")?;
+                // Roll back covenant UTXOs locked at or above the same
+                // cutoff so the tracker matches the surviving chain — a
+                // reorg that drops the lock must drop its UTXO too.
+                let removed_utxos = store
+                    .unwind_covenant_utxos(subgraph, cutoff)
+                    .await
+                    .context("unwinding covenant UTXOs for reorg")?;
                 warn!(
                     subgraph = subgraph.schema_name(),
                     cutoff_daa = cutoff,
                     removed_rows = removed,
+                    removed_covenant_utxos = removed_utxos,
                     "entity-version unwind applied"
                 );
             }
@@ -904,6 +917,26 @@ async fn apply_and_persist_notification(
                     .await
                     .context("writing detected pattern row")?;
                 publish_hit_to_stream(stream, &committed.block, hit);
+
+                // Track this locked covenant's output as a UTXO so a later
+                // input that consumes it can be recognized as the spend.
+                // Gated on a loaded mapping so the tracker only fills for
+                // configured subgraphs (preserving no-mapping behavior).
+                if mapping.is_some() {
+                    let utxo = CovenantUtxoRecord {
+                        subgraph: subgraph.clone(),
+                        tx_hash: hit.tx_hash.clone(),
+                        output_index: hit.output_index as i32,
+                        block_daa_score: committed.block.daa_score,
+                        detector_kind: format!("{:?}", hit.kind),
+                        covenant_id: hit.covenant_id.clone(),
+                        locked_state: hit.payload.clone(),
+                    };
+                    store
+                        .track_covenant_utxo(&utxo)
+                        .await
+                        .context("tracking covenant UTXO for spend detection")?;
+                }
             }
 
             // Dispatch the same hits through the subgraph mapping (if one
@@ -934,6 +967,56 @@ async fn apply_and_persist_notification(
                         "persisted mapping entity versions"
                     );
                 }
+            }
+        }
+
+        // Spend detection runs on every committed block — a spend can
+        // arrive in a block that locks no new covenant — so it sits
+        // outside the `!hits.is_empty()` guard. Each input that consumes a
+        // tracked covenant UTXO is that covenant's spend. Gated on a loaded
+        // mapping so the lookup only runs for configured subgraphs.
+        //
+        // NOTE: this detects and records the spend; actual `CovenantSpent`
+        // dispatch (via `mapping_host::dispatch_spend_hit`) waits on a
+        // spend-transaction decoder to populate the `CovenantSpend`
+        // envelope's `operation` / `successorCovenantId` honestly — the
+        // example mappings branch on those, so dispatching with placeholder
+        // values would feed them wrong data.
+        if mapping.is_some() && !committed.block.inputs.is_empty() {
+            let mut spends = 0usize;
+            for input in &committed.block.inputs {
+                let Some(spent) = store
+                    .lookup_covenant_utxo(
+                        subgraph,
+                        &input.previous_tx_hash,
+                        input.previous_output_index as i32,
+                    )
+                    .await
+                    .context("looking up covenant UTXO for spend detection")?
+                else {
+                    continue;
+                };
+                spends += 1;
+                info!(
+                    subgraph = subgraph.schema_name(),
+                    block_hash = committed.block.hash,
+                    daa_score = committed.block.daa_score,
+                    spending_tx = input.spending_tx_hash,
+                    spent_outpoint =
+                        format!("{}:{}", input.previous_tx_hash, input.previous_output_index),
+                    detector_kind = spent.detector_kind,
+                    covenant_id = spent.covenant_id.as_deref().unwrap_or(""),
+                    "covenant spend detected (CovenantSpent dispatch pending spend-tx decoder)"
+                );
+            }
+            if spends > 0 {
+                info!(
+                    subgraph = subgraph.schema_name(),
+                    block_hash = committed.block.hash,
+                    daa_score = committed.block.daa_score,
+                    spends,
+                    "covenant spends detected on committed block"
+                );
             }
         }
     }
@@ -1388,6 +1471,7 @@ fn block_from_rpc(block: IngestedBlock) -> BootstrapBlock {
         is_finalized: block.is_finalized,
         canonical_entity_bytes,
         outputs: block.outputs,
+        inputs: block.inputs,
         detector_hits,
     }
 }
@@ -1400,7 +1484,7 @@ fn block_to_rpc(block: &BootstrapBlock) -> IngestedBlock {
         is_finalized: block.is_finalized,
         served_by: block.served_by.clone(),
         outputs: block.outputs.clone(),
-        inputs: Vec::new(),
+        inputs: block.inputs.clone(),
     }
 }
 
@@ -1499,6 +1583,7 @@ mod tests {
             is_finalized: finalized,
             canonical_entity_bytes: format!("state-{hash}-{daa_score}").into_bytes(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
             detector_hits: Vec::new(),
         }
     }
@@ -2034,6 +2119,7 @@ mod tests {
                 is_finalized: true,
                 canonical_entity_bytes: b"scaffold-entity-state".to_vec(),
                 outputs: Vec::new(),
+                inputs: Vec::new(),
                 detector_hits: Vec::new(),
             },
             ingest_mode: IngestMode::default(),
@@ -2058,7 +2144,11 @@ mod tests {
             is_finalized: true,
             served_by: "primary".to_owned(),
             outputs: Vec::new(),
-            inputs: Vec::new(),
+            inputs: vec![kasgraph_rpc::IngestedTransactionInput {
+                spending_tx_hash: "spend-tx".to_owned(),
+                previous_tx_hash: "cov-utxo".to_owned(),
+                previous_output_index: 1,
+            }],
         };
 
         let mapped = block_from_rpc(block);
@@ -2067,6 +2157,11 @@ mod tests {
         assert_eq!(mapped.blue_score, 7);
         assert_eq!(mapped.served_by, "primary");
         assert!(mapped.is_finalized);
+        // Inputs thread through unchanged so the committed loop can match
+        // them against the covenant-UTXO tracker.
+        assert_eq!(mapped.inputs.len(), 1);
+        assert_eq!(mapped.inputs[0].previous_tx_hash, "cov-utxo");
+        assert_eq!(mapped.inputs[0].previous_output_index, 1);
         assert!(String::from_utf8(mapped.canonical_entity_bytes)
             .unwrap()
             .contains("finalized=true"));
