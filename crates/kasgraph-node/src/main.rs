@@ -1010,13 +1010,14 @@ async fn apply_and_persist_notification(
         // tracked covenant UTXO is that covenant's spend. Gated on a loaded
         // mapping so the lookup only runs for configured subgraphs.
         //
-        // NOTE: this detects and persists the spend; actual `CovenantSpent`
-        // dispatch (via `mapping_host::dispatch_spend_hit`) waits on a
-        // spend-transaction decoder to populate the `CovenantSpend`
-        // envelope's `operation` / `successorCovenantId` honestly — the
-        // example mappings branch on those, so dispatching with placeholder
-        // values would feed them wrong data. The persisted spend row carries
-        // only protocol-observable fields, so it is honest today.
+        // NOTE: this detects and persists the spend, including a
+        // lineage-derived `successorCovenantId`; actual `CovenantSpent`
+        // dispatch (via `mapping_host::dispatch_spend_hit`) still waits on a
+        // spend-transaction decoder for the `operation` field — the example
+        // mappings branch on it, so dispatching with a placeholder operation
+        // would feed them wrong data. Everything else on the persisted spend
+        // row is protocol-observable or lineage-derived, so it is honest
+        // today.
         if mapping.is_some() && !committed.block.inputs.is_empty() {
             let mut spends = 0usize;
             for input in &committed.block.inputs {
@@ -1032,6 +1033,22 @@ async fn apply_and_persist_notification(
                     continue;
                 };
                 spends += 1;
+                // Resolve the successor: a lineage transition inherits the
+                // predecessor's id, so the successor equals the spent
+                // covenant's id when the spending transaction produced a
+                // tracked covenant output carrying that id. No such output
+                // means the lineage terminates here.
+                let successor_covenant_id = match &spent.covenant_id {
+                    Some(cid)
+                        if store
+                            .covenant_lineage_continues(subgraph, &input.spending_tx_hash, cid)
+                            .await
+                            .context("resolving covenant lineage successor")? =>
+                    {
+                        Some(cid.clone())
+                    }
+                    _ => None,
+                };
                 let spend_record = CovenantSpendRecord {
                     subgraph: subgraph.clone(),
                     spending_tx_hash: input.spending_tx_hash.clone(),
@@ -1041,6 +1058,7 @@ async fn apply_and_persist_notification(
                     detector_kind: spent.detector_kind.clone(),
                     covenant_id: spent.covenant_id.clone(),
                     spent_value_sompi: spent.value_sompi,
+                    successor_covenant_id: successor_covenant_id.clone(),
                 };
                 store
                     .record_covenant_spend(&spend_record)
@@ -1056,7 +1074,8 @@ async fn apply_and_persist_notification(
                     detector_kind = spent.detector_kind,
                     covenant_id = spent.covenant_id.as_deref().unwrap_or(""),
                     spent_value_sompi = spent.value_sompi,
-                    "covenant spend detected (CovenantSpent dispatch pending spend-tx decoder)"
+                    successor_covenant_id = successor_covenant_id.as_deref().unwrap_or(""),
+                    "covenant spend detected (CovenantSpent dispatch pending operation decoder)"
                 );
             }
             if spends > 0 {

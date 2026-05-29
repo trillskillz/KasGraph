@@ -216,9 +216,10 @@ pub struct CovenantUtxoMatch {
 /// UTXO. Persisted so spends are durable before `CovenantSpent` mapping
 /// dispatch exists, and versioned by the *spending* block's DAA so a reorg
 /// of that block unwinds the spend while leaving the (earlier) lock-time
-/// UTXO record intact. Every field is protocol-observable at detection
-/// time; `operation` / `successorCovenantId` are deliberately absent until
-/// a spend-transaction decoder can derive them honestly.
+/// UTXO record intact. Every field is protocol-observable or
+/// lineage-derived at detection time; `operation` is deliberately absent
+/// until a spend-transaction decoder can derive covenant operation
+/// semantics honestly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CovenantSpendRecord {
     pub subgraph: SubgraphId,
@@ -229,6 +230,12 @@ pub struct CovenantSpendRecord {
     pub detector_kind: String,
     pub covenant_id: Option<String>,
     pub spent_value_sompi: i64,
+    /// The covenant id the lineage continues under, if the spending
+    /// transaction produced a tracked covenant output carrying the same
+    /// id (lineage transition); `None` when the lineage terminates. Since
+    /// transitions inherit the predecessor's id, this equals `covenant_id`
+    /// when present.
+    pub successor_covenant_id: Option<String>,
 }
 
 /// Store handle with a live Postgres pool.
@@ -312,6 +319,7 @@ impl Store {
                 detector_kind TEXT NOT NULL,\
                 covenant_id TEXT,\
                 spent_value_sompi BIGINT NOT NULL,\
+                successor_covenant_id TEXT,\
                 PRIMARY KEY (spending_tx_hash, previous_tx_hash, previous_output_index)\
             )",
             schema
@@ -672,11 +680,35 @@ impl Store {
             .bind(&record.detector_kind)
             .bind(record.covenant_id.as_ref())
             .bind(record.spent_value_sompi)
+            .bind(record.successor_covenant_id.as_ref())
             .execute(&self.pool)
             .await
             .map_err(|err| StoreError::Query(err.to_string()))?;
 
         Ok(())
+    }
+
+    /// Whether the spending transaction `spending_tx_hash` produced a
+    /// tracked covenant UTXO carrying `covenant_id` — i.e. the lineage
+    /// continues through this spend. Used to resolve a spend's
+    /// `successorCovenantId`. The continuation output is tracked before
+    /// spend detection runs (the lock loop precedes the spend loop within
+    /// a block, and a spend and its successor share a transaction).
+    pub async fn covenant_lineage_continues(
+        &self,
+        subgraph: &SubgraphId,
+        spending_tx_hash: &str,
+        covenant_id: &str,
+    ) -> Result<bool, StoreError> {
+        let row: Option<(bool,)> =
+            sqlx::query_as(&covenant_lineage_continues_sql(subgraph.schema_name()))
+                .bind(spending_tx_hash)
+                .bind(covenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.map(|(exists,)| exists).unwrap_or(false))
     }
 
     /// Drop every covenant spend recorded at or above `from_daa`, part of a
@@ -884,14 +916,24 @@ fn unwind_covenant_utxos_sql(schema: &str) -> String {
 fn record_covenant_spend_sql(schema: &str) -> String {
     format!(
         "INSERT INTO \"{schema}\".covenant_spends \
-         (spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score, detector_kind, covenant_id, spent_value_sompi) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score, detector_kind, covenant_id, spent_value_sompi, successor_covenant_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (spending_tx_hash, previous_tx_hash, previous_output_index) \
          DO UPDATE SET \
              block_daa_score = EXCLUDED.block_daa_score, \
              detector_kind = EXCLUDED.detector_kind, \
              covenant_id = EXCLUDED.covenant_id, \
-             spent_value_sompi = EXCLUDED.spent_value_sompi"
+             spent_value_sompi = EXCLUDED.spent_value_sompi, \
+             successor_covenant_id = EXCLUDED.successor_covenant_id"
+    )
+}
+
+fn covenant_lineage_continues_sql(schema: &str) -> String {
+    format!(
+        "SELECT EXISTS(\
+             SELECT 1 FROM \"{schema}\".covenant_utxos \
+             WHERE tx_hash = $1 AND covenant_id = $2\
+         )"
     )
 }
 
@@ -990,12 +1032,21 @@ mod tests {
         let sql = record_covenant_spend_sql("kasbonds");
         assert!(sql.contains("\"kasbonds\".covenant_spends"));
         assert!(sql.contains(
-            "(spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score, detector_kind, covenant_id, spent_value_sompi)"
+            "(spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score, detector_kind, covenant_id, spent_value_sompi, successor_covenant_id)"
         ));
         assert!(
             sql.contains("ON CONFLICT (spending_tx_hash, previous_tx_hash, previous_output_index)")
         );
         assert!(sql.contains("spent_value_sompi = EXCLUDED.spent_value_sompi"));
+        assert!(sql.contains("successor_covenant_id = EXCLUDED.successor_covenant_id"));
+    }
+
+    #[test]
+    fn covenant_lineage_continues_sql_checks_for_a_same_id_output_of_the_tx() {
+        let sql = covenant_lineage_continues_sql("kasbonds");
+        assert!(sql.contains("SELECT EXISTS("));
+        assert!(sql.contains("\"kasbonds\".covenant_utxos"));
+        assert!(sql.contains("WHERE tx_hash = $1 AND covenant_id = $2"));
     }
 
     #[test]
