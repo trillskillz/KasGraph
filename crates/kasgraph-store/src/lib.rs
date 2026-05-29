@@ -240,6 +240,46 @@ pub struct CovenantSpendRecord {
     pub successor_covenant_id: Option<String>,
 }
 
+/// One accepted legacy (Kasplex-era) KRC-20 inscription operation: the
+/// durable journal row behind the pure `Krc20Ledger` state machine in
+/// `kasgraph-detectors`. Legacy KRC-20 state is purely a function of the
+/// accepted operation stream, so the materialized ledger is reconstructed
+/// by replaying these rows in acceptance order; a reorg deletes the rows at
+/// or above the reorged DAA and the surviving stream is re-replayed
+/// (`KRC20_KRC721_REFERENCE.md:54`).
+///
+/// The table is keyed globally by `(tick, accepting_block_hash, seq)` — a
+/// tick is global across the Kasplex view, matching the lineage tables'
+/// global keying — while the `subgraph` column scopes only reorg unwind.
+/// `tx_hash` is UNIQUE: exactly one inscription rides a transaction payload,
+/// so it is the replay-safety idempotency key.
+///
+/// Amounts (`amount`/`max_supply`/`mint_limit`) hold the raw decimal strings
+/// the inscription carried, not BIGINT: KRC-20 amounts are u64 and can
+/// exceed `i64::MAX`, so a BIGINT column would silently corrupt large
+/// values. Replay re-parses them through the same strict decimal-u64 path
+/// the envelope parser uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Krc20LegacyOpRecord {
+    pub subgraph: SubgraphId,
+    pub tick: String,
+    pub tick_raw: String,
+    pub accepting_block_hash: String,
+    pub seq: i64,
+    pub accepting_daa_score: i64,
+    pub tx_hash: String,
+    pub op: String,
+    pub sender: String,
+    /// transfer `to`; `None` for deploy/mint/burn.
+    pub recipient: Option<String>,
+    /// mint/transfer/burn `amt`; `None` for deploy.
+    pub amount: Option<String>,
+    /// deploy `max`; `None` otherwise.
+    pub max_supply: Option<String>,
+    /// deploy `lim`; `None` otherwise.
+    pub mint_limit: Option<String>,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -859,6 +899,88 @@ impl Store {
         Ok(removed)
     }
 
+    /// Append one accepted legacy KRC-20 inscription op to the journal.
+    /// Idempotent on `tx_hash` (one inscription per transaction payload):
+    /// a re-delivered notification leaves the original row untouched, so a
+    /// freshly-computed `seq` for an already-recorded tx is discarded rather
+    /// than appended.
+    pub async fn record_krc20_legacy_op(
+        &self,
+        record: &Krc20LegacyOpRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(&record_krc20_legacy_op_sql())
+            .bind(&record.tick)
+            .bind(&record.accepting_block_hash)
+            .bind(record.seq)
+            .bind(record.subgraph.schema_name())
+            .bind(record.accepting_daa_score)
+            .bind(&record.tx_hash)
+            .bind(&record.op)
+            .bind(&record.tick_raw)
+            .bind(&record.sender)
+            .bind(&record.recipient)
+            .bind(&record.amount)
+            .bind(&record.max_supply)
+            .bind(&record.mint_limit)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Whether the journal already records the inscription carried by this
+    /// transaction. Since `seq` is assigned at acceptance time, the node
+    /// checks this before computing the next `seq` so a replayed
+    /// notification does no work (the parallel to
+    /// [`Self::covenant_lineage_row_exists`]).
+    pub async fn krc20_legacy_op_exists(&self, tx_hash: &str) -> Result<bool, StoreError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM kasgraph_krc20_legacy_ledger WHERE tx_hash = $1)",
+        )
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.map(|(exists,)| exists).unwrap_or(false))
+    }
+
+    /// The next acceptance `seq` for a tick: `MAX(seq) + 1`, or `0` for a
+    /// tick with no recorded op yet. `seq` is a per-tick monotonic
+    /// acceptance counter, so it orders that tick's op stream for replay.
+    pub async fn next_krc20_legacy_seq(&self, tick: &str) -> Result<i64, StoreError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM kasgraph_krc20_legacy_ledger WHERE tick = $1",
+        )
+        .bind(tick)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.0)
+    }
+
+    /// Roll back legacy KRC-20 journal rows for `subgraph` at or above
+    /// `from_daa`, part of a reorg unwind. Because legacy KRC-20 state is a
+    /// pure function of the surviving op stream, deleting the reorged rows
+    /// and re-replaying the remainder restores the ledger. Returns the
+    /// number of journal rows removed.
+    pub async fn unwind_krc20_legacy_ledger(
+        &self,
+        subgraph: &SubgraphId,
+        from_daa: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(&unwind_krc20_legacy_ledger_sql())
+            .bind(subgraph.schema_name())
+            .bind(from_daa)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -1069,6 +1191,26 @@ fn unwind_covenant_spends_sql(schema: &str) -> String {
     format!("DELETE FROM \"{schema}\".covenant_spends WHERE block_daa_score >= $1")
 }
 
+// ---- kasgraph_krc20_legacy_ledger SQL builders -------------------------
+//
+// The legacy KRC-20 ledger is a global table (a tick is global across the
+// Kasplex view), so unlike the per-subgraph builders these interpolate no
+// schema name — there is no injection surface. They stay pure functions so
+// the column list / conflict target / cutoff shape is unit-testable.
+
+fn record_krc20_legacy_op_sql() -> String {
+    "INSERT INTO kasgraph_krc20_legacy_ledger \
+     (tick, accepting_block_hash, seq, subgraph, accepting_daa_score, tx_hash, op, tick_raw, sender, recipient, amount, max_supply, mint_limit) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+     ON CONFLICT (tx_hash) DO NOTHING"
+        .to_string()
+}
+
+fn unwind_krc20_legacy_ledger_sql() -> String {
+    "DELETE FROM kasgraph_krc20_legacy_ledger WHERE subgraph = $1 AND accepting_daa_score >= $2"
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,12 +1327,34 @@ mod tests {
     }
 
     #[test]
+    fn record_krc20_legacy_op_sql_lists_every_column_and_is_idempotent_on_tx() {
+        let sql = record_krc20_legacy_op_sql();
+        assert!(sql.contains("INTO kasgraph_krc20_legacy_ledger"));
+        assert!(sql.contains(
+            "(tick, accepting_block_hash, seq, subgraph, accepting_daa_score, tx_hash, op, tick_raw, sender, recipient, amount, max_supply, mint_limit)"
+        ));
+        // 13 columns → 13 bind params.
+        assert!(sql.contains("$13"));
+        assert!(!sql.contains("$14"));
+        // One inscription per tx payload: tx_hash is the replay idempotency key.
+        assert!(sql.contains("ON CONFLICT (tx_hash) DO NOTHING"));
+    }
+
+    #[test]
+    fn unwind_krc20_legacy_ledger_sql_scopes_by_subgraph_and_cutoff() {
+        let sql = unwind_krc20_legacy_ledger_sql();
+        assert!(sql.contains("DELETE FROM kasgraph_krc20_legacy_ledger"));
+        assert!(sql.contains("WHERE subgraph = $1 AND accepting_daa_score >= $2"));
+    }
+
+    #[test]
     fn migrator_embeds_all_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 4);
+        assert_eq!(migrations.len(), 5);
         assert_eq!(migrations[0].version, 20260526110500);
         assert_eq!(migrations[1].version, 20260526150000);
         assert_eq!(migrations[2].version, 20260526160000);
         assert_eq!(migrations[3].version, 20260528120000);
+        assert_eq!(migrations[4].version, 20260529120000);
     }
 }
