@@ -32,8 +32,8 @@ use kasgraph_rpc::{
     MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
 };
 use kasgraph_store::{
-    CommittedBlockRecord, CovenantUtxoRecord, DetectedPatternRecord, PoiCheckpoint,
-    RpcBlockAuditRecord, Store, SubgraphId,
+    CommittedBlockRecord, CovenantSpendRecord, CovenantUtxoRecord, DetectedPatternRecord,
+    PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId,
 };
 use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
@@ -807,11 +807,19 @@ async fn apply_and_persist_notification(
                     .unwind_covenant_utxos(subgraph, cutoff)
                     .await
                     .context("unwinding covenant UTXOs for reorg")?;
+                // Roll back detected spends recorded at or above the cutoff.
+                // Keyed on the spending block's DAA, so a reorg that drops a
+                // spend block restores spend-detectability for its outpoints.
+                let removed_spends = store
+                    .unwind_covenant_spends(subgraph, cutoff)
+                    .await
+                    .context("unwinding covenant spends for reorg")?;
                 warn!(
                     subgraph = subgraph.schema_name(),
                     cutoff_daa = cutoff,
                     removed_rows = removed,
                     removed_covenant_utxos = removed_utxos,
+                    removed_covenant_spends = removed_spends,
                     "entity-version unwind applied"
                 );
             }
@@ -988,12 +996,13 @@ async fn apply_and_persist_notification(
         // tracked covenant UTXO is that covenant's spend. Gated on a loaded
         // mapping so the lookup only runs for configured subgraphs.
         //
-        // NOTE: this detects and records the spend; actual `CovenantSpent`
+        // NOTE: this detects and persists the spend; actual `CovenantSpent`
         // dispatch (via `mapping_host::dispatch_spend_hit`) waits on a
         // spend-transaction decoder to populate the `CovenantSpend`
         // envelope's `operation` / `successorCovenantId` honestly — the
         // example mappings branch on those, so dispatching with placeholder
-        // values would feed them wrong data.
+        // values would feed them wrong data. The persisted spend row carries
+        // only protocol-observable fields, so it is honest today.
         if mapping.is_some() && !committed.block.inputs.is_empty() {
             let mut spends = 0usize;
             for input in &committed.block.inputs {
@@ -1009,6 +1018,20 @@ async fn apply_and_persist_notification(
                     continue;
                 };
                 spends += 1;
+                let spend_record = CovenantSpendRecord {
+                    subgraph: subgraph.clone(),
+                    spending_tx_hash: input.spending_tx_hash.clone(),
+                    previous_tx_hash: input.previous_tx_hash.clone(),
+                    previous_output_index: input.previous_output_index as i32,
+                    block_daa_score: committed.block.daa_score,
+                    detector_kind: spent.detector_kind.clone(),
+                    covenant_id: spent.covenant_id.clone(),
+                    spent_value_sompi: spent.value_sompi,
+                };
+                store
+                    .record_covenant_spend(&spend_record)
+                    .await
+                    .context("recording detected covenant spend")?;
                 info!(
                     subgraph = subgraph.schema_name(),
                     block_hash = committed.block.hash,

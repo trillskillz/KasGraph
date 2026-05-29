@@ -212,6 +212,25 @@ pub struct CovenantUtxoMatch {
     pub locked_state: serde_json::Value,
 }
 
+/// A detected covenant spend: a block input consumed a tracked covenant
+/// UTXO. Persisted so spends are durable before `CovenantSpent` mapping
+/// dispatch exists, and versioned by the *spending* block's DAA so a reorg
+/// of that block unwinds the spend while leaving the (earlier) lock-time
+/// UTXO record intact. Every field is protocol-observable at detection
+/// time; `operation` / `successorCovenantId` are deliberately absent until
+/// a spend-transaction decoder can derive them honestly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovenantSpendRecord {
+    pub subgraph: SubgraphId,
+    pub spending_tx_hash: String,
+    pub previous_tx_hash: String,
+    pub previous_output_index: i32,
+    pub block_daa_score: i64,
+    pub detector_kind: String,
+    pub covenant_id: Option<String>,
+    pub spent_value_sompi: i64,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -280,6 +299,24 @@ impl Store {
             schema
         );
         sqlx::query(&create_covenant_utxos_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        let create_covenant_spends_sql = format!(
+            "CREATE TABLE IF NOT EXISTS \"{}\".covenant_spends (\
+                spending_tx_hash TEXT NOT NULL,\
+                previous_tx_hash TEXT NOT NULL,\
+                previous_output_index INTEGER NOT NULL,\
+                block_daa_score BIGINT NOT NULL,\
+                detector_kind TEXT NOT NULL,\
+                covenant_id TEXT,\
+                spent_value_sompi BIGINT NOT NULL,\
+                PRIMARY KEY (spending_tx_hash, previous_tx_hash, previous_output_index)\
+            )",
+            schema
+        );
+        sqlx::query(&create_covenant_spends_sql)
             .execute(&self.pool)
             .await
             .map_err(|err| StoreError::Query(err.to_string()))?;
@@ -620,6 +657,48 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Record a detected covenant spend (a block input consumed a tracked
+    /// covenant UTXO). Idempotent on the spending input, so re-applying the
+    /// spend block during recovery overwrites rather than duplicates.
+    pub async fn record_covenant_spend(
+        &self,
+        record: &CovenantSpendRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(&record_covenant_spend_sql(record.subgraph.schema_name()))
+            .bind(&record.spending_tx_hash)
+            .bind(&record.previous_tx_hash)
+            .bind(record.previous_output_index)
+            .bind(record.block_daa_score)
+            .bind(&record.detector_kind)
+            .bind(record.covenant_id.as_ref())
+            .bind(record.spent_value_sompi)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Drop every covenant spend recorded at or above `from_daa`, part of a
+    /// reorg unwind. Keyed on the *spending* block's DAA, so a reorg that
+    /// drops the spend rolls the spend record back while the (earlier)
+    /// lock-time UTXO record survives — restoring spend-detectability if the
+    /// outpoint is consumed again on the surviving chain. Returns rows
+    /// removed.
+    pub async fn unwind_covenant_spends(
+        &self,
+        subgraph: &SubgraphId,
+        from_daa: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(&unwind_covenant_spends_sql(subgraph.schema_name()))
+            .bind(from_daa)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -802,6 +881,24 @@ fn unwind_covenant_utxos_sql(schema: &str) -> String {
     format!("DELETE FROM \"{schema}\".covenant_utxos WHERE block_daa_score >= $1")
 }
 
+fn record_covenant_spend_sql(schema: &str) -> String {
+    format!(
+        "INSERT INTO \"{schema}\".covenant_spends \
+         (spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score, detector_kind, covenant_id, spent_value_sompi) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (spending_tx_hash, previous_tx_hash, previous_output_index) \
+         DO UPDATE SET \
+             block_daa_score = EXCLUDED.block_daa_score, \
+             detector_kind = EXCLUDED.detector_kind, \
+             covenant_id = EXCLUDED.covenant_id, \
+             spent_value_sompi = EXCLUDED.spent_value_sompi"
+    )
+}
+
+fn unwind_covenant_spends_sql(schema: &str) -> String {
+    format!("DELETE FROM \"{schema}\".covenant_spends WHERE block_daa_score >= $1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +982,26 @@ mod tests {
     fn unwind_covenant_utxos_sql_deletes_at_or_above_the_cutoff() {
         let sql = unwind_covenant_utxos_sql("network_stats");
         assert!(sql.contains("DELETE FROM \"network_stats\".covenant_utxos"));
+        assert!(sql.contains("WHERE block_daa_score >= $1"));
+    }
+
+    #[test]
+    fn record_covenant_spend_sql_targets_the_schema_and_is_idempotent_on_input() {
+        let sql = record_covenant_spend_sql("kasbonds");
+        assert!(sql.contains("\"kasbonds\".covenant_spends"));
+        assert!(sql.contains(
+            "(spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score, detector_kind, covenant_id, spent_value_sompi)"
+        ));
+        assert!(
+            sql.contains("ON CONFLICT (spending_tx_hash, previous_tx_hash, previous_output_index)")
+        );
+        assert!(sql.contains("spent_value_sompi = EXCLUDED.spent_value_sompi"));
+    }
+
+    #[test]
+    fn unwind_covenant_spends_sql_deletes_at_or_above_the_cutoff() {
+        let sql = unwind_covenant_spends_sql("network_stats");
+        assert!(sql.contains("DELETE FROM \"network_stats\".covenant_spends"));
         assert!(sql.contains("WHERE block_daa_score >= $1"));
     }
 
