@@ -17,7 +17,8 @@
 #![cfg(feature = "integration-pg")]
 
 use kasgraph_store::{
-    CommittedBlockRecord, CovenantUtxoRecord, EntityVersionRecord, Krc20LegacyOpRecord,
+    CommittedBlockRecord, CovenantLineageHead, CovenantLineageRow, CovenantSpendRecord,
+    CovenantUtxoRecord, EntityVersionRecord, Krc20LegacyOpRecord, Krc721LegacyOpRecord,
     PoiCheckpoint, Store, SubgraphId,
 };
 use serde_json::json;
@@ -237,5 +238,244 @@ async fn poi_and_committed_block_reorg_reanchor(pool: PgPool) -> sqlx::Result<()
     let latest = store.latest_poi_for_subgraph(&sg).await.unwrap().unwrap();
     assert_eq!(latest.block_daa_score, 100);
     assert_eq!(latest.poi_hash, [1u8; 32]);
+    Ok(())
+}
+
+/// KIP-20 lineage population + spend lifecycle: open a head, append a row,
+/// the replay-idempotency guard (`covenant_lineage_row_exists`), the head
+/// read-back, `covenant_lineage_continues` (driven by a tracked covenant
+/// output of the spending tx), and the spend record + its DAA-scoped unwind.
+#[sqlx::test]
+async fn covenant_lineage_population_and_spend_lifecycle(pool: PgPool) -> sqlx::Result<()> {
+    let store = Store::from_pool(pool);
+    let sg = SubgraphId::new("itest_lineage").unwrap();
+    store.ensure_subgraph_schema(&sg).await.unwrap();
+
+    // Genesis: a head at lineage_count 1 plus its seq-0 row.
+    store
+        .upsert_covenant_lineage_head(&CovenantLineageHead {
+            covenant_id: "cid-A".into(),
+            subgraph: sg.clone(),
+            genesis_tx: "tx0".into(),
+            current_utxo: "tx0:0".into(),
+            last_seen_daa: 100,
+            lineage_count: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_covenant_lineage_row(&CovenantLineageRow {
+            covenant_id: "cid-A".into(),
+            subgraph: sg.clone(),
+            seq: 0,
+            tx_hash: "tx0".into(),
+            output_index: 0,
+            state_bytes: vec![1, 2, 3],
+            daa_score: 100,
+        })
+        .await
+        .unwrap();
+
+    // The (covenant_id, tx_hash, output_index) step is the replay key.
+    assert!(store
+        .covenant_lineage_row_exists("cid-A", "tx0", 0)
+        .await
+        .unwrap());
+    assert!(!store
+        .covenant_lineage_row_exists("cid-A", "tx0", 9)
+        .await
+        .unwrap());
+
+    let head = store
+        .fetch_covenant_lineage_head("cid-A")
+        .await
+        .unwrap()
+        .expect("head must exist");
+    assert_eq!(head.lineage_count, 1);
+    assert_eq!(head.current_utxo, "tx0:0");
+
+    // A spend's successor resolves when the spending tx produced a tracked
+    // covenant output of the same id (lineage continues).
+    store
+        .track_covenant_utxo(&CovenantUtxoRecord {
+            subgraph: sg.clone(),
+            tx_hash: "txspend".into(),
+            output_index: 0,
+            block_daa_score: 200,
+            detector_kind: "OpenSilverVault".into(),
+            covenant_id: Some("cid-A".into()),
+            value_sompi: 1_000,
+            locked_state: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(store
+        .covenant_lineage_continues(&sg, "txspend", "cid-A")
+        .await
+        .unwrap());
+    assert!(!store
+        .covenant_lineage_continues(&sg, "txspend", "cid-Z")
+        .await
+        .unwrap());
+
+    // Record the spend; it is idempotent on the spending input and unwound
+    // by the *spending* block's DAA.
+    let spend = CovenantSpendRecord {
+        subgraph: sg.clone(),
+        spending_tx_hash: "txspend".into(),
+        previous_tx_hash: "tx0".into(),
+        previous_output_index: 0,
+        block_daa_score: 200,
+        detector_kind: "OpenSilverVault".into(),
+        covenant_id: Some("cid-A".into()),
+        spent_value_sompi: 1_000,
+        successor_covenant_id: Some("cid-A".into()),
+    };
+    store.record_covenant_spend(&spend).await.unwrap();
+    store.record_covenant_spend(&spend).await.unwrap(); // idempotent re-apply
+    let removed = store.unwind_covenant_spends(&sg, 200).await.unwrap();
+    assert_eq!(removed, 1, "idempotent record → exactly one spend row");
+    Ok(())
+}
+
+/// The most intricate SQL in the store: `unwind_covenant_lineage` runs three
+/// steps in one transaction — delete rows at/above the cutoff, drop heads
+/// with no surviving row, and re-point each surviving head at its
+/// highest-`seq` survivor. None of that is observable from a SQL string;
+/// this exercises all three against a real server.
+#[sqlx::test]
+async fn covenant_lineage_reorg_unwinds_and_reanchors_heads(pool: PgPool) -> sqlx::Result<()> {
+    let store = Store::from_pool(pool);
+    let sg = SubgraphId::new("itest_lineage_unwind").unwrap();
+
+    // cid-A: a three-step lineage (genesis + two transitions), head at the tip.
+    // The row→head foreign key requires the head to exist before its rows, so
+    // open the head first (the node opens/advances the head per hit, then
+    // appends the row).
+    store
+        .upsert_covenant_lineage_head(&CovenantLineageHead {
+            covenant_id: "cid-A".into(),
+            subgraph: sg.clone(),
+            genesis_tx: "a0".into(),
+            current_utxo: "a2:0".into(),
+            last_seen_daa: 300,
+            lineage_count: 3,
+        })
+        .await
+        .unwrap();
+    for (seq, tx, daa) in [(0i32, "a0", 100i64), (1, "a1", 200), (2, "a2", 300)] {
+        store
+            .insert_covenant_lineage_row(&CovenantLineageRow {
+                covenant_id: "cid-A".into(),
+                subgraph: sg.clone(),
+                seq,
+                tx_hash: tx.into(),
+                output_index: 0,
+                state_bytes: vec![seq as u8],
+                daa_score: daa,
+            })
+            .await
+            .unwrap();
+    }
+
+    // cid-B: a single genesis row at DAA 300, so the unwind orphans its head.
+    store
+        .upsert_covenant_lineage_head(&CovenantLineageHead {
+            covenant_id: "cid-B".into(),
+            subgraph: sg.clone(),
+            genesis_tx: "b0".into(),
+            current_utxo: "b0:0".into(),
+            last_seen_daa: 300,
+            lineage_count: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_covenant_lineage_row(&CovenantLineageRow {
+            covenant_id: "cid-B".into(),
+            subgraph: sg.clone(),
+            seq: 0,
+            tx_hash: "b0".into(),
+            output_index: 0,
+            state_bytes: vec![0],
+            daa_score: 300,
+        })
+        .await
+        .unwrap();
+
+    // Reorg at DAA 250 drops cid-A's seq-2 row and cid-B's only row.
+    let removed = store.unwind_covenant_lineage(&sg, 250).await.unwrap();
+    assert_eq!(removed, 2);
+
+    // cid-A head re-anchors to the surviving tip (seq 1 @ DAA 200).
+    let head_a = store
+        .fetch_covenant_lineage_head("cid-A")
+        .await
+        .unwrap()
+        .expect("cid-A head survives");
+    assert_eq!(head_a.current_utxo, "a1:0");
+    assert_eq!(head_a.last_seen_daa, 200);
+    assert_eq!(head_a.lineage_count, 2);
+    assert!(!store
+        .covenant_lineage_row_exists("cid-A", "a2", 0)
+        .await
+        .unwrap());
+    assert!(store
+        .covenant_lineage_row_exists("cid-A", "a1", 0)
+        .await
+        .unwrap());
+
+    // cid-B had no surviving row, so its head is dropped entirely.
+    assert!(store
+        .fetch_covenant_lineage_head("cid-B")
+        .await
+        .unwrap()
+        .is_none());
+    Ok(())
+}
+
+/// KRC-721 journal parity with the KRC-20 test: seq allocation, replay
+/// guard, record→ordered-fetch round-trip (incl. a u64 token id overflowing
+/// `i64`, the TEXT-column rationale), and DAA-cutoff unwind.
+#[sqlx::test]
+async fn legacy_krc721_journal_seq_exists_fetch_unwind(pool: PgPool) -> sqlx::Result<()> {
+    let store = Store::from_pool(pool);
+    let sg = SubgraphId::new("itest_krc721").unwrap();
+
+    assert_eq!(store.next_krc721_legacy_seq("nft").await.unwrap(), 0);
+    assert!(!store.krc721_legacy_op_exists("tx-mint").await.unwrap());
+
+    let mint = Krc721LegacyOpRecord {
+        subgraph: sg.clone(),
+        tick: "nft".into(),
+        tick_raw: "NFT".into(),
+        accepting_block_hash: "bh-1".into(),
+        seq: 0,
+        accepting_daa_score: 100,
+        tx_hash: "tx-mint".into(),
+        op: "mint".into(),
+        sender: "kaspa:addr1".into(),
+        // u64 token id beyond i64::MAX — proves the TEXT column choice.
+        token_id: Some("18446744073709551615".into()),
+        recipient: None,
+        metadata_uri: Some("ipfs://cid".into()),
+        max_supply: None,
+    };
+    store.record_krc721_legacy_op(&mint).await.unwrap();
+
+    assert!(store.krc721_legacy_op_exists("tx-mint").await.unwrap());
+    assert_eq!(store.next_krc721_legacy_seq("nft").await.unwrap(), 1);
+
+    let ops = store.fetch_krc721_legacy_ops_ordered(&sg).await.unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0], mint, "write/read column mapping must round-trip");
+
+    let removed = store.unwind_krc721_legacy_ledger(&sg, 100).await.unwrap();
+    assert_eq!(removed, 1);
+    assert!(store
+        .fetch_krc721_legacy_ops_ordered(&sg)
+        .await
+        .unwrap()
+        .is_empty());
     Ok(())
 }
