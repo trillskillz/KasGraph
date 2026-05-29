@@ -11,4 +11,5 @@ description = "Proof-of-indexing for KasGraph. Per-block hash of indexed state. 
 blake2.workspace = true
 hex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
