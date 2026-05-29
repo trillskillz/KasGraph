@@ -101,6 +101,104 @@ impl Fingerprint {
     }
 }
 
+/// A fingerprint for a covenant whose compiled script has a **variable-length
+/// middle**. SilverScript unrolls loops into the redeem script, so a
+/// contract's loop-bound constructor params (e.g. KCC20's `maxCovIns` /
+/// `maxCovOuts`) rewrite the body wholesale — the same pattern compiles to
+/// 2728 bytes at one bound and 5104 at another. A whole-script [`Fingerprint`]
+/// can't match across those, so this anchors only on the parts that survive:
+/// a stable `head` prefix and `tail` suffix, ignoring everything between.
+///
+/// Per-instance state lives in the head (its offset is bound-independent), so
+/// masked windows are head-relative and extraction reads from the head. Use
+/// [`Fingerprint`] for fixed-size patterns; use this for loop-parameterized
+/// ones. The head/tail must be chosen long enough to be pattern-distinguishing
+/// (the shared SilverScript scaffold across patterns is only ~34 head bytes).
+#[derive(Debug, Clone)]
+pub struct AnchoredFingerprint {
+    /// Stable leading bytes. Bytes inside `head_masked_windows` match anything.
+    pub head: Vec<u8>,
+    /// Per-instance state windows, offset relative to the start of `head`.
+    pub head_masked_windows: Vec<MaskedWindow>,
+    /// Stable trailing bytes, matched against the end of the script.
+    pub tail: Vec<u8>,
+}
+
+impl AnchoredFingerprint {
+    /// True if `script` begins with `head` (masked bytes wildcarded) and ends
+    /// with `tail`, with room for both not to overlap. The middle — the
+    /// loop-unrolled body — is unconstrained, so the same pattern matches at
+    /// any loop-bound setting.
+    pub fn matches(&self, script: &[u8]) -> bool {
+        if script.len() < self.head.len() + self.tail.len() {
+            return false;
+        }
+        for (i, &expected) in self.head.iter().enumerate() {
+            if self.in_head_mask(i) {
+                continue;
+            }
+            if script[i] != expected {
+                return false;
+            }
+        }
+        let tail_start = script.len() - self.tail.len();
+        for (j, &expected) in self.tail.iter().enumerate() {
+            if script[tail_start + j] != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Pull each head-relative masked window out of `script`, keyed on its
+    /// `field` name. `None` if the script does not match.
+    pub fn match_and_extract(&self, script: &[u8]) -> Option<BTreeMap<&'static str, Vec<u8>>> {
+        if !self.matches(script) {
+            return None;
+        }
+        let mut out = BTreeMap::new();
+        for w in &self.head_masked_windows {
+            out.insert(w.field, script[w.offset..w.offset + w.len].to_vec());
+        }
+        Some(out)
+    }
+
+    fn in_head_mask(&self, byte_index: usize) -> bool {
+        self.head_masked_windows
+            .iter()
+            .any(|w| byte_index >= w.offset && byte_index < w.offset + w.len)
+    }
+
+    /// Panics-free validation: every masked window must lie within `head` and
+    /// not overlap another. (Windows are head-relative; the tail carries no
+    /// state.)
+    pub fn validate(&self) -> Result<(), FingerprintError> {
+        for w in &self.head_masked_windows {
+            if w.offset + w.len > self.head.len() {
+                return Err(FingerprintError::WindowOutOfBounds {
+                    field: w.field,
+                    offset: w.offset,
+                    len: w.len,
+                    script_len: self.head.len(),
+                });
+            }
+        }
+        for (i, a) in self.head_masked_windows.iter().enumerate() {
+            for b in &self.head_masked_windows[i + 1..] {
+                let a_end = a.offset + a.len;
+                let b_end = b.offset + b.len;
+                if a.offset < b_end && b.offset < a_end {
+                    return Err(FingerprintError::WindowsOverlap {
+                        a: a.field,
+                        b: b.field,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {
     #[error("masked window {field} (offset {offset}, len {len}) extends past script of length {script_len}")]
@@ -257,5 +355,101 @@ mod tests {
             ],
         };
         assert!(f.validate().is_ok());
+    }
+
+    fn anchored() -> AnchoredFingerprint {
+        // head: [H0 H1] [STATE(2)] [H4 H5]   tail: [T0 T1 T2]
+        AnchoredFingerprint {
+            head: vec![0x01, 0x02, 0x00, 0x00, 0x04, 0x05],
+            head_masked_windows: vec![MaskedWindow {
+                field: "state",
+                offset: 2,
+                len: 2,
+            }],
+            tail: vec![0xF0, 0xF1, 0xF2],
+        }
+    }
+
+    fn script_with_middle(a: &AnchoredFingerprint, middle: &[u8], state: [u8; 2]) -> Vec<u8> {
+        let mut s = a.head.clone();
+        s[2] = state[0];
+        s[3] = state[1];
+        s.extend_from_slice(middle);
+        s.extend_from_slice(&a.tail);
+        s
+    }
+
+    #[test]
+    fn anchored_matches_regardless_of_middle_length() {
+        let a = anchored();
+        // The variable, loop-unrolled middle does not affect matching.
+        assert!(a.matches(&script_with_middle(&a, &[], [0xAA, 0xBB])));
+        assert!(a.matches(&script_with_middle(&a, &[0x99; 1], [0xAA, 0xBB])));
+        assert!(a.matches(&script_with_middle(&a, &[0x99; 4000], [0xAA, 0xBB])));
+    }
+
+    #[test]
+    fn anchored_rejects_wrong_head_or_tail_fixed_bytes() {
+        let a = anchored();
+        let mut bad_head = script_with_middle(&a, &[0x99; 8], [0xAA, 0xBB]);
+        bad_head[0] = 0xFF; // fixed head byte
+        assert!(!a.matches(&bad_head));
+        let mut bad_tail = script_with_middle(&a, &[0x99; 8], [0xAA, 0xBB]);
+        let n = bad_tail.len();
+        bad_tail[n - 1] = 0xFF; // fixed tail byte
+        assert!(!a.matches(&bad_tail));
+    }
+
+    #[test]
+    fn anchored_rejects_script_too_short_for_head_plus_tail() {
+        let a = anchored();
+        // 6-byte head + 3-byte tail need >= 9 bytes; 8 must not match (and the
+        // head/tail must not be allowed to overlap into a false positive).
+        assert!(!a.matches(&[0x01, 0x02, 0x00, 0x00, 0x04, 0x05, 0xF0, 0xF1]));
+    }
+
+    #[test]
+    fn anchored_extracts_head_state_independent_of_middle() {
+        let a = anchored();
+        let s = script_with_middle(&a, &[0x99; 4000], [0xDE, 0xAD]);
+        let out = a.match_and_extract(&s).expect("matches");
+        assert_eq!(out.get("state"), Some(&vec![0xDE, 0xAD]));
+        // A different middle yields the identical extraction.
+        let s2 = script_with_middle(&a, &[0x42; 7], [0xDE, 0xAD]);
+        assert_eq!(
+            a.match_and_extract(&s2).unwrap().get("state"),
+            Some(&vec![0xDE, 0xAD])
+        );
+    }
+
+    #[test]
+    fn anchored_validate_rejects_window_past_head_and_overlap() {
+        let past = AnchoredFingerprint {
+            head: vec![0x00; 4],
+            head_masked_windows: vec![MaskedWindow {
+                field: "x",
+                offset: 2,
+                len: 5,
+            }],
+            tail: vec![0x00],
+        };
+        assert!(past.validate().is_err());
+        let overlap = AnchoredFingerprint {
+            head: vec![0x00; 16],
+            head_masked_windows: vec![
+                MaskedWindow {
+                    field: "a",
+                    offset: 0,
+                    len: 5,
+                },
+                MaskedWindow {
+                    field: "b",
+                    offset: 3,
+                    len: 5,
+                },
+            ],
+            tail: vec![0x00],
+        };
+        assert!(overlap.validate().is_err());
     }
 }
