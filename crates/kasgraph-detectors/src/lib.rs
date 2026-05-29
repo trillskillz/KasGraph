@@ -30,6 +30,7 @@
 //! [`registry`] without touching the engine.
 
 pub mod fingerprint;
+pub mod kcc20_operation;
 pub mod krc20;
 pub mod krc20_ledger;
 pub mod krc721;
@@ -37,6 +38,9 @@ pub mod krc721_ledger;
 pub mod registry;
 
 pub use fingerprint::{Fingerprint, MaskedWindow};
+pub use kcc20_operation::{
+    classify_kcc20_asset_operation, Kcc20AssetState, Kcc20DecodeError, Kcc20Operation,
+};
 pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 pub use krc20_ledger::{ApplyOutcome, Krc20Ledger, TokenState};
 pub use krc721::{parse_krc721_inscription, Krc721Inscription, Krc721Op, Krc721Parse};
