@@ -21,9 +21,9 @@
 // stray `env.abort` AssemblyScript would otherwise emit).
 //
 // NOTE: the mapping must be authored in AssemblyScript (a strict TS
-// subset — no async/Promise/closures). The reference mappings under
-// examples/ are still aspirational pseudo-code and do not yet compile;
-// porting them to AssemblyScript is a separate task.
+// subset — no async/Promise/closures). All six reference mappings under
+// examples/ are authored against the `@kasgraph/as-mapping` SDK and
+// compile through this command (see tests/examples-build.test.ts).
 
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
