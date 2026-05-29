@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-28 — spent value captured in the covenant-UTXO tracker)
+## Latest commit arc (2026-05-28 — detected covenant spends persisted)
+
+Detected spends are now durable, not just logged (commit `50869a4`, `kasgraph-store` + `kasgraph-node`).
+
+- New per-subgraph `covenant_spends` table (PK `(spending_tx_hash, previous_tx_hash, previous_output_index)`; `block_daa_score`, `detector_kind`, `covenant_id`, `spent_value_sompi`). `CovenantSpendRecord` + `record_covenant_spend` (idempotent on the spending input) + `unwind_covenant_spends`.
+- **Two-table reorg model:** `covenant_utxos` is the immutable lock-time set (unwound when the *lock* block reorgs); `covenant_spends` is keyed on the *spending* block's DAA (unwound when the *spend* block reorgs). So a reorg that drops only the spend block rolls back the spend row and restores spend-detectability for its outpoints, while the earlier UTXO row survives. Both unwinds run in the node's reorg path at the same cutoff.
+- Every persisted column is protocol-observable at detection time, so the row is honest today — `operation` / `successorCovenantId` are deliberately absent (they need the spend-tx decoder). 2 SQL-builder tests → kasgraph-store at 12; 139 workspace tests green; fmt clean (detectors drift untouched).
+- **Remaining for dispatch unchanged:** the spend-tx decoder for `operation` + `successorCovenantId`. With spends now persisted, a future option is to dispatch `CovenantSpent` directly off the `covenant_spends` row once the decoder fills those two fields (`spentValueSompi` and the rest are already there).
+
+## Previous commit arc (2026-05-28 — spent value captured in the covenant-UTXO tracker)
 
 Honest, protocol-observable groundwork for the `CovenantSpend` envelope (commit `2dcf7b6`, `kasgraph-store` + `kasgraph-node`).
 
