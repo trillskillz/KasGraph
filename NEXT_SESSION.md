@@ -2,7 +2,18 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-28 — WASM dispatch wired into the node ingest loop)
+## Latest commit arc (2026-05-28 — spend-dispatch core, CovenantSpent)
+
+The deterministic core for dispatching covenant **spends** is landed (commit `412de54`, `kasgraph-node::mapping_host`), symmetric to the locked path and ahead of the input-scanning wire change that will feed it — same "pure core first" pattern the locked bridge used.
+
+- **`EVENT_COVENANT_SPENT`** added to `subgraph_manifest` (`#[allow(dead_code)]` until the wiring resolves it). The *locked* covenant's detector kind resolves the spend handler, so the data source whose `patterns` matched the lock also owns the transition.
+- **`CovenantSpend`** envelope (`operation` / `spentValueSompi` / `successorCovenantId`), serde `camelCase` to match the CLI codegen's `CovenantSpend` TS interface — protocol-observable fields only; subgraph quantities stay mapping-derived.
+- **`spend_mapping_event(spend, prior_state, daa, hash, handler)`** builds the `{ spend, state }` payload codegen types for spend handlers, wrapping the prior locked detector state under `state`.
+- **`dispatch_spend_hit(...)`** runs a compiled mapping for a spend, seeding `store_get` from the committed snapshot, returning DAA-versioned records — mirrors `dispatch_locked_hit`.
+- 3 unit tests (payload shape, null successor on lineage termination, snapshot-seeded dispatch via the WAT handler). node at 49 tests; `cargo build --workspace --all-targets` warning-clean.
+- **What's left to wire spend dispatch end-to-end (the side-effecting glue this unblocks):** the block model (`BootstrapBlock` / `kasgraph_rpc::IngestedBlock`) currently carries transaction **outputs only**, so the node can detect lock-time covenants but not spends. Wiring needs: (1) transaction **inputs** added to the wire model in `kasgraph-rpc`; (2) a covenant-UTXO tracker — the `kasgraph_covenant_lineage_*` store tables + `upsert_covenant_lineage_head` / `insert_covenant_lineage_row` exist but the node's committed loop doesn't populate them yet; (3) per committed block, match inputs against tracked covenant UTXOs, build the `CovenantSpend` envelope from the spend tx + lineage head, resolve the `CovenantSpent` handler via the descriptor, and call `dispatch_spend_hit`. Needs the wire change + Postgres to verify.
+
+## Previous commit arc (2026-05-28 — WASM dispatch wired into the node ingest loop)
 
 The loop from detector hit to persisted entity state is now closed end-to-end (everything except a live Postgres round-trip, which this environment can't run). Three slices, in order:
 
