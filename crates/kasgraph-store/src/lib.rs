@@ -392,6 +392,31 @@ impl Store {
         .transpose()
     }
 
+    /// Whether a lineage row already records this covenant output. A given
+    /// `(covenant_id, tx_hash, output_index)` is one physical covenant UTXO
+    /// and therefore one lineage step, so this is the idempotency key for
+    /// replay-safe population: a re-delivered notification must not advance
+    /// the head or append a phantom transition for an already-recorded step.
+    pub async fn covenant_lineage_row_exists(
+        &self,
+        covenant_id: &str,
+        tx_hash: &str,
+        output_index: i32,
+    ) -> Result<bool, StoreError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM kasgraph_covenant_lineage_row \
+             WHERE covenant_id = $1 AND tx_hash = $2 AND output_index = $3)",
+        )
+        .bind(covenant_id)
+        .bind(tx_hash)
+        .bind(output_index)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.map(|(exists,)| exists).unwrap_or(false))
+    }
+
     pub async fn insert_covenant_lineage_row(
         &self,
         row: &CovenantLineageRow,

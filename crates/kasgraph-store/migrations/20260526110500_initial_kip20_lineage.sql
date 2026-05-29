@@ -15,7 +15,10 @@ CREATE TABLE IF NOT EXISTS kasgraph_covenant_lineage_row (
     output_index INTEGER NOT NULL,
     state_bytes BYTEA NOT NULL,
     daa_score BIGINT NOT NULL,
-    PRIMARY KEY (covenant_id, seq)
+    PRIMARY KEY (covenant_id, seq),
+    -- A covenant output is exactly one lineage step; this is the
+    -- replay-safety idempotency key (also indexes the existence lookup).
+    UNIQUE (covenant_id, tx_hash, output_index)
 );
 
 CREATE INDEX IF NOT EXISTS kasgraph_covenant_lineage_row_subgraph_daa_idx

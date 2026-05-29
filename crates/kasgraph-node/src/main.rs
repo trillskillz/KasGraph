@@ -1205,6 +1205,19 @@ async fn persist_lineage(
     block_daa_score: i64,
 ) -> anyhow::Result<()> {
     let covenant_id = class.covenant_id();
+
+    // Replay safety: reconnect re-delivery can re-present the same hit. A
+    // covenant output is one lineage step, so if this `(covenant_id, tx,
+    // output)` step is already recorded, skip — re-advancing the head
+    // would append a phantom transition for an already-seen state.
+    if store
+        .covenant_lineage_row_exists(covenant_id, &hit.tx_hash, hit.output_index as i32)
+        .await
+        .context("checking for an existing covenant lineage step")?
+    {
+        return Ok(());
+    }
+
     let prior = store
         .fetch_covenant_lineage_head(covenant_id)
         .await
