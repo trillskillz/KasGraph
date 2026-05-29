@@ -33,8 +33,8 @@ use kasgraph_rpc::{
 };
 use kasgraph_store::{
     CommittedBlockRecord, CovenantLineageHead, CovenantLineageRow, CovenantSpendRecord,
-    CovenantUtxoRecord, DetectedPatternRecord, PoiCheckpoint, RpcBlockAuditRecord, Store,
-    SubgraphId,
+    CovenantUtxoRecord, DetectedPatternRecord, EntityVersionRecord, PoiCheckpoint,
+    RpcBlockAuditRecord, Store, SubgraphId,
 };
 use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
@@ -188,10 +188,15 @@ impl Default for ContinuousConfig {
 // Eq dropped transitively because BootstrapBlock.detector_hits
 // holds DetectedPattern whose payload is serde_json::Value
 // (PartialEq only).
+//
+// A block the transition selected for committed persistence. POI is NOT
+// computed here: it is computed at persist time (`apply_and_persist_notification`)
+// over the block's *dispatched* entity state (Phase 2.8), so the transition
+// stays a pure block-promotion step and the POI chain reflects real indexed
+// state rather than a pre-dispatch scaffold.
 #[derive(Debug, Clone, PartialEq)]
 struct CommittedBlockWrite {
     block: BootstrapBlock,
-    poi_hash: PoiHash,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -870,11 +875,6 @@ async fn apply_and_persist_notification(
     let mut committed_count: usize = 0;
     for committed in transition.committed_writes {
         committed_count = committed_count.saturating_add(1);
-        let checkpoint = PoiCheckpoint {
-            subgraph: subgraph.clone(),
-            block_daa_score: committed.block.daa_score,
-            poi_hash: committed.poi_hash,
-        };
         let audit = RpcBlockAuditRecord {
             block_hash: committed.block.hash.clone(),
             daa_score: committed.block.daa_score,
@@ -887,10 +887,9 @@ async fn apply_and_persist_notification(
             served_by: committed.block.served_by.clone(),
         };
 
-        store
-            .insert_poi_checkpoint(&checkpoint)
-            .await
-            .context("writing POI checkpoint")?;
+        // Audit + reorg-tracking rows do not depend on POI; the POI checkpoint
+        // is written after dispatch (below) over this block's dispatched
+        // entity state (Phase 2.8).
         store
             .insert_rpc_block_audit(&audit)
             .await
@@ -900,20 +899,13 @@ async fn apply_and_persist_notification(
             .await
             .context("recording committed block for reorg-tracking")?;
 
-        info!(
-            subgraph = subgraph.schema_name(),
-            block_hash = audit.block_hash,
-            daa_score = checkpoint.block_daa_score,
-            poi = poi_hex(&checkpoint.poi_hash),
-            served_by = audit.served_by,
-            finalized = committed.block.is_finalized,
-            "persisted committed checkpoint"
-        );
+        // Entity versions this block's mapping dispatched, collected so the
+        // POI below hashes the real indexed state. Stays empty when no mapping
+        // is loaded or the block dispatched nothing.
+        let mut dispatched: Vec<EntityVersionRecord> = Vec::new();
 
-        // Detector hits were computed once in block_from_rpc and
-        // already contributed to canonical_entity_bytes (and thus
-        // to the POI we just persisted). Re-using them here keeps
-        // detection-cost O(block), not O(2*block).
+        // Detector hits were computed once in block_from_rpc and are reused
+        // here so detection-cost stays O(block), not O(2*block).
         let hits = &committed.block.detector_hits;
         if !hits.is_empty() {
             info!(
@@ -1010,24 +1002,24 @@ async fn apply_and_persist_notification(
             // reorg unwinds them by the same cutoff as the block itself.
             if let Some(mapping) = mapping {
                 let snapshot = load_entity_snapshot(store, subgraph).await?;
-                let records = mapping.dispatch_committed_hits(
+                dispatched = mapping.dispatch_committed_hits(
                     committed.block.daa_score as u64,
                     &committed.block.hash,
                     hits,
                     &snapshot,
                 );
-                for record in &records {
+                for record in &dispatched {
                     store
                         .upsert_entity_version(record)
                         .await
                         .context("persisting mapping-emitted entity version")?;
                 }
-                if !records.is_empty() {
+                if !dispatched.is_empty() {
                     info!(
                         subgraph = subgraph.schema_name(),
                         block_hash = committed.block.hash,
                         daa_score = committed.block.daa_score,
-                        entity_versions = records.len(),
+                        entity_versions = dispatched.len(),
                         "persisted mapping entity versions"
                     );
                 }
@@ -1118,6 +1110,36 @@ async fn apply_and_persist_notification(
                 );
             }
         }
+
+        // Phase 2.8: commit this block's POI over its dispatched entity state
+        // (or the detector-hit canonical bytes when no mapping is loaded).
+        // Computed here, after dispatch, so the chain commits to the real
+        // indexed state a third party can recompute. `prior_poi` was already
+        // re-anchored from the surviving checkpoint on any reorg above, so
+        // this chains from the correct anchor.
+        let poi_input = committed_poi_input(&committed.block, &dispatched, mapping.is_some());
+        let poi_hash = compute_poi(&ingestion.prior_poi, &poi_input)
+            .context("computing committed block POI over dispatched entities")?;
+        ingestion.prior_poi = poi_hash;
+        let checkpoint = PoiCheckpoint {
+            subgraph: subgraph.clone(),
+            block_daa_score: committed.block.daa_score,
+            poi_hash,
+        };
+        store
+            .insert_poi_checkpoint(&checkpoint)
+            .await
+            .context("writing POI checkpoint")?;
+        info!(
+            subgraph = subgraph.schema_name(),
+            block_hash = committed.block.hash,
+            daa_score = committed.block.daa_score,
+            poi = poi_hex(&poi_hash),
+            served_by = committed.block.served_by,
+            finalized = committed.block.is_finalized,
+            entities = dispatched.len(),
+            "persisted committed checkpoint"
+        );
     }
 
     Ok(NotificationOutcome {
@@ -1606,14 +1628,11 @@ impl IngestionState {
         let mut committed_writes = Vec::new();
         for score in promotable_scores {
             if let Some(probabilistic_block) = self.probabilistic.remove(&score) {
-                let poi_hash =
-                    compute_poi(&self.prior_poi, &probabilistic_block.canonical_entity_bytes)
-                        .context("computing committed block POI")?;
-                self.prior_poi = poi_hash;
+                // POI is computed at persist time over this block's dispatched
+                // entity state (Phase 2.8), not here — promotion is a pure step.
                 self.committed.insert(score, probabilistic_block.clone());
                 committed_writes.push(CommittedBlockWrite {
                     block: probabilistic_block,
-                    poi_hash,
                 });
             }
         }
@@ -1734,6 +1753,24 @@ fn block_to_rpc(block: &BootstrapBlock) -> IngestedBlock {
 ///
 /// Empty detector lists collapse to just the header, so synthetic
 /// scaffold blocks still produce a stable POI.
+/// POI input bytes for a committed block (Phase 2.8). With a mapping loaded,
+/// this is the canonical encoding of the block's *dispatched* entity state
+/// (`mapping_host::canonical_bytes_for_entities`), so the POI chain commits
+/// to real indexed state that a third party can recompute. Without a mapping
+/// there is no dispatched state, so it falls back to the block's detector-hit
+/// canonical bytes — byte-identical to the pre-2.8 behavior for that path.
+fn committed_poi_input(
+    block: &BootstrapBlock,
+    dispatched: &[EntityVersionRecord],
+    mapping_loaded: bool,
+) -> Vec<u8> {
+    if mapping_loaded {
+        mapping_host::canonical_bytes_for_entities(dispatched)
+    } else {
+        block.canonical_entity_bytes.clone()
+    }
+}
+
 fn canonical_bytes_for_block(
     block: &IngestedBlock,
     detector_hits: &[kasgraph_detectors::DetectedPattern],
@@ -1875,16 +1912,42 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_poi_chain_is_deterministic() {
-        let mut state = IngestionState::default();
-        let first = state.apply_block(block("a", 1, true)).unwrap();
-        let second = state.apply_block(block("b", 2, true)).unwrap();
-        assert_eq!(first.committed_writes.len(), 1);
-        assert_eq!(second.committed_writes.len(), 1);
-        assert_ne!(
-            first.committed_writes[0].poi_hash,
-            second.committed_writes[0].poi_hash
+    fn committed_poi_input_chains_deterministically_without_a_mapping() {
+        // POI now chains in the persist loop (apply_and_persist_notification),
+        // not in the transition. This pins the no-mapping path: the input is
+        // the block's detector-hit canonical bytes, the chain advances per
+        // block, and the same input reproduces the same hash.
+        let block_a = block("a", 1, true);
+        let block_b = block("b", 2, true);
+        let prior = PoiHash::default();
+        let poi_a = compute_poi(&prior, &committed_poi_input(&block_a, &[], false)).unwrap();
+        let poi_b = compute_poi(&poi_a, &committed_poi_input(&block_b, &[], false)).unwrap();
+        assert_ne!(poi_a, poi_b, "distinct blocks chain to distinct POIs");
+        let poi_a_again = compute_poi(&prior, &committed_poi_input(&block_a, &[], false)).unwrap();
+        assert_eq!(poi_a, poi_a_again, "same input → same POI");
+    }
+
+    #[test]
+    fn committed_poi_input_uses_entity_bytes_only_with_a_mapping() {
+        let blk = block("x", 5, true);
+        let recs = vec![EntityVersionRecord {
+            subgraph: SubgraphId::new("kasbonds").unwrap(),
+            entity_type: "Bond".into(),
+            entity_id: "b1".into(),
+            block_daa_score: 5,
+            payload: serde_json::json!({ "n": 1 }),
+        }];
+        // Mapping loaded → POI input is the dispatched entity state, derived
+        // independently of the block's scaffold canonical bytes.
+        let with_mapping = committed_poi_input(&blk, &recs, true);
+        assert_eq!(
+            with_mapping,
+            mapping_host::canonical_bytes_for_entities(&recs)
         );
+        // No mapping → the block's detector-hit canonical bytes (unchanged).
+        let without = committed_poi_input(&blk, &recs, false);
+        assert_eq!(without, blk.canonical_entity_bytes);
+        assert_ne!(with_mapping, without);
     }
 
     #[test]
@@ -2015,45 +2078,46 @@ mod tests {
 
     #[test]
     fn reseed_prior_poi_anchors_next_committed_chain_from_survivor() {
-        // Build state A: commit a single block; remember its POI.
-        let mut state_a = IngestionState::default();
-        let t = state_a.apply_block(block("a", 1, true)).unwrap();
-        let survivor_poi = t.committed_writes[0].poi_hash;
+        // POI chaining moved to the persist loop, which reads `prior_poi` as
+        // the anchor; `reseed_prior_poi` (called on startup and after a reorg
+        // unwind) sets it. Pin that: after reseeding from a survivor POI, the
+        // next block hashes from the survivor, not the zero seed.
+        let block_a = block("a", 1, true);
+        let survivor = compute_poi(
+            &PoiHash::default(),
+            &committed_poi_input(&block_a, &[], false),
+        )
+        .unwrap();
 
-        // State B: empty in-memory but re-seeded from the survivor.
-        // The next committed block must hash from `survivor_poi`,
-        // not from the default zero seed.
-        let mut state_b = IngestionState::default();
-        state_b.reseed_prior_poi(survivor_poi);
-        let next_b = state_b.apply_block(block("b", 2, true)).unwrap();
+        let mut state = IngestionState::default();
+        state.reseed_prior_poi(survivor);
+        assert_eq!(state.prior_poi, survivor, "reseed sets the chain anchor");
 
-        // For comparison: continue state A naturally.
-        let next_a = state_a.apply_block(block("b", 2, true)).unwrap();
-
-        assert_eq!(
-            next_a.committed_writes[0].poi_hash, next_b.committed_writes[0].poi_hash,
-            "re-seeded chain must match natural continuation"
+        let block_b = block("b", 2, true);
+        let from_survivor =
+            compute_poi(&state.prior_poi, &committed_poi_input(&block_b, &[], false)).unwrap();
+        let from_zero = compute_poi(
+            &PoiHash::default(),
+            &committed_poi_input(&block_b, &[], false),
+        )
+        .unwrap();
+        assert_ne!(
+            from_survivor, from_zero,
+            "the re-seeded anchor must change the next block's POI"
         );
     }
 
     #[test]
     fn reseed_prior_poi_with_zero_resets_to_genesis_chain() {
-        // Commit some blocks, then re-seed to the default seed —
-        // the next committed block's POI must equal a fresh state's
-        // first POI for the same block.
+        // Re-seeding to the default seed (no surviving checkpoint after an
+        // unwind) restores the genesis anchor for the next committed block.
         let mut state = IngestionState::default();
-        state.apply_block(block("a", 1, true)).unwrap();
-        state.apply_block(block("b", 2, true)).unwrap();
+        state.reseed_prior_poi([9u8; 32]);
         state.reseed_prior_poi(PoiHash::default());
-
-        let next = state.apply_block(block("c", 3, true)).unwrap();
-
-        let mut fresh = IngestionState::default();
-        let fresh_first = fresh.apply_block(block("c", 3, true)).unwrap();
-
         assert_eq!(
-            next.committed_writes[0].poi_hash, fresh_first.committed_writes[0].poi_hash,
-            "reseed-to-default must produce the same POI as a fresh state's first commit"
+            state.prior_poi,
+            PoiHash::default(),
+            "reseed-to-default restores the genesis anchor"
         );
     }
 

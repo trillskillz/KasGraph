@@ -17,6 +17,7 @@ use kasgraph_detectors::DetectedPattern;
 use kasgraph_mapping::{
     DispatchOutcome, EntitySnapshot, MappingError, MappingEvent, MappingRuntime,
 };
+use kasgraph_poi::{canonical_block_bytes, CanonicalEntity};
 use kasgraph_store::{EntityVersionRecord, SubgraphId};
 use serde::Serialize;
 use tracing::warn;
@@ -59,6 +60,28 @@ pub fn entity_versions(
             payload: op.data.clone(),
         })
         .collect()
+}
+
+/// Canonical POI input bytes for a committed block's *dispatched* entity
+/// state — the Phase 2.8 encoding (`kasgraph_poi::canonical_block_bytes`)
+/// fed by the entity versions a block's mapping emitted, rather than a
+/// scaffold. The records are the per-block dispatch output, so each carries
+/// the same `block_daa_score`; only the entity identity + state matter for
+/// the hash, so this maps `(entity_type, entity_id, payload)` straight onto
+/// `CanonicalEntity` and lets `canonical_block_bytes` impose the canonical
+/// order. Insertion order is irrelevant (the encoder sorts), and an empty
+/// slice hashes to the well-defined empty-block value so the chain still
+/// advances on a block that dispatched nothing.
+pub fn canonical_bytes_for_entities(records: &[EntityVersionRecord]) -> Vec<u8> {
+    let entities: Vec<CanonicalEntity> = records
+        .iter()
+        .map(|r| CanonicalEntity {
+            entity_type: r.entity_type.clone(),
+            entity_id: r.entity_id.clone(),
+            state: r.payload.clone(),
+        })
+        .collect();
+    canonical_block_bytes(&entities)
 }
 
 /// Dispatch one lock-time hit through a compiled subgraph mapping,
@@ -308,6 +331,58 @@ mod tests {
         assert_eq!(recs[0].entity_id, "a1");
         assert_eq!(recs[1].entity_type, "Holder");
         assert_eq!(recs[1].payload, serde_json::json!({ "balance": 1 }));
+    }
+
+    fn ev(entity_type: &str, entity_id: &str, payload: serde_json::Value) -> EntityVersionRecord {
+        EntityVersionRecord {
+            subgraph: SubgraphId::new("kasbonds").unwrap(),
+            entity_type: entity_type.into(),
+            entity_id: entity_id.into(),
+            block_daa_score: 1,
+            payload,
+        }
+    }
+
+    #[test]
+    fn canonical_bytes_for_entities_is_order_independent_and_matches_the_encoder() {
+        let a = ev("Bond", "b1", serde_json::json!({ "n": 1 }));
+        let b = ev("Holder", "h1", serde_json::json!({ "bal": 2 }));
+        let forward = canonical_bytes_for_entities(&[a.clone(), b.clone()]);
+        let reversed = canonical_bytes_for_entities(&[b, a]);
+        assert_eq!(
+            forward, reversed,
+            "encoder sorts; input order must not matter"
+        );
+
+        // Equals a hand-built canonical_block_bytes over the same entities.
+        let expected = canonical_block_bytes(&[
+            CanonicalEntity {
+                entity_type: "Bond".into(),
+                entity_id: "b1".into(),
+                state: serde_json::json!({ "n": 1 }),
+            },
+            CanonicalEntity {
+                entity_type: "Holder".into(),
+                entity_id: "h1".into(),
+                state: serde_json::json!({ "bal": 2 }),
+            },
+        ]);
+        assert_eq!(forward, expected);
+    }
+
+    #[test]
+    fn canonical_bytes_for_entities_distinguishes_state_and_handles_empty() {
+        let one = canonical_bytes_for_entities(&[ev("Bond", "b1", serde_json::json!({ "n": 1 }))]);
+        let two = canonical_bytes_for_entities(&[ev("Bond", "b1", serde_json::json!({ "n": 2 }))]);
+        assert_ne!(one, two, "distinct entity state must hash distinctly");
+
+        // Empty dispatch still yields the well-defined empty-block bytes so
+        // the POI chain advances on a block that emitted nothing.
+        assert_eq!(
+            canonical_bytes_for_entities(&[]),
+            canonical_block_bytes(&[])
+        );
+        assert!(!canonical_bytes_for_entities(&[]).is_empty());
     }
 
     #[test]
@@ -571,7 +646,9 @@ mod integration_pg_tests {
     }
 
     #[sqlx::test(migrations = "../kasgraph-store/migrations")]
-    async fn committed_dispatch_persists_entity_then_reorg_unwinds(pool: PgPool) -> sqlx::Result<()> {
+    async fn committed_dispatch_persists_entity_then_reorg_unwinds(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
         let store = Store::from_pool(pool);
         let sg = SubgraphId::new("itest_node_hit").unwrap();
         store.ensure_subgraph_schema(&sg).await.unwrap();
