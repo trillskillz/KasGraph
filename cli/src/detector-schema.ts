@@ -125,7 +125,7 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
     fields: [
       { name: "owner_identifier", byteLen: 32 },
       { name: "identifier_type", byteLen: 1 },
-      { name: "amount", byteLen: 16 },
+      { name: "amount", byteLen: 8 },
       { name: "is_minter", byteLen: 1 },
     ],
   },

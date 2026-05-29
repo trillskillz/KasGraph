@@ -140,13 +140,19 @@ fn build_registry() -> Vec<DetectorEntry> {
         ),
         // Native KCC20 — per-UTXO receipt state (kcc20.sil Pattern 4.1):
         // each covenant UTXO carries its own owner / amount / minter flag.
+        // Widths verified against a real `silverc` compile of kcc20.sil — the
+        // 46-byte state slot sits at script offset 1 (bound-independent), with
+        // owner_identifier[2..33] / identifier_type[35] / amount[37..44] (an
+        // 8-byte i64, not 16) / is_minter[46]. (Offsets within the placeholder
+        // fingerprint are still synthetic; only the field widths are real —
+        // see NEXT_SESSION on the anchored-matcher fingerprint sync.)
         opensilver(
             DetectorKind::KCC20Asset,
             0x20,
             &[
                 ("owner_identifier", 32),
                 ("identifier_type", 1),
-                ("amount", 16),
+                ("amount", 8),
                 ("is_minter", 1),
             ],
         ),

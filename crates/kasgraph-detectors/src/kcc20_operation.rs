@@ -70,7 +70,9 @@ impl Kcc20ReceiptState {
         Ok(Self {
             owner_identifier: hex_str(payload, "owner_identifier")?.to_owned(),
             identifier_type: hex_be(payload, "identifier_type", 1)? as u8,
-            amount: hex_be(payload, "amount", 16)?,
+            // 8 bytes: silverscript `int` is i64 — matches the verified
+            // kcc20.sil state slot (amount at script bytes [37..44]).
+            amount: hex_be(payload, "amount", 8)?,
             is_minter: hex_be(payload, "is_minter", 1)? != 0,
         })
     }
@@ -270,7 +272,7 @@ mod tests {
         let payload = json!({
             "owner_identifier": "ab".repeat(32),
             "identifier_type": "02",
-            "amount": "00000000000000000000000000000100", // 256
+            "amount": "0000000000000100", // 8-byte i64 slot, = 256
             "is_minter": "01",
         });
         let parsed = Kcc20ReceiptState::from_payload(&payload).unwrap();
