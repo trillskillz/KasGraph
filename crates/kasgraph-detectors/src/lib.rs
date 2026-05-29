@@ -34,8 +34,33 @@ pub mod registry;
 
 pub use fingerprint::{Fingerprint, MaskedWindow};
 
+use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Domain tag for covenant-id hashing. Keeps the id from colliding with
+/// other blake2b uses in the project (e.g. POI), and is versioned so a
+/// future change to the recipe is distinguishable.
+const COVENANT_ID_DOMAIN: &[u8] = b"kasgraph.covenant_id.v1";
+
+/// Deterministic covenant id for a lineage genesis outpoint.
+///
+/// Kaspa RPC does not expose covenant ids (see
+/// `docs/references/KASPA_RPC_REFERENCE.md`); KasGraph computes and
+/// persists the lineage model itself. The id is the blake2b-256 of the
+/// genesis outpoint `(genesis_tx, genesis_output)`, domain-separated and
+/// hex-encoded (64 chars). It is established once at genesis and stays
+/// stable across every transition in the covenant's lineage — each spend
+/// of a covenant UTXO inherits the predecessor's id rather than computing
+/// a new one. This is the value carried in the `covenant_id` field on
+/// detector hits and store rows.
+pub fn genesis_covenant_id(genesis_tx: &str, genesis_output: u32) -> String {
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(COVENANT_ID_DOMAIN);
+    hasher.update(genesis_tx.as_bytes());
+    hasher.update(genesis_output.to_be_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// What we look for. Extensible — adding a variant requires adding a
 /// matcher entry in [`registry::all`] and a unit test.
@@ -193,6 +218,36 @@ mod tests {
     }
 
     #[test]
+    fn genesis_covenant_id_is_deterministic_and_64_hex_chars() {
+        let a = genesis_covenant_id("deadbeef", 0);
+        let b = genesis_covenant_id("deadbeef", 0);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn genesis_covenant_id_distinguishes_outpoint_and_index() {
+        let base = genesis_covenant_id("deadbeef", 0);
+        assert_ne!(base, genesis_covenant_id("deadbeef", 1));
+        assert_ne!(base, genesis_covenant_id("cafebabe", 0));
+    }
+
+    #[test]
+    fn genesis_covenant_id_is_domain_separated_from_plain_blake2b() {
+        // The domain tag must participate, so a plain hash of the same
+        // bytes (no domain) differs — guarding against collisions with
+        // other blake2b uses in the workspace (e.g. POI).
+        let mut plain = Blake2b::<U32>::new();
+        plain.update(b"deadbeef");
+        plain.update(0u32.to_be_bytes());
+        assert_ne!(
+            genesis_covenant_id("deadbeef", 0),
+            hex::encode(plain.finalize())
+        );
+    }
+
+    #[test]
     fn detect_in_output_returns_hit_for_known_pattern() {
         // Use the OpenSilverOwnable canonical bytes from the registry;
         // splice an arbitrary owner pubkey into the masked window so
@@ -260,8 +315,14 @@ mod tests {
         assert_eq!(
             multisig.fields,
             vec![
-                DetectorFieldSchema { name: "signer_pubkeys".to_owned(), byte_len: 96 },
-                DetectorFieldSchema { name: "threshold".to_owned(), byte_len: 1 },
+                DetectorFieldSchema {
+                    name: "signer_pubkeys".to_owned(),
+                    byte_len: 96
+                },
+                DetectorFieldSchema {
+                    name: "threshold".to_owned(),
+                    byte_len: 1
+                },
             ],
         );
     }
