@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   buildMcpConfig,
@@ -11,6 +12,7 @@ import {
   type CliIo,
 } from '../cli/src/index.js';
 import { runInit } from '../cli/src/init.js';
+import { validateManifest } from '../sdk/src/index.js';
 
 class CapturedIo implements CliIo {
   stdoutBuf = '';
@@ -145,6 +147,20 @@ describe('kasgraph init', () => {
     // schema.graphql has the placeholder entity.
     const schema = await readFile(path.join(root, 'schema.graphql'), 'utf8');
     expect(schema).toContain('type Bond');
+  });
+
+  it('scaffolds a manifest that passes the build-time validator', async () => {
+    // `kasgraph build` rejects a manifest that fails validateManifest, so
+    // the init scaffold must satisfy the same contract — otherwise a fresh
+    // `init` → `build` would fail on the generated file. This pins the two
+    // together so the template can't drift away from the contract.
+    const io = new CapturedIo(scratch);
+    expect(await runInit(['scaffold-check'], io)).toBe(0);
+    const yaml = await readFile(
+      path.join(scratch, 'scaffold-check', 'subgraph.yaml'),
+      'utf8',
+    );
+    expect(validateManifest(parseYaml(yaml))).toEqual([]);
   });
 
   it('refuses to clobber an existing directory', async () => {
