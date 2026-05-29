@@ -176,6 +176,36 @@ pub struct EntitySnapshotRow {
     pub payload: serde_json::Value,
 }
 
+/// A covenant UTXO the indexer locked, recorded so a later transaction
+/// input that consumes `(tx_hash, output_index)` can be recognized as that
+/// covenant's spend. Written on each `CovenantLocked` detector hit and
+/// versioned by the locking block's DAA, so a reorg unwinds it alongside
+/// the entity versions and POI committed at the same height.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovenantUtxoRecord {
+    pub subgraph: SubgraphId,
+    pub tx_hash: String,
+    pub output_index: i32,
+    pub block_daa_score: i64,
+    /// Detector discriminant name (e.g. `"OpenSilverVault"`). Resolves the
+    /// `CovenantSpent` handler when this UTXO is spent.
+    pub detector_kind: String,
+    pub covenant_id: Option<String>,
+    /// The locked covenant's detector payload — becomes the `state` half of
+    /// the spend event's `{ spend, state }` payload.
+    pub locked_state: serde_json::Value,
+}
+
+/// The covenant identified by a spend-input lookup: enough to resolve the
+/// `CovenantSpent` handler (by `detector_kind`) and build the spend event
+/// (the locked `state` and the covenant id).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovenantUtxoMatch {
+    pub detector_kind: String,
+    pub covenant_id: Option<String>,
+    pub locked_state: serde_json::Value,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -226,6 +256,23 @@ impl Store {
             schema
         );
         sqlx::query(&create_entities_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        let create_covenant_utxos_sql = format!(
+            "CREATE TABLE IF NOT EXISTS \"{}\".covenant_utxos (\
+                tx_hash TEXT NOT NULL,\
+                output_index INTEGER NOT NULL,\
+                block_daa_score BIGINT NOT NULL,\
+                detector_kind TEXT NOT NULL,\
+                covenant_id TEXT,\
+                locked_state JSONB NOT NULL,\
+                PRIMARY KEY (tx_hash, output_index)\
+            )",
+            schema
+        );
+        sqlx::query(&create_covenant_utxos_sql)
             .execute(&self.pool)
             .await
             .map_err(|err| StoreError::Query(err.to_string()))?;
@@ -500,6 +547,71 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Record a covenant UTXO produced by a `CovenantLocked` hit so a later
+    /// spend of `(tx_hash, output_index)` can be recognized. Idempotent on
+    /// the outpoint, so re-applying a block during recovery overwrites
+    /// rather than duplicates.
+    pub async fn track_covenant_utxo(
+        &self,
+        record: &CovenantUtxoRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(&track_covenant_utxo_sql(record.subgraph.schema_name()))
+            .bind(&record.tx_hash)
+            .bind(record.output_index)
+            .bind(record.block_daa_score)
+            .bind(&record.detector_kind)
+            .bind(record.covenant_id.as_ref())
+            .bind(&record.locked_state)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Look up the covenant a transaction input consumes, by its previous
+    /// outpoint `(tx_hash, output_index)`. `Some` means the input spends a
+    /// tracked covenant UTXO — the caller dispatches its `CovenantSpent`
+    /// handler. `None` means the input consumes an ordinary (non-covenant)
+    /// UTXO and is skipped.
+    pub async fn lookup_covenant_utxo(
+        &self,
+        subgraph: &SubgraphId,
+        tx_hash: &str,
+        output_index: i32,
+    ) -> Result<Option<CovenantUtxoMatch>, StoreError> {
+        let row: Option<(String, Option<String>, serde_json::Value)> =
+            sqlx::query_as(&lookup_covenant_utxo_sql(subgraph.schema_name()))
+                .bind(tx_hash)
+                .bind(output_index)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.map(|(detector_kind, covenant_id, locked_state)| CovenantUtxoMatch {
+            detector_kind,
+            covenant_id,
+            locked_state,
+        }))
+    }
+
+    /// Drop every covenant UTXO locked at or above `from_daa`, part of a
+    /// reorg unwind. Mirrors the entity-version/POI rollback so the same
+    /// chain bytes reproduce the same tracker state. Returns rows removed.
+    pub async fn unwind_covenant_utxos(
+        &self,
+        subgraph: &SubgraphId,
+        from_daa: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(&unwind_covenant_utxos_sql(subgraph.schema_name()))
+            .bind(from_daa)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -650,6 +762,37 @@ fn unwind_entity_versions_sql(schema: &str) -> String {
     format!("DELETE FROM \"{schema}\".entity_versions WHERE block_daa_score >= $1")
 }
 
+// ---- covenant_utxos SQL builders ---------------------------------------
+//
+// Same injection-safety argument as the entity_versions builders: `schema`
+// is a validated `SubgraphId`. Pure functions so the SQL is unit-testable.
+
+fn track_covenant_utxo_sql(schema: &str) -> String {
+    format!(
+        "INSERT INTO \"{schema}\".covenant_utxos \
+         (tx_hash, output_index, block_daa_score, detector_kind, covenant_id, locked_state) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (tx_hash, output_index) \
+         DO UPDATE SET \
+             block_daa_score = EXCLUDED.block_daa_score, \
+             detector_kind = EXCLUDED.detector_kind, \
+             covenant_id = EXCLUDED.covenant_id, \
+             locked_state = EXCLUDED.locked_state"
+    )
+}
+
+fn lookup_covenant_utxo_sql(schema: &str) -> String {
+    format!(
+        "SELECT detector_kind, covenant_id, locked_state \
+         FROM \"{schema}\".covenant_utxos \
+         WHERE tx_hash = $1 AND output_index = $2"
+    )
+}
+
+fn unwind_covenant_utxos_sql(schema: &str) -> String {
+    format!("DELETE FROM \"{schema}\".covenant_utxos WHERE block_daa_score >= $1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +849,30 @@ mod tests {
     fn unwind_entity_versions_sql_deletes_at_or_above_the_cutoff() {
         let sql = unwind_entity_versions_sql("network_stats");
         assert!(sql.contains("DELETE FROM \"network_stats\".entity_versions"));
+        assert!(sql.contains("WHERE block_daa_score >= $1"));
+    }
+
+    #[test]
+    fn track_covenant_utxo_sql_targets_the_schema_and_is_idempotent_on_outpoint() {
+        let sql = track_covenant_utxo_sql("kasbonds");
+        assert!(sql.contains("\"kasbonds\".covenant_utxos"));
+        assert!(sql.contains("(tx_hash, output_index, block_daa_score, detector_kind, covenant_id, locked_state)"));
+        assert!(sql.contains("ON CONFLICT (tx_hash, output_index)"));
+        assert!(sql.contains("locked_state = EXCLUDED.locked_state"));
+    }
+
+    #[test]
+    fn lookup_covenant_utxo_sql_reads_by_outpoint() {
+        let sql = lookup_covenant_utxo_sql("krc20");
+        assert!(sql.contains("SELECT detector_kind, covenant_id, locked_state"));
+        assert!(sql.contains("\"krc20\".covenant_utxos"));
+        assert!(sql.contains("WHERE tx_hash = $1 AND output_index = $2"));
+    }
+
+    #[test]
+    fn unwind_covenant_utxos_sql_deletes_at_or_above_the_cutoff() {
+        let sql = unwind_covenant_utxos_sql("network_stats");
+        assert!(sql.contains("DELETE FROM \"network_stats\".covenant_utxos"));
         assert!(sql.contains("WHERE block_daa_score >= $1"));
     }
 
