@@ -259,6 +259,26 @@ pub struct CovenantSpendRecord {
 /// exceed `i64::MAX`, so a BIGINT column would silently corrupt large
 /// values. Replay re-parses them through the same strict decimal-u64 path
 /// the envelope parser uses.
+/// The raw row shape returned by the legacy-ledger replay reads. Both the
+/// KRC-20 and KRC-721 fetches select twelve columns of the same SQL types
+/// (the `subgraph` is supplied by the caller, not re-read), differing only
+/// in which two `Option<String>` slots carry which protocol field — so they
+/// share this alias and each method maps the tuple into its own record type.
+type LegacyOpRow = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Krc20LegacyOpRecord {
     pub subgraph: SubgraphId,
@@ -1091,6 +1111,109 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Read a subgraph's accepted legacy KRC-20 ops in replay order. Legacy
+    /// KRC-20 state is a pure function of the accepted op stream, so feeding
+    /// these rows (reconstructed into inscriptions) to `Krc20Ledger::replay`
+    /// rebuilds the ledger on startup or after a reorg unwind. Ordered by
+    /// `(accepting_daa_score, tick, seq)`: a tick's intra-stream order is its
+    /// monotonic `seq`, and inter-tick order is irrelevant since ticks do not
+    /// interact, so the DAA-then-tick-then-seq order is deterministic and
+    /// preserves every tick's acceptance order.
+    pub async fn fetch_krc20_legacy_ops_ordered(
+        &self,
+        subgraph: &SubgraphId,
+    ) -> Result<Vec<Krc20LegacyOpRecord>, StoreError> {
+        let rows: Vec<LegacyOpRow> = sqlx::query_as(&fetch_krc20_legacy_ops_ordered_sql())
+            .bind(subgraph.schema_name())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    tick,
+                    tick_raw,
+                    accepting_block_hash,
+                    seq,
+                    accepting_daa_score,
+                    tx_hash,
+                    op,
+                    sender,
+                    recipient,
+                    amount,
+                    max_supply,
+                    mint_limit,
+                )| Krc20LegacyOpRecord {
+                    subgraph: subgraph.clone(),
+                    tick,
+                    tick_raw,
+                    accepting_block_hash,
+                    seq,
+                    accepting_daa_score,
+                    tx_hash,
+                    op,
+                    sender,
+                    recipient,
+                    amount,
+                    max_supply,
+                    mint_limit,
+                },
+            )
+            .collect())
+    }
+
+    /// Read a subgraph's accepted legacy KRC-721 ops in replay order (the NFT
+    /// parallel of [`Self::fetch_krc20_legacy_ops_ordered`]). Feeding these
+    /// rows to `Krc721Ledger::replay` rebuilds per-token ownership on startup
+    /// or after a reorg unwind. Same `(accepting_daa_score, tick, seq)`
+    /// ordering rationale.
+    pub async fn fetch_krc721_legacy_ops_ordered(
+        &self,
+        subgraph: &SubgraphId,
+    ) -> Result<Vec<Krc721LegacyOpRecord>, StoreError> {
+        let rows: Vec<LegacyOpRow> = sqlx::query_as(&fetch_krc721_legacy_ops_ordered_sql())
+            .bind(subgraph.schema_name())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    tick,
+                    tick_raw,
+                    accepting_block_hash,
+                    seq,
+                    accepting_daa_score,
+                    tx_hash,
+                    op,
+                    sender,
+                    token_id,
+                    recipient,
+                    metadata_uri,
+                    max_supply,
+                )| Krc721LegacyOpRecord {
+                    subgraph: subgraph.clone(),
+                    tick,
+                    tick_raw,
+                    accepting_block_hash,
+                    seq,
+                    accepting_daa_score,
+                    tx_hash,
+                    op,
+                    sender,
+                    token_id,
+                    recipient,
+                    metadata_uri,
+                    max_supply,
+                },
+            )
+            .collect())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -1321,6 +1444,14 @@ fn unwind_krc20_legacy_ledger_sql() -> String {
         .to_string()
 }
 
+fn fetch_krc20_legacy_ops_ordered_sql() -> String {
+    "SELECT tick, tick_raw, accepting_block_hash, seq, accepting_daa_score, tx_hash, op, sender, recipient, amount, max_supply, mint_limit \
+     FROM kasgraph_krc20_legacy_ledger \
+     WHERE subgraph = $1 \
+     ORDER BY accepting_daa_score, tick, seq"
+        .to_string()
+}
+
 // ---- kasgraph_krc721_legacy_ledger SQL builders ------------------------
 //
 // The NFT parallel of the legacy-KRC-20 builders. Also a global table (a
@@ -1337,6 +1468,14 @@ fn record_krc721_legacy_op_sql() -> String {
 
 fn unwind_krc721_legacy_ledger_sql() -> String {
     "DELETE FROM kasgraph_krc721_legacy_ledger WHERE subgraph = $1 AND accepting_daa_score >= $2"
+        .to_string()
+}
+
+fn fetch_krc721_legacy_ops_ordered_sql() -> String {
+    "SELECT tick, tick_raw, accepting_block_hash, seq, accepting_daa_score, tx_hash, op, sender, token_id, recipient, metadata_uri, max_supply \
+     FROM kasgraph_krc721_legacy_ledger \
+     WHERE subgraph = $1 \
+     ORDER BY accepting_daa_score, tick, seq"
         .to_string()
 }
 
@@ -1477,6 +1616,19 @@ mod tests {
     }
 
     #[test]
+    fn fetch_krc20_legacy_ops_ordered_sql_scopes_by_subgraph_in_replay_order() {
+        let sql = fetch_krc20_legacy_ops_ordered_sql();
+        assert!(sql.contains("FROM kasgraph_krc20_legacy_ledger"));
+        // The select column order must match the row tuple the method maps.
+        assert!(sql.contains(
+            "SELECT tick, tick_raw, accepting_block_hash, seq, accepting_daa_score, tx_hash, op, sender, recipient, amount, max_supply, mint_limit"
+        ));
+        assert!(sql.contains("WHERE subgraph = $1"));
+        // Deterministic replay order: DAA, then tick, then per-tick seq.
+        assert!(sql.contains("ORDER BY accepting_daa_score, tick, seq"));
+    }
+
+    #[test]
     fn record_krc721_legacy_op_sql_lists_every_column_and_is_idempotent_on_tx() {
         let sql = record_krc721_legacy_op_sql();
         assert!(sql.contains("INTO kasgraph_krc721_legacy_ledger"));
@@ -1494,6 +1646,17 @@ mod tests {
         let sql = unwind_krc721_legacy_ledger_sql();
         assert!(sql.contains("DELETE FROM kasgraph_krc721_legacy_ledger"));
         assert!(sql.contains("WHERE subgraph = $1 AND accepting_daa_score >= $2"));
+    }
+
+    #[test]
+    fn fetch_krc721_legacy_ops_ordered_sql_scopes_by_subgraph_in_replay_order() {
+        let sql = fetch_krc721_legacy_ops_ordered_sql();
+        assert!(sql.contains("FROM kasgraph_krc721_legacy_ledger"));
+        assert!(sql.contains(
+            "SELECT tick, tick_raw, accepting_block_hash, seq, accepting_daa_score, tx_hash, op, sender, token_id, recipient, metadata_uri, max_supply"
+        ));
+        assert!(sql.contains("WHERE subgraph = $1"));
+        assert!(sql.contains("ORDER BY accepting_daa_score, tick, seq"));
     }
 
     #[test]
