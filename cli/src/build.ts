@@ -29,6 +29,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { validateManifest } from '@kasgraph/sdk';
 
 import type { CliIo } from './index.js';
 
@@ -102,15 +103,28 @@ export async function runBuild(_args: string[], io: CliIo): Promise<number> {
     return 66; // EX_NOINPUT
   }
 
-  let manifest: SubgraphManifest;
+  let parsed: unknown;
   try {
-    manifest = parseYaml(await readFile(manifestPath, 'utf8')) as SubgraphManifest;
+    parsed = parseYaml(await readFile(manifestPath, 'utf8'));
   } catch (err) {
     io.stderr.write(
       `kasgraph build: failed to parse subgraph.yaml: ${errText(err)}\n`,
     );
     return 65; // EX_DATAERR
   }
+
+  // Enforce the documented manifest contract up front so a malformed
+  // subgraph.yaml fails here with a precise locator rather than as a
+  // confusing downstream error (or a node that chokes after deploy).
+  const issues = validateManifest(parsed);
+  if (issues.length > 0) {
+    io.stderr.write('kasgraph build: subgraph.yaml is invalid:\n');
+    for (const issue of issues) {
+      io.stderr.write(`  ${issue.path || '<root>'}: ${issue.message}\n`);
+    }
+    return 65; // EX_DATAERR
+  }
+  const manifest = parsed as SubgraphManifest;
 
   // Map each manifest handler to the mapping file that defines it.
   const handlerFile = new Map<string, string>();

@@ -61,13 +61,16 @@ function manifest(mappingFile = './src/mapping.ts'): string {
     'dataSources:',
     '  - name: cov',
     '    kind: covenant_id',
-    '    network: mainnet',
+    '    network: kaspa-mainnet',
     '    source:',
     '      ids:',
     '        - pattern: OpenSilverVault',
     '        - pattern: OpenSilverOwnable',
     '    mapping:',
+    '      kind: typescript',
     `      file: ${mappingFile}`,
+    '      entities:',
+    '        - Vault',
     '      handlers:',
     '        - event: CovenantLocked',
     '          handler: handleLocked',
@@ -178,9 +181,13 @@ describe('kasgraph build', () => {
       'dataSources:',
       '  - name: cov',
       '    kind: covenant_id',
-      '    network: mainnet',
+      '    network: kaspa-mainnet',
+      '    source: {}',
       '    mapping:',
+      '      kind: typescript',
       '      file: ./src/mapping.ts',
+      '      entities:',
+      '        - Vault',
       '      handlers: []',
       '',
     ].join('\n');
@@ -188,6 +195,29 @@ describe('kasgraph build', () => {
     const io = new CapturedIo(dir);
     expect(await runBuild([], io)).toBe(65);
     expect(io.stderrBuf).toContain('no handlers declared');
+  });
+
+  it('rejects a manifest that violates the documented contract', async () => {
+    // Unknown network + a data-source missing its mapping: the SDK
+    // validator should reject this before any compilation is attempted.
+    const body = [
+      'name: bad',
+      'specVersion: 0.1.0',
+      'schema:',
+      '  file: ./schema.graphql',
+      'dataSources:',
+      '  - name: cov',
+      '    kind: covenant_id',
+      '    network: ethereum',
+      '    source: {}',
+      '',
+    ].join('\n');
+    const dir = await scaffold({ manifestBody: body });
+    const io = new CapturedIo(dir);
+    expect(await runBuild([], io)).toBe(65);
+    expect(io.stderrBuf).toContain('subgraph.yaml is invalid');
+    expect(io.stderrBuf).toContain('dataSources[0].network');
+    expect(io.stderrBuf).toContain('dataSources[0].mapping');
   });
 
   it('surfaces AssemblyScript compile errors with diagnostics', async () => {
