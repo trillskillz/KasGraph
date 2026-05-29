@@ -2,7 +2,14 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-29 — KIP-20 lineage head + rows populated)
+## Latest commit arc (2026-05-29 — KIP-20 lineage population made replay-safe)
+
+Follow-up hardening on the population slice below (commit `566c3c1`, `kasgraph-node` + `kasgraph-store`).
+
+- **Bug:** reconnect re-delivery can re-present an already-ingested hit (the reason `track_covenant_utxo` / `record_covenant_spend` are idempotent). `persist_lineage` was not — replaying a hit re-fetched the *advanced* head and appended a phantom transition at the next `seq`, inflating `lineage_count` and the history.
+- **Fix:** a covenant output is exactly one lineage step, so `(covenant_id, tx_hash, output_index)` is a sound idempotency key. `persist_lineage` now returns early when that step already exists (`Store::covenant_lineage_row_exists`), and a `UNIQUE (covenant_id, tx_hash, output_index)` constraint enforces it at the schema level (and indexes the lookup). 145 cargo + 173 TS tests green; fmt + clippy clean.
+
+## Previous commit arc (2026-05-29 — KIP-20 lineage head + rows populated)
 
 The covenant lineage tables (`kasgraph_covenant_lineage_head` / `_row`) were created in the first store migration but never written; now that `covenant_id` is real (prior arc), the node populates them. One commit (`665124c`, `kasgraph-node` + `kasgraph-store`).
 
