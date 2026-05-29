@@ -1,55 +1,89 @@
-//! Pure operation decoder for native KCC20 asset-covenant spends.
+//! Pure operation decoder for native KCC20 covenant spends.
 //!
-//! A KCC20 asset spend transitions the asset covenant's on-chain state; the
-//! protocol *operation* (transfer / mint / burn / rotate_controller) is **not
-//! tagged on-chain**. It is a pure function of the delta between the spent
-//! asset state and its successor:
+//! KCC20 follows a **per-UTXO receipt** model (OpenSilver Pattern 4.1,
+//! `contracts/tokens/kcc20.sil`): every KCC20 covenant UTXO carries its own
+//! state — `ownerIdentifier` (byte[32]: a pubkey, P2SH script hash, or the
+//! controller's covenant id), `identifierType` (which of those it is),
+//! `amount`, and `isMinter` (the mint-capable branch). There is **no**
+//! aggregate `total_supply` field on chain; supply is the sum of the live
+//! receipts' `amount`s.
 //!
-//!   - `kcc20.sil`'s `checkAmounts` conserves supply across non-minter
-//!     transfers; only a minter branch can change supply. So a rise in the
-//!     asset's `total_supply` is a mint and a fall is a burn.
-//!   - The asset covenant binds its minting authority to a controller via a
-//!     covenant id (`controller_covenant_id`); when supply is unchanged, a
-//!     change to that id is a controller rotation, and no change at all is an
-//!     ordinary transfer.
+//! A spend consumes a set of input receipts (`prevStates`) and produces a set
+//! of output receipts (`newStates`). The protocol *operation* is **not tagged
+//! on-chain** — it is a pure function of the receipt-set delta, per the
+//! `kcc20.sil` invariants:
 //!
-//! This matches the indexer's asset-state model (the `KCC20Asset` registry
-//! fields `controller_covenant_id` / `total_supply` / `mint_nonce`) and the
-//! exact operation strings the `examples/krc20` mapping branches on
-//! (`KRC20_KRC721_REFERENCE.md` §"Native KCC20").
+//!   - `checkAmounts` requires `sum(prev.amount) == sum(new.amount)` on every
+//!     non-minter path; only a minter branch (`isMinter`) may change the sum.
+//!     So a rise in the summed amount is a **mint** and a fall is a **burn**.
+//!   - With supply conserved, the spend either redistributes ownership among
+//!     receipts (a **transfer**) or re-points the minter branch's controller
+//!     binding — the `isMinter` receipt whose `ownerIdentifier` is a
+//!     controller covenant id (`identifierType == COVENANT_ID`). A change to
+//!     that binding is a **controller rotation**.
 //!
-//! The classifier is pure and extraction-agnostic: it takes structured state,
-//! so it is unit-tested today over hand-built states and `from_payload`-parsed
-//! detector payloads. It deliberately is **not yet wired into the node spend
-//! path**: real classification needs the asset state read out of the on-chain
-//! state window, and the fingerprint registry still carries placeholder bytes
-//! (real OpenSilver compiled-script + state-window offsets are a separate,
-//! pending export). Wiring it against placeholder extraction would classify
-//! fake state and mislead the spend mappings, so it lands as a pure core ahead
-//! of that — the same discipline as `krc20_ledger`.
+//! This is the actual reference-contract model (it replaced an earlier
+//! aggregate `total_supply`/`mint_nonce` model that did not match
+//! `kcc20.sil`). The classifier is pure and extraction-agnostic: it takes
+//! structured receipt states, so it is unit-tested today over hand-built
+//! receipts and `from_payload`-parsed detector payloads. It is **not yet
+//! wired into the node spend path**: honest classification needs the receipt
+//! states read out of the on-chain state window, and the fingerprint registry
+//! still carries placeholder bytes (real OpenSilver compiled-script + state
+//! offsets are a separate, pending export). Wiring against placeholder
+//! extraction would classify fake state and mislead the spend mappings, so it
+//! lands as a pure core — the same discipline as `krc20_ledger`.
+
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-/// The asset-covenant state the indexer reads from a KCC20 asset's on-chain
-/// state window — the subset of the `KCC20Asset` registry fields the operation
-/// classification depends on (`decimals` is irrelevant to the operation).
+/// `identifierType == COVENANT_ID` — the `ownerIdentifier` is a controller
+/// covenant id rather than a pubkey/script hash (`kcc20.sil` constant
+/// `IDENTIFIER_COVENANT_ID`).
+pub const IDENTIFIER_COVENANT_ID: u8 = 0x02;
+
+/// One KCC20 covenant receipt's on-chain state — the `KCC20Asset` state window
+/// the indexer extracts, matching the `kcc20.sil` per-UTXO layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Kcc20AssetState {
-    /// Covenant id of the bound controller, hex (registry field
-    /// `controller_covenant_id`). A change with supply held constant is a
-    /// controller rotation.
-    pub controller_covenant_id: String,
-    /// Total minted supply (registry field `total_supply`, a 16-byte big-endian
-    /// `u128`). Its delta distinguishes mint (up) from burn (down).
-    pub total_supply: u128,
-    /// Monotonic mint counter (registry field `mint_nonce`, an 8-byte
-    /// big-endian `u64`). Carried for completeness / future cross-checks.
-    pub mint_nonce: u64,
+pub struct Kcc20ReceiptState {
+    /// `byte[32]`: a holder pubkey, a P2SH script hash, or a controller
+    /// covenant id, disambiguated by [`Self::identifier_type`]. Hex; only ever
+    /// compared for equality, never interpreted.
+    pub owner_identifier: String,
+    /// `0x00` PUBKEY | `0x01` SCRIPT_HASH | `0x02` COVENANT_ID.
+    pub identifier_type: u8,
+    /// This receipt's token amount. Supply is the sum across live receipts.
+    pub amount: u128,
+    /// Whether this is the mint-capable branch (`kcc20.sil` `isMinter`). Only
+    /// minter branches may change the summed amount.
+    pub is_minter: bool,
 }
 
-/// The protocol operation a KCC20 asset spend performed. The string forms
-/// match the codegen `CovenantSpend.operation` values the spend mappings
-/// branch on.
+impl Kcc20ReceiptState {
+    /// Parse one receipt from a detector hit payload — the hex-string field
+    /// map `kasgraph_detectors::payload_to_json` produces for a `KCC20Asset`
+    /// match (`owner_identifier` / `identifier_type` / `amount` / `is_minter`).
+    /// Numeric fields are big-endian hex of their declared width; `is_minter`
+    /// is a 1-byte flag (any non-zero byte = true).
+    pub fn from_payload(payload: &Value) -> Result<Self, Kcc20DecodeError> {
+        Ok(Self {
+            owner_identifier: hex_str(payload, "owner_identifier")?.to_owned(),
+            identifier_type: hex_be(payload, "identifier_type", 1)? as u8,
+            amount: hex_be(payload, "amount", 16)?,
+            is_minter: hex_be(payload, "is_minter", 1)? != 0,
+        })
+    }
+
+    /// Whether this receipt is the minter branch bound to a controller covenant
+    /// — the receipt whose `ownerIdentifier` is a controller covenant id.
+    fn is_controller_binding(&self) -> bool {
+        self.is_minter && self.identifier_type == IDENTIFIER_COVENANT_ID
+    }
+}
+
+/// The protocol operation a KCC20 spend performed. The string forms match the
+/// codegen `CovenantSpend.operation` values the spend mappings branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kcc20Operation {
     Transfer,
@@ -70,51 +104,56 @@ impl Kcc20Operation {
     }
 }
 
-/// Why a KCC20 asset state could not be parsed from a detector payload.
+/// Why a KCC20 receipt could not be parsed from a detector payload.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Kcc20DecodeError {
-    #[error("missing field `{0}` in KCC20 asset payload")]
+    #[error("missing field `{0}` in KCC20 receipt payload")]
     MissingField(&'static str),
-    #[error("field `{0}` is not valid hex in KCC20 asset payload")]
+    #[error("field `{0}` is not valid hex in KCC20 receipt payload")]
     NotHex(&'static str),
-    #[error("field `{0}` is wider than its integer type in KCC20 asset payload")]
+    #[error("field `{0}` is wider than its declared width in KCC20 receipt payload")]
     Overflow(&'static str),
 }
 
-impl Kcc20AssetState {
-    /// Parse the asset state from a detector hit payload — the hex-string field
-    /// map `kasgraph_detectors::payload_to_json` produces for a `KCC20Asset`
-    /// match. Numeric fields are big-endian hex of their fixed byte width;
-    /// `controller_covenant_id` is kept as its raw hex string (it is only ever
-    /// compared for equality, never interpreted).
-    pub fn from_payload(payload: &Value) -> Result<Self, Kcc20DecodeError> {
-        Ok(Self {
-            controller_covenant_id: hex_str(payload, "controller_covenant_id")?.to_owned(),
-            total_supply: hex_be_u128(payload, "total_supply")?,
-            mint_nonce: hex_be_u64(payload, "mint_nonce")? as u64,
-        })
-    }
-}
-
-/// Classify a KCC20 asset spend from the state delta. Operations are mutually
-/// exclusive per spend (one operation per transition): a `total_supply`
-/// increase is a mint and a decrease is a burn; with supply unchanged, a
-/// change to `controller_covenant_id` is a controller rotation and otherwise
-/// the spend is a plain transfer. Supply is checked first so a (hypothetical)
-/// mint that also touched the controller binding is still reported as a mint.
-pub fn classify_kcc20_asset_operation(
-    prior: &Kcc20AssetState,
-    next: &Kcc20AssetState,
+/// Classify a KCC20 spend from the input/output receipt-set delta. Operations
+/// are mutually exclusive per spend: a rise in the summed `amount` is a mint
+/// and a fall is a burn (only a minter branch can change the sum, per
+/// `kcc20.sil` `checkAmounts`); with the sum conserved, a change to the minter
+/// branch's controller binding (`isMinter` + `identifierType == COVENANT_ID`
+/// `ownerIdentifier`) is a controller rotation, and otherwise the spend is a
+/// transfer. Supply delta is checked first so a mint that also re-points the
+/// controller still reports as a mint.
+pub fn classify_kcc20_operation(
+    prev: &[Kcc20ReceiptState],
+    next: &[Kcc20ReceiptState],
 ) -> Kcc20Operation {
     use std::cmp::Ordering::{Equal, Greater, Less};
-    match next.total_supply.cmp(&prior.total_supply) {
+    let total_in = sum_amounts(prev);
+    let total_out = sum_amounts(next);
+    match total_out.cmp(&total_in) {
         Greater => Kcc20Operation::Mint,
         Less => Kcc20Operation::Burn,
-        Equal if next.controller_covenant_id != prior.controller_covenant_id => {
+        Equal if controller_bindings(prev) != controller_bindings(next) => {
             Kcc20Operation::RotateController
         }
         Equal => Kcc20Operation::Transfer,
     }
+}
+
+fn sum_amounts(receipts: &[Kcc20ReceiptState]) -> u128 {
+    receipts
+        .iter()
+        .fold(0u128, |acc, r| acc.saturating_add(r.amount))
+}
+
+/// The set of controller covenant ids bound on the minter branches. A change
+/// to this set (with supply conserved) is a controller rotation.
+fn controller_bindings(receipts: &[Kcc20ReceiptState]) -> BTreeSet<&str> {
+    receipts
+        .iter()
+        .filter(|r| r.is_controller_binding())
+        .map(|r| r.owner_identifier.as_str())
+        .collect()
 }
 
 fn hex_str<'a>(payload: &'a Value, field: &'static str) -> Result<&'a str, Kcc20DecodeError> {
@@ -124,22 +163,16 @@ fn hex_str<'a>(payload: &'a Value, field: &'static str) -> Result<&'a str, Kcc20
         .ok_or(Kcc20DecodeError::MissingField(field))
 }
 
-/// Decode a big-endian hex field into a `u128`, rejecting input wider than 16
-/// bytes (the field's declared width).
-fn hex_be_u128(payload: &Value, field: &'static str) -> Result<u128, Kcc20DecodeError> {
+/// Decode a big-endian hex field into a `u128`, rejecting input wider than
+/// `max_bytes` (the field's declared width).
+fn hex_be(
+    payload: &Value,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<u128, Kcc20DecodeError> {
     let bytes =
         hex::decode(hex_str(payload, field)?).map_err(|_| Kcc20DecodeError::NotHex(field))?;
-    if bytes.len() > 16 {
-        return Err(Kcc20DecodeError::Overflow(field));
-    }
-    Ok(bytes.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128))
-}
-
-/// Decode a big-endian hex field into a `u128` bounded to 8 bytes (a `u64`).
-fn hex_be_u64(payload: &Value, field: &'static str) -> Result<u128, Kcc20DecodeError> {
-    let bytes =
-        hex::decode(hex_str(payload, field)?).map_err(|_| Kcc20DecodeError::NotHex(field))?;
-    if bytes.len() > 8 {
+    if bytes.len() > max_bytes {
         return Err(Kcc20DecodeError::Overflow(field));
     }
     Ok(bytes.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128))
@@ -150,11 +183,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn state(controller: &str, supply: u128, nonce: u64) -> Kcc20AssetState {
-        Kcc20AssetState {
-            controller_covenant_id: controller.into(),
-            total_supply: supply,
-            mint_nonce: nonce,
+    fn receipt(owner: &str, id_type: u8, amount: u128, is_minter: bool) -> Kcc20ReceiptState {
+        Kcc20ReceiptState {
+            owner_identifier: owner.into(),
+            identifier_type: id_type,
+            amount,
+            is_minter,
         }
     }
 
@@ -170,115 +204,117 @@ mod tests {
     }
 
     #[test]
-    fn supply_increase_is_a_mint() {
-        let prior = state("aa", 1_000, 4);
-        let next = state("aa", 1_500, 5);
-        assert_eq!(
-            classify_kcc20_asset_operation(&prior, &next),
-            Kcc20Operation::Mint
-        );
+    fn summed_amount_increase_is_a_mint() {
+        // A minter branch mints 500 into a holder receipt: 1000 in -> 1500 out.
+        let prev = [receipt("ctrl", IDENTIFIER_COVENANT_ID, 1000, true)];
+        let next = [
+            receipt("ctrl", IDENTIFIER_COVENANT_ID, 1000, true),
+            receipt("alice", 0, 500, false),
+        ];
+        assert_eq!(classify_kcc20_operation(&prev, &next), Kcc20Operation::Mint);
     }
 
     #[test]
-    fn supply_decrease_is_a_burn() {
-        let prior = state("aa", 1_000, 5);
-        let next = state("aa", 700, 5);
-        assert_eq!(
-            classify_kcc20_asset_operation(&prior, &next),
-            Kcc20Operation::Burn
-        );
+    fn summed_amount_decrease_is_a_burn() {
+        let prev = [receipt("alice", 0, 1000, false)];
+        let next = [receipt("alice", 0, 700, false)];
+        assert_eq!(classify_kcc20_operation(&prev, &next), Kcc20Operation::Burn);
     }
 
     #[test]
-    fn conserved_supply_with_controller_change_is_a_rotation() {
-        let prior = state("aa", 1_000, 5);
-        let next = state("bb", 1_000, 5);
+    fn conserved_supply_with_ownership_change_is_a_transfer() {
+        // Alice's 1000 receipt splits into 600 (alice) + 400 (bob); sum held.
+        let prev = [receipt("alice", 0, 1000, false)];
+        let next = [
+            receipt("alice", 0, 600, false),
+            receipt("bob", 0, 400, false),
+        ];
         assert_eq!(
-            classify_kcc20_asset_operation(&prior, &next),
-            Kcc20Operation::RotateController
-        );
-    }
-
-    #[test]
-    fn conserved_supply_and_controller_is_a_transfer() {
-        let prior = state("aa", 1_000, 5);
-        let next = state("aa", 1_000, 5);
-        assert_eq!(
-            classify_kcc20_asset_operation(&prior, &next),
+            classify_kcc20_operation(&prev, &next),
             Kcc20Operation::Transfer
         );
     }
 
     #[test]
-    fn supply_delta_takes_precedence_over_a_controller_change() {
-        // A mint that also re-pointed the controller still reports as a mint.
-        let prior = state("aa", 1_000, 5);
-        let next = state("bb", 2_000, 6);
+    fn conserved_supply_with_controller_rebinding_is_a_rotation() {
+        // The minter branch re-points from controller "ctrl-a" to "ctrl-b".
+        let prev = [receipt("ctrl-a", IDENTIFIER_COVENANT_ID, 1000, true)];
+        let next = [receipt("ctrl-b", IDENTIFIER_COVENANT_ID, 1000, true)];
         assert_eq!(
-            classify_kcc20_asset_operation(&prior, &next),
-            Kcc20Operation::Mint
+            classify_kcc20_operation(&prev, &next),
+            Kcc20Operation::RotateController
         );
+    }
+
+    #[test]
+    fn a_holder_owner_change_alone_is_not_a_rotation() {
+        // A non-minter owner change is an ordinary transfer, not a rotation —
+        // only the minter/controller binding distinguishes rotation.
+        let prev = [receipt("alice", 0, 1000, false)];
+        let next = [receipt("bob", 0, 1000, false)];
+        assert_eq!(
+            classify_kcc20_operation(&prev, &next),
+            Kcc20Operation::Transfer
+        );
+    }
+
+    #[test]
+    fn supply_delta_takes_precedence_over_a_controller_rebinding() {
+        let prev = [receipt("ctrl-a", IDENTIFIER_COVENANT_ID, 1000, true)];
+        let next = [receipt("ctrl-b", IDENTIFIER_COVENANT_ID, 2000, true)];
+        assert_eq!(classify_kcc20_operation(&prev, &next), Kcc20Operation::Mint);
     }
 
     #[test]
     fn from_payload_parses_the_hex_field_map() {
-        // total_supply = 16-byte BE for 0x0100 = 256; mint_nonce = 8-byte BE 3.
         let payload = json!({
-            "controller_covenant_id": "ab".repeat(32),
-            "decimals": "08",
-            "total_supply": "00000000000000000000000000000100",
-            "mint_nonce": "0000000000000003",
+            "owner_identifier": "ab".repeat(32),
+            "identifier_type": "02",
+            "amount": "00000000000000000000000000000100", // 256
+            "is_minter": "01",
         });
-        let parsed = Kcc20AssetState::from_payload(&payload).unwrap();
-        assert_eq!(parsed.controller_covenant_id, "ab".repeat(32));
-        assert_eq!(parsed.total_supply, 256);
-        assert_eq!(parsed.mint_nonce, 3);
+        let parsed = Kcc20ReceiptState::from_payload(&payload).unwrap();
+        assert_eq!(parsed.owner_identifier, "ab".repeat(32));
+        assert_eq!(parsed.identifier_type, IDENTIFIER_COVENANT_ID);
+        assert_eq!(parsed.amount, 256);
+        assert!(parsed.is_minter);
     }
 
     #[test]
     fn from_payload_round_trips_into_classification() {
-        let prior_payload = json!({
-            "controller_covenant_id": "aa",
-            "total_supply": "0a", // 10
-            "mint_nonce": "01",
+        let prev_p = json!({
+            "owner_identifier": "alice", "identifier_type": "00",
+            "amount": "0a", "is_minter": "00", // 10
         });
-        let next_payload = json!({
-            "controller_covenant_id": "aa",
-            "total_supply": "14", // 20
-            "mint_nonce": "02",
+        let next_p = json!({
+            "owner_identifier": "alice", "identifier_type": "00",
+            "amount": "14", "is_minter": "00", // 20
         });
-        let prior = Kcc20AssetState::from_payload(&prior_payload).unwrap();
-        let next = Kcc20AssetState::from_payload(&next_payload).unwrap();
-        assert_eq!(
-            classify_kcc20_asset_operation(&prior, &next).as_str(),
-            "mint"
-        );
+        let prev = [Kcc20ReceiptState::from_payload(&prev_p).unwrap()];
+        let next = [Kcc20ReceiptState::from_payload(&next_p).unwrap()];
+        assert_eq!(classify_kcc20_operation(&prev, &next).as_str(), "mint");
     }
 
     #[test]
     fn from_payload_rejects_missing_non_hex_and_oversized_fields() {
-        // Missing total_supply.
-        let missing = json!({ "controller_covenant_id": "aa", "mint_nonce": "01" });
+        let missing =
+            json!({ "owner_identifier": "aa", "identifier_type": "00", "is_minter": "00" });
         assert_eq!(
-            Kcc20AssetState::from_payload(&missing),
-            Err(Kcc20DecodeError::MissingField("total_supply"))
+            Kcc20ReceiptState::from_payload(&missing),
+            Err(Kcc20DecodeError::MissingField("amount"))
         );
-        // Non-hex total_supply.
-        let bad =
-            json!({ "controller_covenant_id": "aa", "total_supply": "zz", "mint_nonce": "01" });
+        let bad = json!({ "owner_identifier": "aa", "identifier_type": "00", "amount": "zz", "is_minter": "00" });
         assert_eq!(
-            Kcc20AssetState::from_payload(&bad),
-            Err(Kcc20DecodeError::NotHex("total_supply"))
+            Kcc20ReceiptState::from_payload(&bad),
+            Err(Kcc20DecodeError::NotHex("amount"))
         );
-        // total_supply wider than 16 bytes overflows the u128 field.
         let big = json!({
-            "controller_covenant_id": "aa",
-            "total_supply": "00".repeat(17),
-            "mint_nonce": "01",
+            "owner_identifier": "aa", "identifier_type": "00",
+            "amount": "00".repeat(17), "is_minter": "00",
         });
         assert_eq!(
-            Kcc20AssetState::from_payload(&big),
-            Err(Kcc20DecodeError::Overflow("total_supply"))
+            Kcc20ReceiptState::from_payload(&big),
+            Err(Kcc20DecodeError::Overflow("amount"))
         );
     }
 }

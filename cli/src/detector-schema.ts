@@ -123,10 +123,10 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
   {
     kind: "KCC20Asset",
     fields: [
-      { name: "controller_covenant_id", byteLen: 32 },
-      { name: "decimals", byteLen: 1 },
-      { name: "total_supply", byteLen: 16 },
-      { name: "mint_nonce", byteLen: 8 },
+      { name: "owner_identifier", byteLen: 32 },
+      { name: "identifier_type", byteLen: 1 },
+      { name: "amount", byteLen: 16 },
+      { name: "is_minter", byteLen: 1 },
     ],
   },
   {

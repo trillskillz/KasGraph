@@ -79,16 +79,16 @@ The KCC20 family — sourced from the sibling **OpenSilver** repo's `contracts/t
 
 ### KCC20 architecture
 
-A KCC20 token consists of **two** covenant instances:
+A KCC20 token consists of **two** kinds of covenant:
 
-1. **The asset covenant** (`contracts/tokens/kcc20.sil` in OpenSilver). One per token. Holds total supply, decimals, the controller pubkey, and an internal "mint nonce." All transfers, mints, and burns transition this covenant's state. Indexable by a single covenant id.
-2. **A controller covenant** (`kcc20-ownable.sil`, `kcc20-pausable.sil`, `kcc20-capped.sil`, `kcc20-vesting.sil`). Optional. Bound to the asset covenant via `validateOutputStateWithTemplate`. Controls who can mint and under what conditions. The asset covenant defers minting authority to whichever controller's covenant id is recorded in its state.
+1. **The asset covenant** (`contracts/tokens/kcc20.sil` in OpenSilver, Pattern 4.1). This is a **per-UTXO receipt** state machine, **not** an aggregate. Each KCC20 covenant UTXO carries its own state — `ownerIdentifier` (`byte[32]`: a holder pubkey, a P2SH script hash, or a controller covenant id), `identifierType` (which of those), `amount`, and `isMinter` (the mint-capable branch). There is **no** stored `total_supply`/`mint_nonce` field: the token's supply is the **sum of the live receipts' `amount`s**, and minting authority is bound by the minter branch carrying the controller's covenant id in `ownerIdentifier` (`identifierType == COVENANT_ID`). A spend consumes a set of input receipts and produces a set of output receipts; `kcc20.sil`'s `checkAmounts` requires `sum(in) == sum(out)` on every non-minter path.
+2. **A controller covenant** (`kcc20-ownable.sil`, `kcc20-pausable.sil`, `kcc20-capped.sil`, `kcc20-vesting.sil`). Optional. Bound to the asset's minter branch via covenant-id ownership (`validateOutputStateWithTemplate`). Controls who can mint and under what conditions.
 
-For indexing purposes this means **two lineages** per token: the asset's lineage (every supply change), and the controller's lineage (every authority rotation, pause/unpause, cap remaining, etc.). KasGraph indexes both and exposes them as `Token { id, assetCovenantId, controllerCovenantId, controllerKind }`.
+**Operation inference.** Because the operation is not tagged on chain, the indexer derives it from the receipt-set delta (`kasgraph_detectors::kcc20_operation::classify_kcc20_operation`): a rise in the summed `amount` is a **mint** and a fall is a **burn** (only a minter branch may change the sum); with the sum conserved, a change to the minter branch's controller binding is a **rotate_controller** and otherwise the spend is a **transfer**. For indexing this still yields **two lineages** per token: the asset's (every supply/ownership change across its receipts) and the controller's (authority rotation, pause/unpause, cap remaining, …). KasGraph exposes them as `Token { id, assetCovenantId, controllerCovenantId, controllerKind }`.
 
 ### Per-holder balances
 
-Native KCC20 does **not** store a global balance table on chain. Instead each holder has an individual **balance receipt** UTXO whose script binds (asset_covenant_id, holder_pubkey, amount) and whose redemption rules require co-spending with the asset covenant. KasGraph indexes balance-receipt UTXOs in their own table:
+Native KCC20 does **not** store a global balance table on chain. As above, each holder's balance simply *is* a KCC20 asset-covenant (receipt) UTXO — its `ownerIdentifier` is the holder and its `amount` is the balance. The token's supply is the sum of these live receipts. KasGraph maintains a current-owner **projection** over them so balance queries don't have to walk the UTXO set (`holder_pubkey` here is the receipt's `ownerIdentifier`):
 
 ```sql
 CREATE TABLE kasgraph_kcc20_balance (

@@ -39,7 +39,7 @@ pub mod registry;
 
 pub use fingerprint::{Fingerprint, MaskedWindow};
 pub use kcc20_operation::{
-    classify_kcc20_asset_operation, Kcc20AssetState, Kcc20DecodeError, Kcc20Operation,
+    classify_kcc20_operation, Kcc20DecodeError, Kcc20Operation, Kcc20ReceiptState,
 };
 pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 pub use krc20_ledger::{ApplyOutcome, Krc20Ledger, TokenState};

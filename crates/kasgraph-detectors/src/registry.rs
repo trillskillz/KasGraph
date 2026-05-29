@@ -138,15 +138,16 @@ fn build_registry() -> Vec<DetectorEntry> {
                 ("period_blocks", 8),
             ],
         ),
-        // Native KCC20.
+        // Native KCC20 — per-UTXO receipt state (kcc20.sil Pattern 4.1):
+        // each covenant UTXO carries its own owner / amount / minter flag.
         opensilver(
             DetectorKind::KCC20Asset,
             0x20,
             &[
-                ("controller_covenant_id", 32),
-                ("decimals", 1),
-                ("total_supply", 16),
-                ("mint_nonce", 8),
+                ("owner_identifier", 32),
+                ("identifier_type", 1),
+                ("amount", 16),
+                ("is_minter", 1),
             ],
         ),
         opensilver(
@@ -285,11 +286,12 @@ fn field_label(kind: DetectorKind, raw: &str) -> &'static str {
         "worker_root",
         "worker_count",
         "period_blocks",
-        // KCC20
-        "controller_covenant_id",
-        "decimals",
-        "total_supply",
-        "mint_nonce",
+        // KCC20 asset (per-UTXO receipt state)
+        "owner_identifier",
+        "identifier_type",
+        "amount",
+        "is_minter",
+        // KCC20 controllers
         "asset_covenant_id",
         "paused_flag",
         "remaining_allowance",
