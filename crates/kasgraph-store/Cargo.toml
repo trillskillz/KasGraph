@@ -14,3 +14,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 sqlx.workspace = true
+
+[features]
+# Real-Postgres integration tests (`tests/integration_pg.rs`). Off by
+# default so `cargo test --workspace` stays green without a database (CI
+# has no Postgres). Run locally against a live server with:
+#   DATABASE_URL=postgres://user:pw@host:port/db \
+#     cargo test -p kasgraph-store --features integration-pg
+integration-pg = []
