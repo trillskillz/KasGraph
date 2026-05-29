@@ -2612,3 +2612,153 @@ mod tests {
         }
     }
 }
+
+/// End-to-end coverage of the Phase 2.8 persist loop against live Postgres:
+/// drives `apply_and_persist_notification` with a real committed-block
+/// notification through a loaded mapping, and asserts the *persisted* POI
+/// checkpoint equals `compute_poi` over `canonical_bytes_for_entities` of the
+/// dispatched entities — closing the gap the unit tests leave (they cover the
+/// pieces, not the loop wiring). Gated behind `integration-pg` (off by
+/// default); run with:
+///   DATABASE_URL=postgres://kasgraph:kasgraph@127.0.0.1:5434/kasgraph \
+///     cargo test -p kasgraph-node --features integration-pg
+#[cfg(all(test, feature = "integration-pg"))]
+mod integration_pg_persist {
+    use super::*;
+    use kasgraph_detectors::{registry, DetectorKind};
+    use kasgraph_rpc::{ChainNotification, IngestedBlock, IngestedTransactionOutput};
+    use sqlx::PgPool;
+    use std::path::PathBuf;
+
+    // handleLock unconditionally emits a fixed Bond/b1 entity, so a committed
+    // OpenSilverOwnable hit dispatches a known entity we can hash into the
+    // expected POI independently of the (ignored) event payload.
+    const EMIT_WAT: &str = r#"
+        (module
+          (import "kasgraph" "store_set" (func $store_set (param i32 i32)))
+          (memory (export "memory") 1)
+          (global $heap (mut i32) (i32.const 1024))
+          (func (export "kasgraph_alloc") (param $len i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+            (local.get $p))
+          (data (i32.const 0) "{\"entity\":\"Bond\",\"id\":\"b1\",\"data\":{\"n\":7}}")
+          (func (export "handleLock") (param i32 i32)
+            (call $store_set (i32.const 0) (i32.const 42))))
+    "#;
+
+    fn write_fixture() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("kasgraph_persistit_{}_{nanos}", std::process::id()));
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let manifest = r#"{ "name":"itest", "wasm":"mapping.wasm", "dataSources":[
+            { "name":"d", "kind":"covenant_id", "patterns":["OpenSilverOwnable"],
+              "collection":null, "addresses":[],
+              "handlers":[{"event":"CovenantLocked","handler":"handleLock"}] } ]}"#;
+        std::fs::write(build.join("manifest.json"), manifest).unwrap();
+        std::fs::write(build.join("mapping.wasm"), EMIT_WAT).unwrap();
+        dir
+    }
+
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn persist_loop_commits_poi_over_dispatched_entities(pool: PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg = SubgraphId::new("itest_persist_poi").unwrap();
+        store.ensure_subgraph_schema(&sg).await.unwrap();
+
+        let dir = write_fixture();
+        let mapping = mapping_host::LoadedMapping::load(sg.clone(), &dir).unwrap();
+
+        // A finalized block whose one output matches the OpenSilverOwnable
+        // fingerprint → exactly one committed detector hit → handleLock fires.
+        let script = registry::all()
+            .iter()
+            .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
+            .expect("OpenSilverOwnable registered")
+            .fingerprint
+            .bytes
+            .clone();
+        let ingested = IngestedBlock {
+            hash: "blk-1".into(),
+            daa_score: 100,
+            blue_score: 100,
+            is_finalized: true,
+            served_by: "primary".into(),
+            outputs: vec![IngestedTransactionOutput {
+                tx_hash: "tx-a".into(),
+                output_index: 0,
+                script_public_key: script,
+                value: 1,
+            }],
+            inputs: Vec::new(),
+            payloads: Vec::new(),
+        };
+
+        let mut ingestion = IngestionState::default();
+        let outcome = apply_and_persist_notification(
+            &store,
+            &sg,
+            &mut ingestion,
+            ChainNotification::BlockAdded(ingested),
+            None,
+            Some(&mapping),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.committed_count, 1);
+
+        // Independently recompute the POI the loop should have committed:
+        // compute_poi(genesis, canonical_bytes_for_entities([Bond/b1={"n":7}])).
+        let dispatched = vec![EntityVersionRecord {
+            subgraph: sg.clone(),
+            entity_type: "Bond".into(),
+            entity_id: "b1".into(),
+            block_daa_score: 100,
+            payload: serde_json::json!({ "n": 7 }),
+        }];
+        let expected_bytes = mapping_host::canonical_bytes_for_entities(&dispatched);
+        let expected_poi = compute_poi(&PoiHash::default(), &expected_bytes).unwrap();
+
+        // The persisted checkpoint hashes the dispatched entity state, and the
+        // in-memory chain advanced to it.
+        let latest = store
+            .latest_poi_for_subgraph(&sg)
+            .await
+            .unwrap()
+            .expect("a POI checkpoint was written");
+        assert_eq!(latest.block_daa_score, 100);
+        assert_eq!(
+            latest.poi_hash, expected_poi,
+            "persisted POI must hash the dispatched entity state, not a scaffold"
+        );
+        assert_eq!(
+            ingestion.prior_poi, expected_poi,
+            "the in-memory POI chain advanced to the committed checkpoint"
+        );
+
+        // Sanity: dispatch actually ran and persisted the entity.
+        assert_eq!(
+            store.latest_entity(&sg, "Bond", "b1").await.unwrap(),
+            Some(serde_json::json!({ "n": 7 }))
+        );
+
+        // A third party can verify the one-block chain from genesis.
+        let checkpoints = [kasgraph_poi::PoiCheckpoint {
+            canonical_entity_bytes: &expected_bytes,
+            expected_poi,
+        }];
+        assert!(matches!(
+            kasgraph_poi::verify_poi_chain(&checkpoints).unwrap(),
+            kasgraph_poi::PoiVerification::Valid { .. }
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+}
