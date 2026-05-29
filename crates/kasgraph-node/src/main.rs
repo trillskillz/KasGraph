@@ -46,6 +46,12 @@ use tracing::{info, warn};
 #[allow(dead_code)]
 mod mapping_host;
 
+// Rust-side view of the `build/manifest.json` descriptor the CLI emits;
+// resolves which handler fires for a detector hit. Consumed by the live
+// loop once per-subgraph wasm loading is wired (the deferred slice).
+#[allow(dead_code)]
+mod subgraph_manifest;
+
 const DEFAULT_SUBGRAPH: &str = "kasgraph_scaffold";
 const DEFAULT_BLOCK_HASH: &str = "scaffold-block-0001";
 const DEFAULT_SERVED_BY: &str = "bootstrap";
