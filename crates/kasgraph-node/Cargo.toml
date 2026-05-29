@@ -25,3 +25,16 @@ kasgraph-detectors.workspace = true
 kasgraph-mapping.workspace = true
 kasgraph-poi.workspace = true
 kasgraph-stream.workspace = true
+
+[features]
+# Real-Postgres integration tests for the node ingest loop (the
+# `#[sqlx::test]` module in `mapping_host.rs`). Off by default so
+# `cargo test --workspace` and CI (no Postgres) stay green. Run with:
+#   DATABASE_URL=postgres://user:pw@host:port/db \
+#     cargo test -p kasgraph-node --features integration-pg
+integration-pg = []
+
+[dev-dependencies]
+# Only the integration-pg tests use this (PgPool + #[sqlx::test]); it
+# stays unused when that feature is off.
+sqlx.workspace = true

@@ -482,3 +482,168 @@ mod tests {
         }
     }
 }
+
+/// Real-Postgres coverage for the *node* end of the dispatch loop: load a
+/// subgraph's compiled mapping from disk via [`LoadedMapping::load`], build
+/// the `store_get` read-set from `Store::snapshot_entities`, dispatch a
+/// committed detector hit, persist the emitted entity versions with
+/// `Store::upsert_entity_version`, and unwind them on reorg — exactly the
+/// sequence the live ingest loop in `main.rs` runs, which until now had only
+/// ever been exercised with an in-memory snapshot and no database.
+///
+/// Gated behind `integration-pg` (off by default) so `cargo test --workspace`
+/// and CI stay green without Postgres. `#[sqlx::test]` provisions a fresh DB
+/// per test and runs the `kasgraph-store` migrations into it, reading the
+/// server from `DATABASE_URL`. Run with:
+///   DATABASE_URL=postgres://kasgraph:kasgraph@127.0.0.1:5434/kasgraph \
+///     cargo test -p kasgraph-node --features integration-pg
+#[cfg(all(test, feature = "integration-pg"))]
+mod integration_pg_tests {
+    use super::*;
+    use kasgraph_detectors::DetectorKind;
+    use kasgraph_mapping::EntitySnapshot;
+    use kasgraph_store::{EntityVersionRecord, Store};
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::path::PathBuf;
+
+    // A mapping whose `handleLock` reads the seeded ("Bond","b1") entity and
+    // emits a `Bond/b1` op **only when `store_get` hits** (returns non-zero).
+    // Branching on the result is what makes this prove the Postgres-sourced
+    // snapshot actually reaches and steers the guest — a miss emits nothing.
+    const GATED_WAT: &str = r#"
+        (module
+          (import "kasgraph" "store_set" (func $store_set (param i32 i32)))
+          (import "kasgraph" "store_get"
+            (func $store_get (param i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (global $heap (mut i32) (i32.const 1024))
+          (func (export "kasgraph_alloc") (param $len i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+            (local.get $p))
+          (data (i32.const 0) "{\"entity\":\"Bond\",\"id\":\"b1\",\"data\":{\"n\":7}}")
+          (data (i32.const 200) "Bond")
+          (data (i32.const 210) "b1")
+          (func (export "handleLock") (param i32 i32)
+            (if (i64.ne
+                  (call $store_get
+                    (i32.const 200) (i32.const 4) (i32.const 210) (i32.const 2))
+                  (i64.const 0))
+              (then (call $store_set (i32.const 0) (i32.const 42))))))
+    "#;
+
+    fn hit() -> DetectedPattern {
+        DetectedPattern {
+            kind: DetectorKind::OpenSilverOwnable,
+            covenant_id: Some("cov-1".into()),
+            tx_hash: "tx-1".into(),
+            output_index: 0,
+            payload: json!({ "owner": "abcd" }),
+        }
+    }
+
+    /// Write a loadable subgraph build dir (`build/manifest.json` +
+    /// `build/mapping.wasm`) so the test exercises the real on-disk
+    /// `LoadedMapping::load` path. The WAT is written as the wasm file;
+    /// wasmtime's `Module::new` parses WAT text, so no `asc` toolchain is
+    /// needed (the example mappings' own wasm is already ABI-checked by the
+    /// TS `examples-build.test.ts` suite — what's unverified is this loop).
+    fn write_fixture(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kasgraph_nodeit_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let manifest = r#"{ "name":"itest", "wasm":"mapping.wasm", "dataSources":[
+            { "name":"d", "kind":"covenant_id", "patterns":["OpenSilverOwnable"],
+              "collection":null, "addresses":[],
+              "handlers":[{"event":"CovenantLocked","handler":"handleLock"}] } ]}"#;
+        std::fs::write(build.join("manifest.json"), manifest).unwrap();
+        std::fs::write(build.join("mapping.wasm"), GATED_WAT).unwrap();
+        dir
+    }
+
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn committed_dispatch_persists_entity_then_reorg_unwinds(pool: PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg = SubgraphId::new("itest_node_hit").unwrap();
+        store.ensure_subgraph_schema(&sg).await.unwrap();
+
+        // Prior committed state at DAA 50 — what a reorg of block 100 restores.
+        store
+            .upsert_entity_version(&EntityVersionRecord {
+                subgraph: sg.clone(),
+                entity_type: "Bond".into(),
+                entity_id: "b1".into(),
+                block_daa_score: 50,
+                payload: json!({ "n": 1 }),
+            })
+            .await
+            .unwrap();
+
+        // Build the store_get read-set from Postgres exactly as the ingest loop does.
+        let mut snapshot = EntitySnapshot::new();
+        for row in store.snapshot_entities(&sg).await.unwrap() {
+            snapshot.insert((row.entity_type, row.entity_id), row.payload);
+        }
+        assert_eq!(snapshot.len(), 1, "snapshot must be seeded from Postgres");
+
+        let dir = write_fixture("hit");
+        let lm = LoadedMapping::load(sg.clone(), &dir).unwrap();
+
+        // The guest emits a Bond/b1 op *because* store_get hit on the seeded entity.
+        let recs = lm.dispatch_committed_hits(100, "blk-100", &[hit()], &snapshot);
+        assert_eq!(recs.len(), 1, "store_get hit → one emitted entity version");
+        assert_eq!(recs[0].entity_type, "Bond");
+        assert_eq!(recs[0].block_daa_score, 100);
+        for r in &recs {
+            store.upsert_entity_version(r).await.unwrap();
+        }
+
+        // The dispatched version is now the entity's current state.
+        assert_eq!(
+            store.latest_entity(&sg, "Bond", "b1").await.unwrap(),
+            Some(json!({ "n": 7 }))
+        );
+
+        // A reorg of block 100 unwinds the dispatched version; the DAA-50 survivor returns.
+        let removed = store.unwind_entity_versions(&sg, 100).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store.latest_entity(&sg, "Bond", "b1").await.unwrap(),
+            Some(json!({ "n": 1 }))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn committed_dispatch_emits_nothing_on_snapshot_miss(pool: PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg = SubgraphId::new("itest_node_miss").unwrap();
+        store.ensure_subgraph_schema(&sg).await.unwrap();
+
+        // Empty snapshot → the guest's store_get misses → it emits nothing.
+        let snapshot = EntitySnapshot::new();
+        let dir = write_fixture("miss");
+        let lm = LoadedMapping::load(sg.clone(), &dir).unwrap();
+
+        let recs = lm.dispatch_committed_hits(100, "blk-100", &[hit()], &snapshot);
+        assert!(recs.is_empty(), "store_get miss → guest emits no op");
+        assert!(
+            store.snapshot_entities(&sg).await.unwrap().is_empty(),
+            "nothing dispatched, nothing persisted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+}
