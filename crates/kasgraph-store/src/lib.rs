@@ -81,6 +81,7 @@ pub struct PoiCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovenantLineageHead {
     pub covenant_id: String,
+    pub subgraph: SubgraphId,
     pub genesis_tx: String,
     pub current_utxo: String,
     pub last_seen_daa: i64,
@@ -91,6 +92,7 @@ pub struct CovenantLineageHead {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovenantLineageRow {
     pub covenant_id: String,
+    pub subgraph: SubgraphId,
     pub seq: i32,
     pub tx_hash: String,
     pub output_index: i32,
@@ -338,14 +340,15 @@ impl Store {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO kasgraph_covenant_lineage_head \
-             (covenant_id, genesis_tx, current_utxo, last_seen_daa, lineage_count) \
-             VALUES ($1, $2, $3, $4, $5) \
+             (covenant_id, subgraph, genesis_tx, current_utxo, last_seen_daa, lineage_count) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (covenant_id) DO UPDATE SET \
                  current_utxo = EXCLUDED.current_utxo, \
                  last_seen_daa = EXCLUDED.last_seen_daa, \
                  lineage_count = EXCLUDED.lineage_count",
         )
         .bind(&head.covenant_id)
+        .bind(head.subgraph.schema_name())
         .bind(&head.genesis_tx)
         .bind(&head.current_utxo)
         .bind(head.last_seen_daa)
@@ -357,16 +360,49 @@ impl Store {
         Ok(())
     }
 
+    /// Fetch the current head for a covenant lineage, if one exists.
+    /// Lineage is keyed globally by `covenant_id` (a deterministic
+    /// hash of the genesis outpoint), so no subgraph filter is needed
+    /// for the lookup; the stored `subgraph` scopes only reorg unwind.
+    pub async fn fetch_covenant_lineage_head(
+        &self,
+        covenant_id: &str,
+    ) -> Result<Option<CovenantLineageHead>, StoreError> {
+        let row: Option<(String, String, String, String, i64, i32)> = sqlx::query_as(
+            "SELECT covenant_id, subgraph, genesis_tx, current_utxo, last_seen_daa, lineage_count \
+             FROM kasgraph_covenant_lineage_head WHERE covenant_id = $1",
+        )
+        .bind(covenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        row.map(
+            |(covenant_id, subgraph, genesis_tx, current_utxo, last_seen_daa, lineage_count)| {
+                Ok(CovenantLineageHead {
+                    covenant_id,
+                    subgraph: SubgraphId::new(subgraph)?,
+                    genesis_tx,
+                    current_utxo,
+                    last_seen_daa,
+                    lineage_count,
+                })
+            },
+        )
+        .transpose()
+    }
+
     pub async fn insert_covenant_lineage_row(
         &self,
         row: &CovenantLineageRow,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO kasgraph_covenant_lineage_row \
-             (covenant_id, seq, tx_hash, output_index, state_bytes, daa_score) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (covenant_id, subgraph, seq, tx_hash, output_index, state_bytes, daa_score) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&row.covenant_id)
+        .bind(row.subgraph.schema_name())
         .bind(row.seq)
         .bind(&row.tx_hash)
         .bind(row.output_index)
@@ -729,6 +765,73 @@ impl Store {
             .map_err(|err| StoreError::Query(err.to_string()))?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Roll back KIP-20 lineage state for `subgraph` at or above
+    /// `from_daa`, part of a reorg unwind. Runs atomically: (1) delete
+    /// the lineage rows this subgraph recorded at or above the cutoff;
+    /// (2) drop heads that no longer have any surviving row; (3) re-point
+    /// each surviving head at its highest-`seq` surviving row, restoring
+    /// `current_utxo`/`last_seen_daa`/`lineage_count` to the pre-reorg
+    /// chain. Returns the number of lineage rows removed.
+    pub async fn unwind_covenant_lineage(
+        &self,
+        subgraph: &SubgraphId,
+        from_daa: i64,
+    ) -> Result<u64, StoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        let removed = sqlx::query(
+            "DELETE FROM kasgraph_covenant_lineage_row \
+             WHERE subgraph = $1 AND daa_score >= $2",
+        )
+        .bind(subgraph.schema_name())
+        .bind(from_daa)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?
+        .rows_affected();
+
+        sqlx::query(
+            "DELETE FROM kasgraph_covenant_lineage_head h \
+             WHERE h.subgraph = $1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM kasgraph_covenant_lineage_row r \
+                   WHERE r.covenant_id = h.covenant_id)",
+        )
+        .bind(subgraph.schema_name())
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        sqlx::query(
+            "UPDATE kasgraph_covenant_lineage_head h SET \
+                 current_utxo = r.tx_hash || ':' || r.output_index, \
+                 last_seen_daa = r.daa_score, \
+                 lineage_count = r.seq + 1 \
+             FROM ( \
+                 SELECT DISTINCT ON (covenant_id) \
+                     covenant_id, seq, tx_hash, output_index, daa_score \
+                 FROM kasgraph_covenant_lineage_row \
+                 WHERE subgraph = $1 \
+                 ORDER BY covenant_id, seq DESC \
+             ) r \
+             WHERE h.covenant_id = r.covenant_id AND h.subgraph = $1",
+        )
+        .bind(subgraph.schema_name())
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(removed)
     }
 
     /// Roll back committed state for the listed block hashes, in a

@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS kasgraph_covenant_lineage_head (
     covenant_id TEXT PRIMARY KEY,
+    subgraph TEXT NOT NULL,
     genesis_tx TEXT NOT NULL,
     current_utxo TEXT NOT NULL,
     last_seen_daa BIGINT NOT NULL,
@@ -8,6 +9,7 @@ CREATE TABLE IF NOT EXISTS kasgraph_covenant_lineage_head (
 
 CREATE TABLE IF NOT EXISTS kasgraph_covenant_lineage_row (
     covenant_id TEXT NOT NULL REFERENCES kasgraph_covenant_lineage_head(covenant_id) ON DELETE CASCADE,
+    subgraph TEXT NOT NULL,
     seq INTEGER NOT NULL,
     tx_hash TEXT NOT NULL,
     output_index INTEGER NOT NULL,
@@ -15,6 +17,9 @@ CREATE TABLE IF NOT EXISTS kasgraph_covenant_lineage_row (
     daa_score BIGINT NOT NULL,
     PRIMARY KEY (covenant_id, seq)
 );
+
+CREATE INDEX IF NOT EXISTS kasgraph_covenant_lineage_row_subgraph_daa_idx
+    ON kasgraph_covenant_lineage_row (subgraph, daa_score DESC);
 
 CREATE INDEX IF NOT EXISTS kasgraph_covenant_lineage_row_daa_idx
     ON kasgraph_covenant_lineage_row (daa_score DESC);

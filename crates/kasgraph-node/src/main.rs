@@ -32,8 +32,9 @@ use kasgraph_rpc::{
     MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
 };
 use kasgraph_store::{
-    CommittedBlockRecord, CovenantSpendRecord, CovenantUtxoRecord, DetectedPatternRecord,
-    PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId,
+    CommittedBlockRecord, CovenantLineageHead, CovenantLineageRow, CovenantSpendRecord,
+    CovenantUtxoRecord, DetectedPatternRecord, PoiCheckpoint, RpcBlockAuditRecord, Store,
+    SubgraphId,
 };
 use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
@@ -814,12 +815,21 @@ async fn apply_and_persist_notification(
                     .unwind_covenant_spends(subgraph, cutoff)
                     .await
                     .context("unwinding covenant spends for reorg")?;
+                // Roll back KIP-20 lineage rows this subgraph recorded at
+                // or above the cutoff and re-point the heads, so the
+                // lineage view never exposes a transition the surviving
+                // chain dropped.
+                let removed_lineage = store
+                    .unwind_covenant_lineage(subgraph, cutoff)
+                    .await
+                    .context("unwinding covenant lineage for reorg")?;
                 warn!(
                     subgraph = subgraph.schema_name(),
                     cutoff_daa = cutoff,
                     removed_rows = removed,
                     removed_covenant_utxos = removed_utxos,
                     removed_covenant_spends = removed_spends,
+                    removed_covenant_lineage = removed_lineage,
                     "entity-version unwind applied"
                 );
             }
@@ -918,10 +928,14 @@ async fn apply_and_persist_notification(
                 // prior behavior and does no extra lookups (the tracker the
                 // classification reads is only populated when a mapping is
                 // loaded).
-                let covenant_id = if mapping.is_some() {
-                    Some(assign_covenant_id(store, subgraph, hit, &committed.block.inputs).await?)
+                let lineage = if mapping.is_some() {
+                    Some(classify_lineage(store, subgraph, hit, &committed.block.inputs).await?)
                 } else {
-                    hit.covenant_id.clone()
+                    None
+                };
+                let covenant_id = match &lineage {
+                    Some(class) => Some(class.covenant_id().to_owned()),
+                    None => hit.covenant_id.clone(),
                 };
 
                 let record = DetectedPatternRecord {
@@ -970,6 +984,17 @@ async fn apply_and_persist_notification(
                         .track_covenant_utxo(&utxo)
                         .await
                         .context("tracking covenant UTXO for spend detection")?;
+
+                    // Record the KIP-20 lineage: a genesis opens a fresh
+                    // head at seq 0; a transition appends the next seq and
+                    // advances the head to this output. `seq` is the prior
+                    // head's `lineage_count` (states already recorded), so
+                    // genesis (no head) starts at 0 and each transition
+                    // increments by one (KIP20_COVENANT_ID_QUERIES.md:109).
+                    if let Some(class) = &lineage {
+                        persist_lineage(store, subgraph, hit, class, committed.block.daa_score)
+                            .await?;
+                    }
                 }
             }
 
@@ -1112,18 +1137,35 @@ async fn load_entity_snapshot(
         .collect())
 }
 
+/// The lineage classification of a detector hit: either the genesis of
+/// a new covenant lineage or a transition that inherits an existing id.
+enum LineageClass {
+    /// First sighting of this covenant; carries its fresh deterministic id.
+    Genesis(String),
+    /// Inherits the predecessor's `covenant_id` (a lineage transition).
+    Transition(String),
+}
+
+impl LineageClass {
+    fn covenant_id(&self) -> &str {
+        match self {
+            LineageClass::Genesis(id) | LineageClass::Transition(id) => id,
+        }
+    }
+}
+
 /// Assign a covenant id to a detector hit via KIP-20 lineage rules.
 /// If the hit's transaction consumes a tracked covenant UTXO, the hit
 /// is a lineage transition and inherits that predecessor's id;
 /// otherwise it is a genesis and gets a fresh deterministic id from its
 /// own outpoint (see [`kasgraph_detectors::genesis_covenant_id`]). The
 /// inherited id propagates the lineage unchanged across every spend.
-async fn assign_covenant_id(
+async fn classify_lineage(
     store: &Store,
     subgraph: &SubgraphId,
     hit: &kasgraph_detectors::DetectedPattern,
     inputs: &[kasgraph_rpc::IngestedTransactionInput],
-) -> anyhow::Result<String> {
+) -> anyhow::Result<LineageClass> {
     for input in inputs {
         if input.spending_tx_hash != hit.tx_hash {
             continue;
@@ -1138,11 +1180,83 @@ async fn assign_covenant_id(
             .context("looking up predecessor covenant for lineage assignment")?
         {
             if let Some(id) = prev.covenant_id {
-                return Ok(id);
+                return Ok(LineageClass::Transition(id));
             }
         }
     }
-    Ok(genesis_covenant_id(&hit.tx_hash, hit.output_index))
+    Ok(LineageClass::Genesis(genesis_covenant_id(
+        &hit.tx_hash,
+        hit.output_index,
+    )))
+}
+
+/// Persist the KIP-20 lineage state for a classified hit: append the
+/// next per-transition row and advance (or open) the lineage head. The
+/// next `seq` is the prior head's `lineage_count`, so a genesis (no head
+/// yet) starts at seq 0 and every transition increments by one. The head
+/// is keyed globally by `covenant_id`; the stored `subgraph` scopes only
+/// reorg unwind. `state_bytes` is the detector payload serialized as JSON
+/// so consumers can replay the covenant state at each lineage step.
+async fn persist_lineage(
+    store: &Store,
+    subgraph: &SubgraphId,
+    hit: &kasgraph_detectors::DetectedPattern,
+    class: &LineageClass,
+    block_daa_score: i64,
+) -> anyhow::Result<()> {
+    let covenant_id = class.covenant_id();
+    let prior = store
+        .fetch_covenant_lineage_head(covenant_id)
+        .await
+        .context("loading covenant lineage head")?;
+    // Genesis tx is fixed at the lineage origin; transitions keep it.
+    let genesis_tx = prior
+        .as_ref()
+        .map(|h| h.genesis_tx.clone())
+        .unwrap_or_else(|| hit.tx_hash.clone());
+    let (seq, lineage_count) = next_lineage_step(prior.as_ref().map(|h| h.lineage_count));
+    let current_utxo = format!("{}:{}", hit.tx_hash, hit.output_index);
+    let state_bytes =
+        serde_json::to_vec(&hit.payload).context("serializing covenant lineage state bytes")?;
+
+    let head = CovenantLineageHead {
+        covenant_id: covenant_id.to_owned(),
+        subgraph: subgraph.clone(),
+        genesis_tx,
+        current_utxo,
+        last_seen_daa: block_daa_score,
+        lineage_count,
+    };
+    store
+        .upsert_covenant_lineage_head(&head)
+        .await
+        .context("upserting covenant lineage head")?;
+
+    let row = CovenantLineageRow {
+        covenant_id: covenant_id.to_owned(),
+        subgraph: subgraph.clone(),
+        seq,
+        tx_hash: hit.tx_hash.clone(),
+        output_index: hit.output_index as i32,
+        state_bytes,
+        daa_score: block_daa_score,
+    };
+    store
+        .insert_covenant_lineage_row(&row)
+        .await
+        .context("inserting covenant lineage row")?;
+
+    Ok(())
+}
+
+/// Compute the next lineage `(seq, lineage_count)` from the prior head's
+/// `lineage_count`. The next sequence number is the count of states
+/// already recorded, so a genesis (no prior head) appends seq 0 and sets
+/// the count to 1, and each transition appends the next seq and
+/// increments the count by one (KIP20_COVENANT_ID_QUERIES.md:109).
+fn next_lineage_step(prior_lineage_count: Option<i32>) -> (i32, i32) {
+    let seq = prior_lineage_count.unwrap_or(0);
+    (seq, seq + 1)
 }
 
 /// Run every registered detector against every output of `block`.
@@ -1928,6 +2042,19 @@ mod tests {
     fn run_detectors_on_block_returns_empty_for_block_without_outputs() {
         let b = block("h", 1, true);
         assert!(run_detectors_on_block(&b).is_empty());
+    }
+
+    #[test]
+    fn next_lineage_step_opens_genesis_at_seq_zero() {
+        // No prior head: a genesis appends seq 0 and sets count to 1.
+        assert_eq!(next_lineage_step(None), (0, 1));
+    }
+
+    #[test]
+    fn next_lineage_step_advances_each_transition_by_one() {
+        // A transition appends seq == prior count and increments count.
+        assert_eq!(next_lineage_step(Some(1)), (1, 2));
+        assert_eq!(next_lineage_step(Some(7)), (7, 8));
     }
 
     #[test]
