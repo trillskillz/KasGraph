@@ -2199,7 +2199,10 @@ mod tests {
             .iter()
             .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
             .expect("OpenSilverOwnable registered");
-        let matching_script = entry.fingerprint.bytes.clone();
+        let kasgraph_detectors::PatternMatcher::Exact(fp) = &entry.matcher else {
+            panic!("OpenSilverOwnable is an exact fingerprint");
+        };
+        let matching_script = fp.bytes.clone();
         let non_matching_script = vec![0x00, 0x01, 0x02];
 
         let mut b = block("h-detect", 1, true);
@@ -2722,13 +2725,14 @@ mod integration_pg_persist {
 
         // A finalized block whose one output matches the OpenSilverOwnable
         // fingerprint → exactly one committed detector hit → handleLock fires.
-        let script = registry::all()
+        let owner_entry = registry::all()
             .iter()
             .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
-            .expect("OpenSilverOwnable registered")
-            .fingerprint
-            .bytes
-            .clone();
+            .expect("OpenSilverOwnable registered");
+        let kasgraph_detectors::PatternMatcher::Exact(fp) = &owner_entry.matcher else {
+            panic!("OpenSilverOwnable is an exact fingerprint");
+        };
+        let script = fp.bytes.clone();
         let ingested = IngestedBlock {
             hash: "blk-1".into(),
             daa_score: 100,

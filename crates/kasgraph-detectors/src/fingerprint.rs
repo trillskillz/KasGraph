@@ -199,6 +199,64 @@ impl AnchoredFingerprint {
     }
 }
 
+/// How a registered detector recognizes its covenant: an exact whole-script
+/// [`Fingerprint`] for fixed-size patterns, or an [`AnchoredFingerprint`] for
+/// loop-parameterized ones whose body length varies. The registry holds one
+/// per detector kind; `detect_in_output` dispatches through it.
+#[derive(Debug, Clone)]
+pub enum PatternMatcher {
+    Exact(Fingerprint),
+    Anchored(AnchoredFingerprint),
+}
+
+impl PatternMatcher {
+    /// Match `script` and extract the masked state fields, or `None`.
+    pub fn match_and_extract(&self, script: &[u8]) -> Option<BTreeMap<&'static str, Vec<u8>>> {
+        match self {
+            PatternMatcher::Exact(f) => f.match_and_extract(script),
+            PatternMatcher::Anchored(a) => a.match_and_extract(script),
+        }
+    }
+
+    /// True if `script` matches this pattern.
+    pub fn matches(&self, script: &[u8]) -> bool {
+        match self {
+            PatternMatcher::Exact(f) => f.matches(script),
+            PatternMatcher::Anchored(a) => a.matches(script),
+        }
+    }
+
+    /// The masked state windows this pattern extracts (the field schema source).
+    pub fn windows(&self) -> &[MaskedWindow] {
+        match self {
+            PatternMatcher::Exact(f) => &f.masked_windows,
+            PatternMatcher::Anchored(a) => &a.head_masked_windows,
+        }
+    }
+
+    /// Structural validity of the windows (bounds + non-overlap).
+    pub fn validate(&self) -> Result<(), FingerprintError> {
+        match self {
+            PatternMatcher::Exact(f) => f.validate(),
+            PatternMatcher::Anchored(a) => a.validate(),
+        }
+    }
+
+    /// A representative script this matcher accepts — its canonical bytes for
+    /// an exact pattern, or `head ++ tail` (empty middle) for an anchored one.
+    /// Used by registry self-consistency / cross-collision tests.
+    pub fn sample_script(&self) -> Vec<u8> {
+        match self {
+            PatternMatcher::Exact(f) => f.bytes.clone(),
+            PatternMatcher::Anchored(a) => {
+                let mut s = a.head.clone();
+                s.extend_from_slice(&a.tail);
+                s
+            }
+        }
+    }
+}
+
 /// Derive an [`AnchoredFingerprint`] from the compiled scripts of the **same
 /// pattern at several loop-bound settings** (e.g. KCC20 at `maxCovIns` 4 and
 /// 8). The stable `head` is their longest common prefix and the stable `tail`

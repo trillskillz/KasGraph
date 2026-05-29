@@ -14,14 +14,15 @@
 
 use std::sync::OnceLock;
 
-use crate::fingerprint::{Fingerprint, MaskedWindow};
+use crate::fingerprint::{Fingerprint, MaskedWindow, PatternMatcher};
+use crate::kcc20_asset_fingerprint::kcc20_asset_fingerprint;
 use crate::DetectorKind;
 
 /// One entry in the detector registry.
 #[derive(Debug, Clone)]
 pub struct DetectorEntry {
     pub kind: DetectorKind,
-    pub fingerprint: Fingerprint,
+    pub matcher: PatternMatcher,
 }
 
 /// All known patterns, in detection-priority order. Entries earlier
@@ -138,24 +139,16 @@ fn build_registry() -> Vec<DetectorEntry> {
                 ("period_blocks", 8),
             ],
         ),
-        // Native KCC20 — per-UTXO receipt state (kcc20.sil Pattern 4.1):
-        // each covenant UTXO carries its own owner / amount / minter flag.
-        // Widths verified against a real `silverc` compile of kcc20.sil — the
-        // 46-byte state slot sits at script offset 1 (bound-independent), with
-        // owner_identifier[2..33] / identifier_type[35] / amount[37..44] (an
-        // 8-byte i64, not 16) / is_minter[46]. (Offsets within the placeholder
-        // fingerprint are still synthetic; only the field widths are real —
-        // see NEXT_SESSION on the anchored-matcher fingerprint sync.)
-        opensilver(
-            DetectorKind::KCC20Asset,
-            0x20,
-            &[
-                ("owner_identifier", 32),
-                ("identifier_type", 1),
-                ("amount", 8),
-                ("is_minter", 1),
-            ],
-        ),
+        // Native KCC20 — the FIRST real fingerprint. KCC20 unrolls its
+        // maxCovIns/maxCovOuts loops into the script, so it's matched with an
+        // anchored head+tail (captured from real silverc compiles) rather than
+        // a placeholder. The per-UTXO receipt state (owner_identifier /
+        // identifier_type / amount / is_minter) is masked in the head at the
+        // verified offsets. See `kcc20_asset_fingerprint`.
+        DetectorEntry {
+            kind: DetectorKind::KCC20Asset,
+            matcher: PatternMatcher::Anchored(kcc20_asset_fingerprint()),
+        },
         opensilver(
             DetectorKind::KCC20OwnableController,
             0x21,
@@ -241,7 +234,10 @@ fn opensilver(
         bytes,
         masked_windows: windows,
     };
-    DetectorEntry { kind, fingerprint }
+    DetectorEntry {
+        kind,
+        matcher: PatternMatcher::Exact(fingerprint),
+    }
 }
 
 /// Map a generic field name (e.g. `"owner_pubkey"`) to a static
@@ -314,7 +310,7 @@ mod tests {
     fn every_registry_entry_has_a_valid_fingerprint() {
         for entry in all() {
             entry
-                .fingerprint
+                .matcher
                 .validate()
                 .unwrap_or_else(|e| panic!("invalid fingerprint for {:?}: {e}", entry.kind));
         }
@@ -329,16 +325,21 @@ mod tests {
     }
 
     #[test]
-    fn every_entry_has_a_unique_discriminator() {
+    fn every_exact_entry_has_a_unique_discriminator() {
+        // Discriminators are the placeholder-fingerprint scheme; anchored
+        // (real-script) entries are distinguished by head/tail content instead
+        // and are covered by the cross-match test below.
         let mut seen = std::collections::HashSet::new();
         for entry in all() {
-            let disc = (entry.fingerprint.bytes[0], entry.fingerprint.bytes[1]);
-            assert!(
-                seen.insert(disc),
-                "duplicate discriminator {:?} for {:?}",
-                disc,
-                entry.kind
-            );
+            if let PatternMatcher::Exact(f) = &entry.matcher {
+                let disc = (f.bytes[0], f.bytes[1]);
+                assert!(
+                    seen.insert(disc),
+                    "duplicate discriminator {:?} for {:?}",
+                    disc,
+                    entry.kind
+                );
+            }
         }
     }
 
@@ -346,8 +347,8 @@ mod tests {
     fn each_fingerprint_matches_a_script_built_from_its_own_bytes() {
         for entry in all() {
             assert!(
-                entry.fingerprint.matches(&entry.fingerprint.bytes),
-                "fingerprint for {:?} does not match its own canonical bytes",
+                entry.matcher.matches(&entry.matcher.sample_script()),
+                "fingerprint for {:?} does not match its own representative script",
                 entry.kind
             );
         }
@@ -361,11 +362,9 @@ mod tests {
                 if a.kind == b.kind {
                     continue;
                 }
-                // A different pattern's canonical bytes should not
-                // match this one — discriminators differ.
+                // No pattern may match another's representative script.
                 assert!(
-                    !a.fingerprint.matches(&b.fingerprint.bytes)
-                        || a.fingerprint.bytes.len() != b.fingerprint.bytes.len(),
+                    !a.matcher.matches(&b.matcher.sample_script()),
                     "{:?} cross-matches {:?}",
                     a.kind,
                     b.kind

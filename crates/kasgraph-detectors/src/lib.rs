@@ -40,6 +40,7 @@ pub mod registry;
 
 pub use fingerprint::{
     derive_anchored_fingerprint, AnchoredFingerprint, Fingerprint, FingerprintError, MaskedWindow,
+    PatternMatcher,
 };
 pub use kcc20_asset_fingerprint::kcc20_asset_fingerprint;
 pub use kcc20_operation::{
@@ -149,7 +150,7 @@ pub fn detect_in_output(
 ) -> Vec<DetectedPattern> {
     let mut hits = Vec::new();
     for entry in registry::all() {
-        if let Some(payload) = entry.fingerprint.match_and_extract(redeem_script_bytes) {
+        if let Some(payload) = entry.matcher.match_and_extract(redeem_script_bytes) {
             hits.push(DetectedPattern {
                 kind: entry.kind,
                 covenant_id: None,
@@ -207,8 +208,8 @@ pub fn registry_schema() -> RegistrySchema {
         .map(|entry| DetectorSchema {
             kind: entry.kind,
             fields: entry
-                .fingerprint
-                .masked_windows
+                .matcher
+                .windows()
                 .iter()
                 .map(|w| DetectorFieldSchema {
                     name: w.field.to_owned(),
@@ -272,8 +273,11 @@ mod tests {
             .iter()
             .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
             .expect("OpenSilverOwnable registered");
-        let mut script = entry.fingerprint.bytes.clone();
-        for w in &entry.fingerprint.masked_windows {
+        let PatternMatcher::Exact(f) = &entry.matcher else {
+            panic!("OpenSilverOwnable is an exact fingerprint");
+        };
+        let mut script = f.bytes.clone();
+        for w in &f.masked_windows {
             for i in 0..w.len {
                 script[w.offset + i] = 0xAB;
             }
@@ -294,7 +298,10 @@ mod tests {
             .iter()
             .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
             .unwrap();
-        let script = vec![0xFFu8; entry.fingerprint.bytes.len()];
+        let PatternMatcher::Exact(f) = &entry.matcher else {
+            panic!("OpenSilverOwnable is an exact fingerprint");
+        };
+        let script = vec![0xFFu8; f.bytes.len()];
         let hits = detect_in_output(&script, "tx", 0);
         // Could match if every fixed byte coincidentally is 0xFF; the
         // canonical bytes start with 0x01, so this collides only if
