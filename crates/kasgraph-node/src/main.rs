@@ -39,6 +39,13 @@ use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+// Detector-hit → WASM-mapping → entity-version bridge. Complete and
+// unit-tested; the live committed-block loop calls it once subgraph wasm
+// loading + manifest handler resolution are wired (the deferred slice),
+// so the transformations are allowed to be unreferenced for now.
+#[allow(dead_code)]
+mod mapping_host;
+
 const DEFAULT_SUBGRAPH: &str = "kasgraph_scaffold";
 const DEFAULT_BLOCK_HASH: &str = "scaffold-block-0001";
 const DEFAULT_SERVED_BY: &str = "bootstrap";
@@ -850,9 +857,7 @@ async fn apply_and_persist_notification(
 /// in `block_from_rpc`); this helper stays for tests that want to
 /// exercise the dispatch without going through the wRPC parse path.
 #[cfg(test)]
-fn run_detectors_on_block(
-    block: &BootstrapBlock,
-) -> Vec<kasgraph_detectors::DetectedPattern> {
+fn run_detectors_on_block(block: &BootstrapBlock) -> Vec<kasgraph_detectors::DetectedPattern> {
     let mut hits = Vec::new();
     for output in &block.outputs {
         hits.extend(detect_in_output(
@@ -1806,8 +1811,14 @@ mod tests {
         let bytes_b = canonical_bytes_for_block(&block_meta, &hits_b);
         let bytes_none = canonical_bytes_for_block(&block_meta, &[]);
 
-        assert_ne!(bytes_a, bytes_b, "different hits must change canonical bytes");
-        assert_ne!(bytes_a, bytes_none, "presence of hits must change canonical bytes");
+        assert_ne!(
+            bytes_a, bytes_b,
+            "different hits must change canonical bytes"
+        );
+        assert_ne!(
+            bytes_a, bytes_none,
+            "presence of hits must change canonical bytes"
+        );
     }
 
     #[test]
@@ -1838,7 +1849,10 @@ mod tests {
 
         let forward = canonical_bytes_for_block(&block_meta, &[hit_one.clone(), hit_two.clone()]);
         let reversed = canonical_bytes_for_block(&block_meta, &[hit_two, hit_one]);
-        assert_eq!(forward, reversed, "canonical bytes must not depend on hit order");
+        assert_eq!(
+            forward, reversed,
+            "canonical bytes must not depend on hit order"
+        );
     }
 
     #[test]
