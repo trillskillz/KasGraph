@@ -39,6 +39,8 @@ pub struct CanonicalEntity {
 pub enum PoiError {
     #[error("entity bytes are empty — POI requires at least one entity slot")]
     EmptyEntityBytes,
+    #[error("POI hex is not exactly 32 hex-encoded bytes")]
+    InvalidHex,
 }
 
 /// Compute the POI for a block given the prior POI and the
@@ -65,6 +67,64 @@ pub fn compute_poi(
 /// queries, status pages).
 pub fn poi_hex(poi: &PoiHash) -> String {
     hex::encode(poi)
+}
+
+/// Decode a hex-encoded POI (the inverse of [`poi_hex`]). Used by a
+/// verifier that reads checkpoints off a status page or another
+/// indexer's published chain.
+pub fn poi_from_hex(hex_str: &str) -> Result<PoiHash, PoiError> {
+    let bytes = hex::decode(hex_str).map_err(|_| PoiError::InvalidHex)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| PoiError::InvalidHex)?;
+    Ok(arr)
+}
+
+/// One block's checkpoint as a third-party verifier sees it: the
+/// canonical entity bytes the indexer claims it processed, plus the POI
+/// the indexer published for that block.
+pub struct PoiCheckpoint<'a> {
+    pub canonical_entity_bytes: &'a [u8],
+    pub expected_poi: PoiHash,
+}
+
+/// Outcome of replaying a published POI chain. `Valid` means every
+/// checkpoint's POI matches what recomputation produces from genesis;
+/// `Diverged` pinpoints the first block whose published POI does not.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PoiVerification {
+    Valid {
+        final_poi: PoiHash,
+    },
+    Diverged {
+        index: usize,
+        expected: PoiHash,
+        recomputed: PoiHash,
+    },
+}
+
+/// Verify a published POI chain by recomputing it from genesis
+/// (`[0u8; 32]`). This is the side a third party runs to check an
+/// indexer's correctness: feed the canonical bytes for each block and
+/// the POI the indexer published, and learn whether the chain holds and,
+/// if not, exactly which block first diverges.
+///
+/// An empty chain trivially verifies to the genesis prior.
+pub fn verify_poi_chain(checkpoints: &[PoiCheckpoint]) -> Result<PoiVerification, PoiError> {
+    let mut prior = [0u8; 32];
+    for (index, cp) in checkpoints.iter().enumerate() {
+        let recomputed = compute_poi(&prior, cp.canonical_entity_bytes)?;
+        if recomputed != cp.expected_poi {
+            return Ok(PoiVerification::Diverged {
+                index,
+                expected: cp.expected_poi,
+                recomputed,
+            });
+        }
+        prior = recomputed;
+    }
+    Ok(PoiVerification::Valid { final_poi: prior })
 }
 
 /// Canonical byte encoding of a block's indexed entity state, suitable as
@@ -239,5 +299,120 @@ mod tests {
         let one = canonical_block_bytes(&[entity("Bond", "b1", json!({"v": 1}))]);
         let two = canonical_block_bytes(&[entity("Bond", "b1", json!({"v": 2}))]);
         assert_ne!(one, two);
+    }
+
+    fn build_chain(blocks: &[&[u8]]) -> Vec<PoiHash> {
+        let mut prior = [0u8; 32];
+        let mut chain = Vec::new();
+        for block in blocks {
+            prior = compute_poi(&prior, block).unwrap();
+            chain.push(prior);
+        }
+        chain
+    }
+
+    #[test]
+    fn poi_from_hex_round_trips_with_poi_hex() {
+        let poi = compute_poi(&[0u8; 32], b"state").unwrap();
+        assert_eq!(poi_from_hex(&poi_hex(&poi)).unwrap(), poi);
+    }
+
+    #[test]
+    fn poi_from_hex_rejects_bad_hex() {
+        assert!(matches!(poi_from_hex("nothex"), Err(PoiError::InvalidHex)));
+    }
+
+    #[test]
+    fn poi_from_hex_rejects_wrong_length() {
+        // 64 hex chars = 32 bytes is correct; 62 chars decodes to 31 bytes.
+        let short = "ab".repeat(31);
+        assert!(matches!(poi_from_hex(&short), Err(PoiError::InvalidHex)));
+    }
+
+    #[test]
+    fn empty_chain_verifies_to_genesis_prior() {
+        let result = verify_poi_chain(&[]).unwrap();
+        assert_eq!(
+            result,
+            PoiVerification::Valid {
+                final_poi: [0u8; 32]
+            }
+        );
+    }
+
+    #[test]
+    fn honest_chain_verifies() {
+        let blocks: [&[u8]; 3] = [b"block-1", b"block-2", b"block-3"];
+        let chain = build_chain(&blocks);
+        let checkpoints: Vec<PoiCheckpoint> = blocks
+            .iter()
+            .zip(&chain)
+            .map(|(bytes, poi)| PoiCheckpoint {
+                canonical_entity_bytes: bytes,
+                expected_poi: *poi,
+            })
+            .collect();
+        let result = verify_poi_chain(&checkpoints).unwrap();
+        assert_eq!(
+            result,
+            PoiVerification::Valid {
+                final_poi: *chain.last().unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn tampered_checkpoint_diverges_at_its_index() {
+        let blocks: [&[u8]; 3] = [b"block-1", b"block-2", b"block-3"];
+        let chain = build_chain(&blocks);
+        let mut checkpoints: Vec<PoiCheckpoint> = blocks
+            .iter()
+            .zip(&chain)
+            .map(|(bytes, poi)| PoiCheckpoint {
+                canonical_entity_bytes: bytes,
+                expected_poi: *poi,
+            })
+            .collect();
+        // Corrupt the middle block's published POI.
+        let mut bad = chain[1];
+        bad[0] ^= 0xff;
+        checkpoints[1].expected_poi = bad;
+        match verify_poi_chain(&checkpoints).unwrap() {
+            PoiVerification::Diverged {
+                index,
+                expected,
+                recomputed,
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(expected, bad);
+                assert_eq!(recomputed, chain[1]);
+            }
+            other => panic!("expected divergence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn end_to_end_entities_through_verify() {
+        let block_one = canonical_block_bytes(&[
+            entity("Bond", "b1", json!({"amount": "10"})),
+            entity("Holder", "h1", json!({"balance": "5"})),
+        ]);
+        let block_two = canonical_block_bytes(&[entity("Bond", "b1", json!({"amount": "20"}))]);
+        let p1 = compute_poi(&[0u8; 32], &block_one).unwrap();
+        let p2 = compute_poi(&p1, &block_two).unwrap();
+        let checkpoints = [
+            PoiCheckpoint {
+                canonical_entity_bytes: &block_one,
+                expected_poi: p1,
+            },
+            PoiCheckpoint {
+                canonical_entity_bytes: &block_two,
+                expected_poi: p2,
+            },
+        ];
+        assert_eq!(
+            verify_poi_chain(&checkpoints).unwrap(),
+            PoiVerification::Valid { final_poi: p2 }
+        );
     }
 }
