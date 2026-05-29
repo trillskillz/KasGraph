@@ -280,6 +280,39 @@ pub struct Krc20LegacyOpRecord {
     pub mint_limit: Option<String>,
 }
 
+/// One accepted legacy KRC-721 inscription op, journaled in
+/// `kasgraph_krc721_legacy_ledger`. The NFT parallel of
+/// [`Krc20LegacyOpRecord`]: legacy KRC-721 state is a pure function of the
+/// accepted op stream, so per-token ownership is rebuilt by replaying these
+/// rows in acceptance order (`seq`) and a reorg deletes rows at/above the
+/// reorged DAA before re-replay.
+///
+/// `tx_hash` is the replay-safety idempotency key (one inscription per tx
+/// payload). `token_id` / `max_supply` hold the raw decimal strings the
+/// inscription carried, not BIGINT: KRC-721 ids and collection sizes are
+/// u64 and can exceed `i64::MAX`, so a BIGINT column would silently corrupt
+/// large values (the same rationale as legacy-KRC-20 amounts).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Krc721LegacyOpRecord {
+    pub subgraph: SubgraphId,
+    pub tick: String,
+    pub tick_raw: String,
+    pub accepting_block_hash: String,
+    pub seq: i64,
+    pub accepting_daa_score: i64,
+    pub tx_hash: String,
+    pub op: String,
+    pub sender: String,
+    /// mint/transfer/burn token id; `None` for deploy.
+    pub token_id: Option<String>,
+    /// transfer `to`; `None` for deploy/mint/burn.
+    pub recipient: Option<String>,
+    /// mint `uri`; `None` otherwise.
+    pub metadata_uri: Option<String>,
+    /// deploy `max`; `None` otherwise.
+    pub max_supply: Option<String>,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -981,6 +1014,83 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Append one accepted legacy KRC-721 inscription op to the journal.
+    /// Idempotent on `tx_hash` (one inscription per transaction payload),
+    /// exactly as [`Self::record_krc20_legacy_op`].
+    pub async fn record_krc721_legacy_op(
+        &self,
+        record: &Krc721LegacyOpRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(&record_krc721_legacy_op_sql())
+            .bind(&record.tick)
+            .bind(&record.accepting_block_hash)
+            .bind(record.seq)
+            .bind(record.subgraph.schema_name())
+            .bind(record.accepting_daa_score)
+            .bind(&record.tx_hash)
+            .bind(&record.op)
+            .bind(&record.tick_raw)
+            .bind(&record.sender)
+            .bind(&record.token_id)
+            .bind(&record.recipient)
+            .bind(&record.metadata_uri)
+            .bind(&record.max_supply)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Whether the journal already records the NFT inscription carried by
+    /// this transaction (the pre-`seq` replay guard, mirroring
+    /// [`Self::krc20_legacy_op_exists`]).
+    pub async fn krc721_legacy_op_exists(&self, tx_hash: &str) -> Result<bool, StoreError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM kasgraph_krc721_legacy_ledger WHERE tx_hash = $1)",
+        )
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.map(|(exists,)| exists).unwrap_or(false))
+    }
+
+    /// The next acceptance `seq` for a collection tick: `MAX(seq) + 1`, or
+    /// `0` for a tick with no recorded op yet (mirrors
+    /// [`Self::next_krc20_legacy_seq`]).
+    pub async fn next_krc721_legacy_seq(&self, tick: &str) -> Result<i64, StoreError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(seq) + 1, 0) FROM kasgraph_krc721_legacy_ledger WHERE tick = $1",
+        )
+        .bind(tick)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.0)
+    }
+
+    /// Roll back legacy KRC-721 journal rows for `subgraph` at or above
+    /// `from_daa` as part of a reorg unwind, then re-replay the surviving
+    /// stream to restore ownership (mirrors
+    /// [`Self::unwind_krc20_legacy_ledger`]). Returns the rows removed.
+    pub async fn unwind_krc721_legacy_ledger(
+        &self,
+        subgraph: &SubgraphId,
+        from_daa: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(&unwind_krc721_legacy_ledger_sql())
+            .bind(subgraph.schema_name())
+            .bind(from_daa)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -1211,6 +1321,25 @@ fn unwind_krc20_legacy_ledger_sql() -> String {
         .to_string()
 }
 
+// ---- kasgraph_krc721_legacy_ledger SQL builders ------------------------
+//
+// The NFT parallel of the legacy-KRC-20 builders. Also a global table (a
+// collection tick is global across the Kasplex view), so no schema name is
+// interpolated and there is no injection surface.
+
+fn record_krc721_legacy_op_sql() -> String {
+    "INSERT INTO kasgraph_krc721_legacy_ledger \
+     (tick, accepting_block_hash, seq, subgraph, accepting_daa_score, tx_hash, op, tick_raw, sender, token_id, recipient, metadata_uri, max_supply) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+     ON CONFLICT (tx_hash) DO NOTHING"
+        .to_string()
+}
+
+fn unwind_krc721_legacy_ledger_sql() -> String {
+    "DELETE FROM kasgraph_krc721_legacy_ledger WHERE subgraph = $1 AND accepting_daa_score >= $2"
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,13 +1477,34 @@ mod tests {
     }
 
     #[test]
+    fn record_krc721_legacy_op_sql_lists_every_column_and_is_idempotent_on_tx() {
+        let sql = record_krc721_legacy_op_sql();
+        assert!(sql.contains("INTO kasgraph_krc721_legacy_ledger"));
+        assert!(sql.contains(
+            "(tick, accepting_block_hash, seq, subgraph, accepting_daa_score, tx_hash, op, tick_raw, sender, token_id, recipient, metadata_uri, max_supply)"
+        ));
+        // 13 columns → 13 bind params.
+        assert!(sql.contains("$13"));
+        assert!(!sql.contains("$14"));
+        assert!(sql.contains("ON CONFLICT (tx_hash) DO NOTHING"));
+    }
+
+    #[test]
+    fn unwind_krc721_legacy_ledger_sql_scopes_by_subgraph_and_cutoff() {
+        let sql = unwind_krc721_legacy_ledger_sql();
+        assert!(sql.contains("DELETE FROM kasgraph_krc721_legacy_ledger"));
+        assert!(sql.contains("WHERE subgraph = $1 AND accepting_daa_score >= $2"));
+    }
+
+    #[test]
     fn migrator_embeds_all_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 5);
+        assert_eq!(migrations.len(), 6);
         assert_eq!(migrations[0].version, 20260526110500);
         assert_eq!(migrations[1].version, 20260526150000);
         assert_eq!(migrations[2].version, 20260526160000);
         assert_eq!(migrations[3].version, 20260528120000);
         assert_eq!(migrations[4].version, 20260529120000);
+        assert_eq!(migrations[5].version, 20260529130000);
     }
 }

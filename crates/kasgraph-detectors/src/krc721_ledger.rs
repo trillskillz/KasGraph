@@ -3,8 +3,9 @@
 //! A pure, in-memory NFT-ownership state machine that applies parsed
 //! [`Krc721Inscription`](crate::krc721::Krc721Inscription)s in transaction
 //! order. It mirrors [`crate::krc20_ledger`] in spirit but tracks
-//! per-token ownership rather than fungible balances, matching the
-//! `kasgraph_krc721_legacy_token` / `_transfer` tables described in
+//! per-token ownership rather than fungible balances. Accepted ops are
+//! journaled in the `kasgraph_krc721_legacy_ledger` store table and this
+//! state is rebuilt by replaying them in acceptance order, per
 //! `docs/references/KRC20_KRC721_REFERENCE.md:58-74`.
 //!
 //! Acceptance rules (mirroring legacy KRC-20):
