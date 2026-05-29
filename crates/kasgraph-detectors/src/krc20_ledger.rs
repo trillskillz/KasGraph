@@ -73,6 +73,29 @@ impl Krc20Ledger {
             .unwrap_or(0)
     }
 
+    /// Rebuild a ledger from an ordered stream of accepted ops — the pure
+    /// form of the reorg / startup recovery contract. Legacy KRC-20 state
+    /// is a pure function of the accepted op stream, so replaying the
+    /// surviving journal rows in acceptance order reconstructs the exact
+    /// in-memory state (`KRC20_KRC721_REFERENCE.md:54`): the node calls
+    /// this to rebuild after a reorg unwind and to re-anchor on startup.
+    ///
+    /// `ops` must be in acceptance order and contain only previously
+    /// accepted ops (the journal stores nothing else). Because a reorg
+    /// deletes a DAA *suffix* and a tick's deploy always precedes its
+    /// mints/transfers, any surviving prefix is self-consistent and every
+    /// op re-applies as `Accepted`.
+    pub fn replay<'a, I>(ops: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a Krc20Inscription, &'a str)>,
+    {
+        let mut ledger = Self::new();
+        for (inscription, sender) in ops {
+            ledger.apply(inscription, sender);
+        }
+        ledger
+    }
+
     /// Apply one parsed inscription as it was performed by `sender` (the
     /// transaction's first input address — the standard Kasplex
     /// convention for the operator/credited party). `deploy` ignores
@@ -337,5 +360,48 @@ mod tests {
         let sum: u64 = t.balances.values().sum();
         assert_eq!(sum, t.minted);
         assert_eq!(t.minted, 500 + 300 - 100);
+    }
+
+    #[test]
+    fn replay_reconstructs_the_same_state_as_incremental_apply() {
+        let ops = [
+            (deploy("t", 10_000, 10_000), "x"),
+            (mint("t", 500), "alice"),
+            (mint("t", 300), "bob"),
+            (transfer("t", 200, "carol"), "alice"),
+            (burn("t", 100), "bob"),
+        ];
+        let mut incremental = Krc20Ledger::new();
+        for (ins, sender) in &ops {
+            incremental.apply(ins, sender);
+        }
+        let replayed = Krc20Ledger::replay(ops.iter().map(|(ins, sender)| (ins, *sender)));
+        assert_eq!(incremental.token("t"), replayed.token("t"));
+    }
+
+    #[test]
+    fn replaying_the_daa_surviving_prefix_models_a_reorg_unwind() {
+        // (inscription, sender, accepting_daa) — the daa is the test's
+        // stand-in for the journal's `accepting_daa_score`.
+        let stream = [
+            (deploy("t", 10_000, 10_000), "x", 10u64),
+            (mint("t", 500), "alice", 11),
+            (mint("t", 300), "bob", 12),
+            (transfer("t", 200, "carol"), "alice", 13),
+        ];
+        // A reorg deletes every row at or above daa 12, then the survivors
+        // are re-replayed — exactly `unwind_krc20_legacy_ledger` followed by
+        // `Krc20Ledger::replay`.
+        let survivors = stream
+            .iter()
+            .filter(|(_, _, daa)| *daa < 12)
+            .map(|(ins, sender, _)| (ins, *sender));
+        let ledger = Krc20Ledger::replay(survivors);
+        // Only the deploy + alice's 500 mint survive; bob's mint and the
+        // transfer are gone.
+        assert_eq!(ledger.balance_of("t", "alice"), 500);
+        assert_eq!(ledger.balance_of("t", "bob"), 0);
+        assert_eq!(ledger.balance_of("t", "carol"), 0);
+        assert_eq!(ledger.token("t").unwrap().minted, 500);
     }
 }

@@ -68,6 +68,29 @@ impl Krc721Ledger {
             .map(String::as_str)
     }
 
+    /// Rebuild a ledger from an ordered stream of accepted ops — the pure
+    /// form of the reorg / startup recovery contract, identical in spirit
+    /// to [`crate::krc20_ledger::Krc20Ledger::replay`]. Legacy KRC-721
+    /// ownership is a pure function of the accepted op stream, so replaying
+    /// the surviving journal rows in acceptance order reconstructs the exact
+    /// in-memory state (`KRC20_KRC721_REFERENCE.md:58-74`).
+    ///
+    /// `ops` must be in acceptance order and contain only previously
+    /// accepted ops. Because a reorg deletes a DAA *suffix* and a
+    /// collection's deploy always precedes its mints/transfers, any
+    /// surviving prefix is self-consistent and every op re-applies as
+    /// `Accepted`.
+    pub fn replay<'a, I>(ops: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a Krc721Inscription, &'a str)>,
+    {
+        let mut ledger = Self::new();
+        for (inscription, sender) in ops {
+            ledger.apply(inscription, sender);
+        }
+        ledger
+    }
+
     /// Apply one parsed inscription as it was performed by `sender` (the
     /// transaction's first input address — the standard Kasplex
     /// convention for the operator/owner). `deploy` ignores `sender`.
@@ -304,5 +327,48 @@ mod tests {
             ApplyOutcome::Rejected(_)
         ));
         assert_eq!(l.owner_of("punks", 3), None);
+    }
+
+    #[test]
+    fn replay_reconstructs_the_same_state_as_incremental_apply() {
+        let ops = [
+            (deploy("punks", 100), "x"),
+            (mint("punks", 1), "alice"),
+            (mint("punks", 2), "bob"),
+            (transfer("punks", 1, "carol"), "alice"),
+            (burn("punks", 2), "bob"),
+        ];
+        let mut incremental = Krc721Ledger::new();
+        for (ins, sender) in &ops {
+            incremental.apply(ins, sender);
+        }
+        let replayed = Krc721Ledger::replay(ops.iter().map(|(ins, sender)| (ins, *sender)));
+        assert_eq!(
+            incremental.collection("punks"),
+            replayed.collection("punks")
+        );
+    }
+
+    #[test]
+    fn replaying_the_daa_surviving_prefix_models_a_reorg_unwind() {
+        // (inscription, sender, accepting_daa) — daa stands in for the
+        // journal's `accepting_daa_score`.
+        let stream = [
+            (deploy("punks", 100), "x", 10u64),
+            (mint("punks", 1), "alice", 11),
+            (mint("punks", 2), "bob", 12),
+            (transfer("punks", 1, "carol"), "alice", 13),
+        ];
+        // A reorg deletes every row at or above daa 13 (the transfer), then
+        // the survivors are re-replayed.
+        let survivors = stream
+            .iter()
+            .filter(|(_, _, daa)| *daa < 13)
+            .map(|(ins, sender, _)| (ins, *sender));
+        let ledger = Krc721Ledger::replay(survivors);
+        // The transfer is gone, so token #1 is back to alice; the two mints
+        // survive.
+        assert_eq!(ledger.owner_of("punks", 1), Some("alice"));
+        assert_eq!(ledger.owner_of("punks", 2), Some("bob"));
     }
 }
