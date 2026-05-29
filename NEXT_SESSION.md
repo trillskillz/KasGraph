@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-28 — covenant-UTXO tracker wired into the node)
+## Latest commit arc (2026-05-28 — spent value captured in the covenant-UTXO tracker)
+
+Honest, protocol-observable groundwork for the `CovenantSpend` envelope (commit `2dcf7b6`, `kasgraph-store` + `kasgraph-node`).
+
+- The locked output's value is observable at lock time, so recording it lets a detected spend report `spentValueSompi` **honestly** — no spend-tx decoder needed for this field. Added `value_sompi BIGINT NOT NULL` to the `covenant_utxos` table, `CovenantUtxoRecord`, and `CovenantUtxoMatch`.
+- The node derives `value_sompi` from the locking block's output whose `(tx_hash, output_index)` matches the `CovenantLocked` hit (falls back to 0 if absent), and surfaces it on the spend-detection `info!` log.
+- 137 workspace tests green; `cargo fmt` clean (except the pre-existing detectors drift, intentionally untouched).
+- **Remaining for `CovenantSpent` dispatch now narrows to two fields:** `operation` and `successorCovenantId`, which genuinely need a spend-transaction decoder (read the spending tx + KIP-20 lineage head). Once those are honestly derivable, build the `CovenantSpend` envelope `{ operation, spentValueSompi: <from the match>, successorCovenantId }`, resolve the `CovenantSpent` handler via the descriptor keyed on the matched `detector_kind`, seed prior state from the matched `locked_state`, and call `dispatch_spend_hit` (`412de54`) in place of the `info!` log.
+
+## Previous commit arc (2026-05-28 — covenant-UTXO tracker wired into the node)
 
 Spend **detection** is now wired end-to-end through the node; spend **dispatch** stays deferred behind a missing decoder (see below). Two commits this arc.
 
