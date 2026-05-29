@@ -32,11 +32,15 @@
 pub mod fingerprint;
 pub mod krc20;
 pub mod krc20_ledger;
+pub mod krc721;
+pub mod krc721_ledger;
 pub mod registry;
 
 pub use fingerprint::{Fingerprint, MaskedWindow};
 pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 pub use krc20_ledger::{ApplyOutcome, Krc20Ledger, TokenState};
+pub use krc721::{parse_krc721_inscription, Krc721Inscription, Krc721Op, Krc721Parse};
+pub use krc721_ledger::{CollectionState, Krc721Ledger};
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::{Deserialize, Serialize};
