@@ -923,6 +923,17 @@ async fn apply_and_persist_notification(
                 // Gated on a loaded mapping so the tracker only fills for
                 // configured subgraphs (preserving no-mapping behavior).
                 if mapping.is_some() {
+                    // The locked output's value is protocol-observable here,
+                    // so a later spend can honestly report `spentValueSompi`
+                    // without a spend-tx decoder. Match the hit's outpoint
+                    // against the block's outputs.
+                    let value_sompi = committed
+                        .block
+                        .outputs
+                        .iter()
+                        .find(|o| o.tx_hash == hit.tx_hash && o.output_index == hit.output_index)
+                        .map(|o| o.value as i64)
+                        .unwrap_or(0);
                     let utxo = CovenantUtxoRecord {
                         subgraph: subgraph.clone(),
                         tx_hash: hit.tx_hash.clone(),
@@ -930,6 +941,7 @@ async fn apply_and_persist_notification(
                         block_daa_score: committed.block.daa_score,
                         detector_kind: format!("{:?}", hit.kind),
                         covenant_id: hit.covenant_id.clone(),
+                        value_sompi,
                         locked_state: hit.payload.clone(),
                     };
                     store
@@ -1006,6 +1018,7 @@ async fn apply_and_persist_notification(
                         format!("{}:{}", input.previous_tx_hash, input.previous_output_index),
                     detector_kind = spent.detector_kind,
                     covenant_id = spent.covenant_id.as_deref().unwrap_or(""),
+                    spent_value_sompi = spent.value_sompi,
                     "covenant spend detected (CovenantSpent dispatch pending spend-tx decoder)"
                 );
             }

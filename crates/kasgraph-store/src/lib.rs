@@ -191,6 +191,10 @@ pub struct CovenantUtxoRecord {
     /// `CovenantSpent` handler when this UTXO is spent.
     pub detector_kind: String,
     pub covenant_id: Option<String>,
+    /// The locked output's value in sompi. Protocol-observable at lock time,
+    /// so a later spend can honestly report `spentValueSompi` without a
+    /// spend-transaction decoder.
+    pub value_sompi: i64,
     /// The locked covenant's detector payload — becomes the `state` half of
     /// the spend event's `{ spend, state }` payload.
     pub locked_state: serde_json::Value,
@@ -198,11 +202,13 @@ pub struct CovenantUtxoRecord {
 
 /// The covenant identified by a spend-input lookup: enough to resolve the
 /// `CovenantSpent` handler (by `detector_kind`) and build the spend event
-/// (the locked `state` and the covenant id).
+/// (the locked `state`, the covenant id, and the spent value).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CovenantUtxoMatch {
     pub detector_kind: String,
     pub covenant_id: Option<String>,
+    /// Value in sompi of the consumed output — the honest `spentValueSompi`.
+    pub value_sompi: i64,
     pub locked_state: serde_json::Value,
 }
 
@@ -267,6 +273,7 @@ impl Store {
                 block_daa_score BIGINT NOT NULL,\
                 detector_kind TEXT NOT NULL,\
                 covenant_id TEXT,\
+                value_sompi BIGINT NOT NULL,\
                 locked_state JSONB NOT NULL,\
                 PRIMARY KEY (tx_hash, output_index)\
             )",
@@ -558,6 +565,7 @@ impl Store {
             .bind(record.block_daa_score)
             .bind(&record.detector_kind)
             .bind(record.covenant_id.as_ref())
+            .bind(record.value_sompi)
             .bind(&record.locked_state)
             .execute(&self.pool)
             .await
@@ -577,7 +585,7 @@ impl Store {
         tx_hash: &str,
         output_index: i32,
     ) -> Result<Option<CovenantUtxoMatch>, StoreError> {
-        let row: Option<(String, Option<String>, serde_json::Value)> =
+        let row: Option<(String, Option<String>, i64, serde_json::Value)> =
             sqlx::query_as(&lookup_covenant_utxo_sql(subgraph.schema_name()))
                 .bind(tx_hash)
                 .bind(output_index)
@@ -586,9 +594,10 @@ impl Store {
                 .map_err(|err| StoreError::Query(err.to_string()))?;
 
         Ok(row.map(
-            |(detector_kind, covenant_id, locked_state)| CovenantUtxoMatch {
+            |(detector_kind, covenant_id, value_sompi, locked_state)| CovenantUtxoMatch {
                 detector_kind,
                 covenant_id,
+                value_sompi,
                 locked_state,
             },
         ))
@@ -769,20 +778,21 @@ fn unwind_entity_versions_sql(schema: &str) -> String {
 fn track_covenant_utxo_sql(schema: &str) -> String {
     format!(
         "INSERT INTO \"{schema}\".covenant_utxos \
-         (tx_hash, output_index, block_daa_score, detector_kind, covenant_id, locked_state) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+         (tx_hash, output_index, block_daa_score, detector_kind, covenant_id, value_sompi, locked_state) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (tx_hash, output_index) \
          DO UPDATE SET \
              block_daa_score = EXCLUDED.block_daa_score, \
              detector_kind = EXCLUDED.detector_kind, \
              covenant_id = EXCLUDED.covenant_id, \
+             value_sompi = EXCLUDED.value_sompi, \
              locked_state = EXCLUDED.locked_state"
     )
 }
 
 fn lookup_covenant_utxo_sql(schema: &str) -> String {
     format!(
-        "SELECT detector_kind, covenant_id, locked_state \
+        "SELECT detector_kind, covenant_id, value_sompi, locked_state \
          FROM \"{schema}\".covenant_utxos \
          WHERE tx_hash = $1 AND output_index = $2"
     )
@@ -856,16 +866,17 @@ mod tests {
         let sql = track_covenant_utxo_sql("kasbonds");
         assert!(sql.contains("\"kasbonds\".covenant_utxos"));
         assert!(sql.contains(
-            "(tx_hash, output_index, block_daa_score, detector_kind, covenant_id, locked_state)"
+            "(tx_hash, output_index, block_daa_score, detector_kind, covenant_id, value_sompi, locked_state)"
         ));
         assert!(sql.contains("ON CONFLICT (tx_hash, output_index)"));
+        assert!(sql.contains("value_sompi = EXCLUDED.value_sompi"));
         assert!(sql.contains("locked_state = EXCLUDED.locked_state"));
     }
 
     #[test]
     fn lookup_covenant_utxo_sql_reads_by_outpoint() {
         let sql = lookup_covenant_utxo_sql("krc20");
-        assert!(sql.contains("SELECT detector_kind, covenant_id, locked_state"));
+        assert!(sql.contains("SELECT detector_kind, covenant_id, value_sompi, locked_state"));
         assert!(sql.contains("\"krc20\".covenant_utxos"));
         assert!(sql.contains("WHERE tx_hash = $1 AND output_index = $2"));
     }
