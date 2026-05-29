@@ -25,7 +25,7 @@
 use std::{collections::BTreeMap, env, time::Duration};
 
 use anyhow::{Context, Result};
-use kasgraph_detectors::{detect_in_output, DetectorKind};
+use kasgraph_detectors::{detect_in_output, genesis_covenant_id, DetectorKind};
 use kasgraph_poi::{compute_poi, poi_hex, PoiHash};
 use kasgraph_rpc::{
     parse_notifications_jsonl, ChainNotification, IngestedBlock, LiveRpcCapabilities,
@@ -910,6 +910,20 @@ async fn apply_and_persist_notification(
                 "detector hits on committed block"
             );
             for hit in hits {
+                // Assign the covenant id by lineage classification: a hit
+                // whose transaction consumes a tracked covenant UTXO is a
+                // transition (inherits the predecessor's id); otherwise it
+                // is a genesis (a fresh deterministic id from its outpoint).
+                // Gated on a loaded mapping so the no-mapping path keeps its
+                // prior behavior and does no extra lookups (the tracker the
+                // classification reads is only populated when a mapping is
+                // loaded).
+                let covenant_id = if mapping.is_some() {
+                    Some(assign_covenant_id(store, subgraph, hit, &committed.block.inputs).await?)
+                } else {
+                    hit.covenant_id.clone()
+                };
+
                 let record = DetectedPatternRecord {
                     subgraph: subgraph.clone(),
                     block_hash: committed.block.hash.clone(),
@@ -917,7 +931,7 @@ async fn apply_and_persist_notification(
                     tx_hash: hit.tx_hash.clone(),
                     output_index: hit.output_index as i32,
                     detector_kind: format!("{:?}", hit.kind),
-                    covenant_id: hit.covenant_id.clone(),
+                    covenant_id: covenant_id.clone(),
                     payload: hit.payload.clone(),
                 };
                 store
@@ -948,7 +962,7 @@ async fn apply_and_persist_notification(
                         output_index: hit.output_index as i32,
                         block_daa_score: committed.block.daa_score,
                         detector_kind: format!("{:?}", hit.kind),
-                        covenant_id: hit.covenant_id.clone(),
+                        covenant_id: covenant_id.clone(),
                         value_sompi,
                         locked_state: hit.payload.clone(),
                     };
@@ -1077,6 +1091,39 @@ async fn load_entity_snapshot(
         .into_iter()
         .map(|r| ((r.entity_type, r.entity_id), r.payload))
         .collect())
+}
+
+/// Assign a covenant id to a detector hit via KIP-20 lineage rules.
+/// If the hit's transaction consumes a tracked covenant UTXO, the hit
+/// is a lineage transition and inherits that predecessor's id;
+/// otherwise it is a genesis and gets a fresh deterministic id from its
+/// own outpoint (see [`kasgraph_detectors::genesis_covenant_id`]). The
+/// inherited id propagates the lineage unchanged across every spend.
+async fn assign_covenant_id(
+    store: &Store,
+    subgraph: &SubgraphId,
+    hit: &kasgraph_detectors::DetectedPattern,
+    inputs: &[kasgraph_rpc::IngestedTransactionInput],
+) -> anyhow::Result<String> {
+    for input in inputs {
+        if input.spending_tx_hash != hit.tx_hash {
+            continue;
+        }
+        if let Some(prev) = store
+            .lookup_covenant_utxo(
+                subgraph,
+                &input.previous_tx_hash,
+                input.previous_output_index as i32,
+            )
+            .await
+            .context("looking up predecessor covenant for lineage assignment")?
+        {
+            if let Some(id) = prev.covenant_id {
+                return Ok(id);
+            }
+        }
+    }
+    Ok(genesis_covenant_id(&hit.tx_hash, hit.output_index))
 }
 
 /// Run every registered detector against every output of `block`.
