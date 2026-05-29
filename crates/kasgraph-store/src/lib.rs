@@ -149,6 +149,33 @@ pub struct DetectedPatternRecord {
     pub payload: serde_json::Value,
 }
 
+/// One version of a mapping-emitted entity, written into a
+/// subgraph's per-schema `entity_versions` table. The mapping
+/// runtime hands the node `EntityOp { entity, id, data }`s; the node
+/// stamps each with the committing block's DAA score (the version
+/// key) and persists it here. Versioning by DAA lets a reorg unwind
+/// drop exactly the rows committed at or above the rolled-back
+/// height, mirroring the POI/committed-block unwind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityVersionRecord {
+    pub subgraph: SubgraphId,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub block_daa_score: i64,
+    pub payload: serde_json::Value,
+}
+
+/// One row of a latest-state entity snapshot: the highest-DAA
+/// version of each `(entity_type, entity_id)`. This is the read set
+/// the mapping runtime's `store_get` is seeded from before a
+/// dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntitySnapshotRow {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub payload: serde_json::Value,
+}
+
 /// Store handle with a live Postgres pool.
 pub struct Store {
     pool: PgPool,
@@ -393,6 +420,86 @@ impl Store {
         Ok(())
     }
 
+    /// Upsert one entity version into the subgraph's per-schema
+    /// `entity_versions` table. Idempotent on `(entity_type,
+    /// entity_id, block_daa_score)` so re-applying a block during
+    /// recovery overwrites rather than duplicates.
+    pub async fn upsert_entity_version(
+        &self,
+        record: &EntityVersionRecord,
+    ) -> Result<(), StoreError> {
+        sqlx::query(&upsert_entity_version_sql(record.subgraph.schema_name()))
+            .bind(&record.entity_type)
+            .bind(&record.entity_id)
+            .bind(record.block_daa_score)
+            .bind(&record.payload)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Latest committed state of a single entity, or `None` if it has
+    /// never been written. "Latest" = highest `block_daa_score`.
+    pub async fn latest_entity(
+        &self,
+        subgraph: &SubgraphId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as(&latest_entity_sql(subgraph.schema_name()))
+                .bind(entity_type)
+                .bind(entity_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(row.map(|(payload,)| payload))
+    }
+
+    /// Latest-state snapshot of every entity in the subgraph: the
+    /// highest-DAA version of each `(entity_type, entity_id)`. Seeds
+    /// the mapping runtime's `store_get` read set.
+    pub async fn snapshot_entities(
+        &self,
+        subgraph: &SubgraphId,
+    ) -> Result<Vec<EntitySnapshotRow>, StoreError> {
+        let rows: Vec<(String, String, serde_json::Value)> =
+            sqlx::query_as(&snapshot_entities_sql(subgraph.schema_name()))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(entity_type, entity_id, payload)| EntitySnapshotRow {
+                entity_type,
+                entity_id,
+                payload,
+            })
+            .collect())
+    }
+
+    /// Delete every entity version committed at or above `from_daa`,
+    /// part of a reorg unwind. Mirrors the POI/committed-block
+    /// rollback so the same chain bytes reproduce the same entity
+    /// state. Returns the number of rows removed.
+    pub async fn unwind_entity_versions(
+        &self,
+        subgraph: &SubgraphId,
+        from_daa: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(&unwind_entity_versions_sql(subgraph.schema_name()))
+            .bind(from_daa)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Roll back committed state for the listed block hashes, in a
     /// single SQL transaction. The order inside the transaction
     /// matches the BlockDAG reorg semantics doc:
@@ -506,6 +613,43 @@ impl Store {
     }
 }
 
+// ---- entity_versions SQL builders --------------------------------------
+//
+// The schema name is a validated `SubgraphId` (lowercase / digits /
+// underscore only — see `SubgraphId::new`), so interpolating it into the
+// table-qualified name is injection-safe, matching `ensure_subgraph_schema`.
+// Kept as pure functions so the SQL shape is unit-testable without a DB.
+
+fn upsert_entity_version_sql(schema: &str) -> String {
+    format!(
+        "INSERT INTO \"{schema}\".entity_versions \
+         (entity_type, entity_id, block_daa_score, payload) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (entity_type, entity_id, block_daa_score) \
+         DO UPDATE SET payload = EXCLUDED.payload"
+    )
+}
+
+fn latest_entity_sql(schema: &str) -> String {
+    format!(
+        "SELECT payload FROM \"{schema}\".entity_versions \
+         WHERE entity_type = $1 AND entity_id = $2 \
+         ORDER BY block_daa_score DESC LIMIT 1"
+    )
+}
+
+fn snapshot_entities_sql(schema: &str) -> String {
+    format!(
+        "SELECT DISTINCT ON (entity_type, entity_id) entity_type, entity_id, payload \
+         FROM \"{schema}\".entity_versions \
+         ORDER BY entity_type, entity_id, block_daa_score DESC"
+    )
+}
+
+fn unwind_entity_versions_sql(schema: &str) -> String {
+    format!("DELETE FROM \"{schema}\".entity_versions WHERE block_daa_score >= $1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +674,39 @@ mod tests {
             SubgraphId::new(""),
             Err(StoreError::InvalidSubgraphId(_))
         ));
+    }
+
+    #[test]
+    fn upsert_entity_version_sql_targets_the_subgraph_schema_and_is_idempotent() {
+        let sql = upsert_entity_version_sql("kasbonds_mainnet_v1");
+        assert!(sql.contains("\"kasbonds_mainnet_v1\".entity_versions"));
+        assert!(sql.contains("ON CONFLICT (entity_type, entity_id, block_daa_score)"));
+        assert!(sql.contains("DO UPDATE SET payload = EXCLUDED.payload"));
+    }
+
+    #[test]
+    fn latest_entity_sql_reads_the_highest_daa_version() {
+        let sql = latest_entity_sql("krc20");
+        assert!(sql.contains("\"krc20\".entity_versions"));
+        assert!(sql.contains("WHERE entity_type = $1 AND entity_id = $2"));
+        assert!(sql.contains("ORDER BY block_daa_score DESC LIMIT 1"));
+    }
+
+    #[test]
+    fn snapshot_entities_sql_takes_one_row_per_entity_key() {
+        let sql = snapshot_entities_sql("krc721");
+        assert!(sql.contains("DISTINCT ON (entity_type, entity_id)"));
+        assert!(sql.contains("\"krc721\".entity_versions"));
+        // DISTINCT ON requires the leading ORDER BY keys to match, with
+        // block_daa_score DESC last so the surviving row is the latest.
+        assert!(sql.contains("ORDER BY entity_type, entity_id, block_daa_score DESC"));
+    }
+
+    #[test]
+    fn unwind_entity_versions_sql_deletes_at_or_above_the_cutoff() {
+        let sql = unwind_entity_versions_sql("network_stats");
+        assert!(sql.contains("DELETE FROM \"network_stats\".entity_versions"));
+        assert!(sql.contains("WHERE block_daa_score >= $1"));
     }
 
     #[test]
