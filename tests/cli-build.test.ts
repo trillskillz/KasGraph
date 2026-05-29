@@ -62,6 +62,10 @@ function manifest(mappingFile = './src/mapping.ts'): string {
     '  - name: cov',
     '    kind: covenant_id',
     '    network: mainnet',
+    '    source:',
+    '      ids:',
+    '        - pattern: OpenSilverVault',
+    '        - pattern: OpenSilverOwnable',
     '    mapping:',
     `      file: ${mappingFile}`,
     '      handlers:',
@@ -125,6 +129,29 @@ describe('kasgraph build', () => {
     expect(entry).toContain('export function handleSpent(ptr: i32, len: i32)');
     // Imports the user mapping by a relative, extension-less specifier.
     expect(entry).toContain('from "../src/mapping"');
+  });
+
+  it('emits a build/manifest.json descriptor the node consumes', async () => {
+    const dir = await scaffold();
+    const io = new CapturedIo(dir);
+    expect(await runBuild([], io)).toBe(0);
+    expect(io.stdoutBuf).toContain('manifest descriptor');
+
+    const descriptor = JSON.parse(
+      await readFile(path.join(dir, 'build', 'manifest.json'), 'utf8'),
+    );
+    expect(descriptor.name).toBe('build-fixture');
+    expect(descriptor.wasm).toBe('build-fixture.wasm');
+    expect(descriptor.dataSources).toHaveLength(1);
+    const ds = descriptor.dataSources[0];
+    expect(ds.kind).toBe('covenant_id');
+    expect(ds.patterns).toEqual(['OpenSilverVault', 'OpenSilverOwnable']);
+    expect(ds.collection).toBeNull();
+    expect(ds.addresses).toEqual([]);
+    expect(ds.handlers).toEqual([
+      { event: 'CovenantLocked', handler: 'handleLocked' },
+      { event: 'CovenantSpent', handler: 'handleSpent' },
+    ]);
   });
 
   it('errors when subgraph.yaml is missing', async () => {

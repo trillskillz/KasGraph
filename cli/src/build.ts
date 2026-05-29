@@ -36,6 +36,12 @@ interface SubgraphManifest {
   name?: string;
   dataSources?: Array<{
     name?: string;
+    kind?: string;
+    source?: {
+      ids?: Array<{ pattern?: string }>;
+      collection?: string;
+      addresses?: string[];
+    };
     mapping?: {
       file?: string;
       handlers?: Array<{ event?: string; handler?: string }>;
@@ -48,6 +54,28 @@ export interface BuildResult {
   byteLength: number;
   handlers: string[];
 }
+
+// Resolved descriptor `kasgraph build` writes next to the wasm. It is the
+// node's single source of manifest truth: kasgraph-node deserializes this
+// (serde_json) instead of re-parsing subgraph.yaml, so the TS CLI stays
+// the only manifest parser. Detector-hit dispatch keys on a data source's
+// `patterns` (the covenant_id `pattern:` selectors) → the handler whose
+// `event` matches; other selector kinds carry their own selector field.
+interface BuildDescriptorDataSource {
+  name: string;
+  kind: string;
+  patterns: string[];
+  collection: string | null;
+  addresses: string[];
+  handlers: Array<{ event: string; handler: string }>;
+}
+interface BuildDescriptor {
+  name: string;
+  wasm: string;
+  dataSources: BuildDescriptorDataSource[];
+}
+
+export const MANIFEST_DESCRIPTOR_FILE = 'manifest.json';
 
 // asc determinism flags. `--runtime stub` gives a minimal bump allocator
 // (which backs kasgraph_alloc) with no GC; `--use abort=` drops the
@@ -175,15 +203,49 @@ export async function runBuild(_args: string[], io: CliIo): Promise<number> {
     return 65;
   }
 
+  // Emit the resolved manifest descriptor the node consumes.
+  const descriptorPath = path.join(outDir, MANIFEST_DESCRIPTOR_FILE);
+  await writeFile(
+    descriptorPath,
+    `${JSON.stringify(buildDescriptor(manifest, wasmName), null, 2)}\n`,
+    'utf8',
+  );
+
   io.stdout.write(
     [
       'Build complete:',
       `  ${order.length} handler${order.length === 1 ? '' : 's'} → ${wasmPath}`,
       `  ${bytes.byteLength} bytes`,
+      `  manifest descriptor → ${descriptorPath}`,
       '',
     ].join('\n'),
   );
   return 0;
+}
+
+function buildDescriptor(
+  manifest: SubgraphManifest,
+  wasmName: string,
+): BuildDescriptor {
+  return {
+    name: manifest.name ?? '',
+    wasm: wasmName,
+    dataSources: (manifest.dataSources ?? []).map((ds) => ({
+      name: ds.name ?? '',
+      kind: ds.kind ?? '',
+      patterns: (ds.source?.ids ?? [])
+        .map((id) => id.pattern)
+        .filter((p): p is string => typeof p === 'string'),
+      collection: ds.source?.collection ?? null,
+      addresses: ds.source?.addresses ?? [],
+      handlers: (ds.mapping?.handlers ?? [])
+        .filter(
+          (h): h is { event: string; handler: string } =>
+            typeof h.event === 'string' && typeof h.handler === 'string',
+        )
+        .map((h) => ({ event: h.event, handler: h.handler })),
+    })),
+  };
 }
 
 // ----------------------------------------------------------------
