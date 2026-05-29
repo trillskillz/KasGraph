@@ -30,9 +30,11 @@
 //! [`registry`] without touching the engine.
 
 pub mod fingerprint;
+pub mod krc20;
 pub mod registry;
 
 pub use fingerprint::{Fingerprint, MaskedWindow};
+pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::{Deserialize, Serialize};
