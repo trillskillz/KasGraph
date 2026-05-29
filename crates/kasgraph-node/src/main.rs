@@ -39,17 +39,13 @@ use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-// Detector-hit → WASM-mapping → entity-version bridge. Complete and
-// unit-tested; the live committed-block loop calls it once subgraph wasm
-// loading + manifest handler resolution are wired (the deferred slice),
-// so the transformations are allowed to be unreferenced for now.
-#[allow(dead_code)]
+// Detector-hit → WASM-mapping → entity-version bridge: the committed-block
+// loop dispatches each subgraph's hits through its compiled mapping and
+// persists the entity versions emitted.
 mod mapping_host;
 
 // Rust-side view of the `build/manifest.json` descriptor the CLI emits;
-// resolves which handler fires for a detector hit. Consumed by the live
-// loop once per-subgraph wasm loading is wired (the deferred slice).
-#[allow(dead_code)]
+// resolves which handler fires for a detector hit.
 mod subgraph_manifest;
 
 const DEFAULT_SUBGRAPH: &str = "kasgraph_scaffold";
@@ -415,6 +411,30 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         "KasStream hub initialized; detector hits will be published to in-process subscribers"
     );
 
+    // Optionally load the subgraph's compiled mapping. When
+    // KASGRAPH_SUBGRAPH_DIR points at a built subgraph (containing
+    // build/manifest.json + its wasm), committed detector hits are
+    // dispatched through it and the emitted entity versions persisted.
+    // Unset → the node behaves exactly as before (no mapping dispatch).
+    let mapping = match env::var("KASGRAPH_SUBGRAPH_DIR").ok() {
+        Some(dir) => {
+            let loaded = mapping_host::LoadedMapping::load(subgraph.clone(), &dir)
+                .with_context(|| format!("loading subgraph mapping from {dir}"))?;
+            info!(
+                subgraph = subgraph.schema_name(),
+                dir,
+                wasm = %loaded.descriptor.wasm,
+                data_sources = loaded.descriptor.data_sources.len(),
+                "loaded subgraph mapping; committed hits will be dispatched"
+            );
+            Some(loaded)
+        }
+        None => {
+            info!("KASGRAPH_SUBGRAPH_DIR not set; skipping WASM mapping dispatch");
+            None
+        }
+    };
+
     let mut ingestion = IngestionState::default();
 
     if let Some(checkpoint) = store
@@ -441,6 +461,7 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                     &mut ingestion,
                     notification,
                     Some(&stream_hub),
+                    mapping.as_ref(),
                 )
                 .await?;
             }
@@ -458,6 +479,7 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 config,
                 rpc_client.as_ref(),
                 Some(&stream_hub),
+                mapping.as_ref(),
             )
             .await?;
             info!(
@@ -496,6 +518,7 @@ async fn run_continuous_ingestion(
     config: &NodeConfig,
     rpc_client: Option<&MultiRpcClient>,
     stream: Option<&StreamHub>,
+    mapping: Option<&mapping_host::LoadedMapping>,
 ) -> Result<()> {
     validate_continuous_config(config)?;
     let continuous = &config.continuous;
@@ -586,9 +609,15 @@ async fn run_continuous_ingestion(
             break;
         };
 
-        let outcome =
-            apply_and_persist_notification(store, subgraph, ingestion, notification, stream)
-                .await?;
+        let outcome = apply_and_persist_notification(
+            store,
+            subgraph,
+            ingestion,
+            notification,
+            stream,
+            mapping,
+        )
+        .await?;
         processed = processed.saturating_add(1);
 
         // Active gap recovery: when the driver-synthesized
@@ -642,6 +671,7 @@ async fn run_continuous_ingestion(
                         ingestion,
                         recovery_notification,
                         stream,
+                        mapping,
                     )
                     .await?;
                     info!(
@@ -713,6 +743,7 @@ async fn apply_and_persist_notification(
     ingestion: &mut IngestionState,
     notification: ChainNotification,
     stream: Option<&StreamHub>,
+    mapping: Option<&mapping_host::LoadedMapping>,
 ) -> Result<NotificationOutcome> {
     let transition = ingestion
         .apply_notification(notification)
@@ -747,6 +778,31 @@ async fn apply_and_persist_notification(
             audit_id = report.audit_id,
             "committed-state unwind applied"
         );
+
+        // Unwind mapping-emitted entity versions for the same reorg.
+        // The cutoff is the lowest DAA among the unwound blocks; every
+        // entity row stamped at or above it is rolled back, matching the
+        // committed-block unwind above. Only meaningful when a mapping is
+        // loaded (otherwise no entity_versions rows exist).
+        if mapping.is_some() {
+            if let Some(cutoff) = transition
+                .committed_unwinds
+                .iter()
+                .map(|b| b.daa_score)
+                .min()
+            {
+                let removed = store
+                    .unwind_entity_versions(subgraph, cutoff)
+                    .await
+                    .context("unwinding entity versions for reorg")?;
+                warn!(
+                    subgraph = subgraph.schema_name(),
+                    cutoff_daa = cutoff,
+                    removed_rows = removed,
+                    "entity-version unwind applied"
+                );
+            }
+        }
 
         // POI re-anchor: after deleting the unwound POI rows, load
         // the new highest-DAA survivor and re-seed the in-memory
@@ -849,6 +905,36 @@ async fn apply_and_persist_notification(
                     .context("writing detected pattern row")?;
                 publish_hit_to_stream(stream, &committed.block, hit);
             }
+
+            // Dispatch the same hits through the subgraph mapping (if one
+            // is loaded) and persist the entity versions it emits. The
+            // store_get read-set is seeded from the entity state committed
+            // by prior blocks; rows are stamped with this block's DAA so a
+            // reorg unwinds them by the same cutoff as the block itself.
+            if let Some(mapping) = mapping {
+                let snapshot = load_entity_snapshot(store, subgraph).await?;
+                let records = mapping.dispatch_committed_hits(
+                    committed.block.daa_score as u64,
+                    &committed.block.hash,
+                    hits,
+                    &snapshot,
+                );
+                for record in &records {
+                    store
+                        .upsert_entity_version(record)
+                        .await
+                        .context("persisting mapping-emitted entity version")?;
+                }
+                if !records.is_empty() {
+                    info!(
+                        subgraph = subgraph.schema_name(),
+                        block_hash = committed.block.hash,
+                        daa_score = committed.block.daa_score,
+                        entity_versions = records.len(),
+                        "persisted mapping entity versions"
+                    );
+                }
+            }
         }
     }
 
@@ -856,6 +942,22 @@ async fn apply_and_persist_notification(
         recovery_requested,
         committed_count,
     })
+}
+
+/// Build the read-only entity snapshot a mapping's `store_get` reads from:
+/// the latest committed version of every entity in the subgraph.
+async fn load_entity_snapshot(
+    store: &Store,
+    subgraph: &SubgraphId,
+) -> Result<kasgraph_mapping::EntitySnapshot> {
+    let rows = store
+        .snapshot_entities(subgraph)
+        .await
+        .context("loading entity snapshot for mapping dispatch")?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ((r.entity_type, r.entity_id), r.payload))
+        .collect())
 }
 
 /// Run every registered detector against every output of `block`.

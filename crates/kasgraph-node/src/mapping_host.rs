@@ -98,7 +98,6 @@ pub enum LoadError {
 /// subgraph and dispatches each committed block's detector hits through it.
 pub struct LoadedMapping {
     pub subgraph: SubgraphId,
-    pub dir: PathBuf,
     pub descriptor: BuildDescriptor,
     pub runtime: MappingRuntime,
 }
@@ -120,7 +119,6 @@ impl LoadedMapping {
         })?;
         Ok(Self {
             subgraph,
-            dir,
             descriptor,
             runtime,
         })
@@ -305,7 +303,6 @@ mod tests {
         );
         LoadedMapping {
             subgraph: SubgraphId::new("kasbonds").unwrap(),
-            dir: PathBuf::from("/unused"),
             descriptor: BuildDescriptor::from_json(&json).unwrap(),
             runtime: MappingRuntime::from_wasm(WAT).unwrap(),
         }
