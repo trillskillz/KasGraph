@@ -377,6 +377,19 @@ impl MultiRpcClient {
         self.audit_log.lock().await.clone()
     }
 
+    /// Take and clear the accumulated per-fetch audit records. Every
+    /// successful `fetch_block` (and thus `fetch_blocks` / the recovery +
+    /// hydration paths) appends one record naming the endpoint that actually
+    /// served it (failover-aware). A long-lived continuous ingestion loop must
+    /// drain this periodically — otherwise the in-memory log grows without
+    /// bound — and persist the drained records so the real RPC fetch
+    /// provenance survives a restart. Returns the drained records in fetch
+    /// order; a subsequent call returns empty until new fetches occur.
+    pub async fn drain_audit_log(&self) -> Vec<BlockAuditRecord> {
+        let mut log = self.audit_log.lock().await;
+        std::mem::take(&mut *log)
+    }
+
     pub async fn recover_blocks_by_hashes<I, S>(
         &self,
         block_hashes: I,
@@ -2082,6 +2095,40 @@ mod tests {
         let health = client.endpoint_health().await;
         assert_eq!(health.get("primary"), Some(&false));
         assert_eq!(health.get("backup-1"), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn drain_audit_log_returns_then_clears_fetch_records() {
+        let primary = spawn_mock_rpc_server(vec![
+            MockBehavior::BlockResponse {
+                hash: "blk-1",
+                daa_score: 1,
+                blue_score: 1,
+                finalized: true,
+            },
+            MockBehavior::BlockResponse {
+                hash: "blk-2",
+                daa_score: 2,
+                blue_score: 2,
+                finalized: true,
+            },
+        ])
+        .await;
+        let client = client(primary, vec![]);
+
+        client.fetch_block("blk-1").await.unwrap();
+        client.fetch_block("blk-2").await.unwrap();
+
+        // First drain returns both fetch records in order and empties the log.
+        let drained = client.drain_audit_log().await;
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].block_hash, "blk-1");
+        assert_eq!(drained[1].block_hash, "blk-2");
+        assert!(drained.iter().all(|r| r.served_by == "primary"));
+
+        // The log is now empty (so a continuous loop's memory stays bounded).
+        assert!(client.drain_audit_log().await.is_empty());
+        assert!(client.audit_log().await.is_empty());
     }
 
     #[tokio::test]

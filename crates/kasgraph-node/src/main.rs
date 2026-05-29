@@ -481,6 +481,15 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 )
                 .await?;
             }
+            // Persist the provenance of any blocks the bootstrap pass fetched
+            // via RPC (recorded in the client's audit log during
+            // build_notifications), then clear it.
+            if let Some(client) = rpc_client.as_ref() {
+                let fetch_audit_rows = persist_drained_rpc_audit(&store, client).await?;
+                if fetch_audit_rows > 0 {
+                    info!(fetch_audit_rows, "persisted RPC fetch-audit records");
+                }
+            }
             info!(
                 committed_blocks = ingestion.committed.len(),
                 probabilistic_blocks = ingestion.probabilistic.len(),
@@ -708,6 +717,20 @@ async fn run_continuous_ingestion(
             }
         }
 
+        // Persist (and bound) the RPC client's per-fetch audit log: recovery
+        // fetches recorded which endpoint actually served each block
+        // (failover-aware). Draining here makes that provenance durable and
+        // keeps the in-memory log from growing without bound over a long-lived
+        // loop. Subscription-delivered blocks aren't fetched, so they don't
+        // appear here — their provenance is the per-committed-block audit row.
+        let fetch_audit_rows = persist_drained_rpc_audit(store, &driver_client).await?;
+        if fetch_audit_rows > 0 {
+            info!(
+                subgraph = subgraph.schema_name(),
+                fetch_audit_rows, "persisted RPC fetch-audit records"
+            );
+        }
+
         if continuous.max_messages != 0 && processed >= continuous.max_messages {
             info!(
                 processed,
@@ -731,6 +754,28 @@ async fn run_continuous_ingestion(
 
     info!(processed, "continuous ingestion loop done");
     Ok(())
+}
+
+/// Drain the RPC client's accumulated per-fetch audit records and persist
+/// each one. Every successful `fetch_block` (recovery + hydration paths)
+/// recorded the endpoint that actually served the block (failover-aware) into
+/// the client's in-memory log; draining + persisting here makes that real RPC
+/// provenance durable across restarts and keeps the in-memory log bounded
+/// over a long-lived ingestion loop. Returns the number of records persisted.
+async fn persist_drained_rpc_audit(store: &Store, client: &MultiRpcClient) -> Result<usize> {
+    let drained = client.drain_audit_log().await;
+    let count = drained.len();
+    for record in drained {
+        store
+            .insert_rpc_block_audit(&RpcBlockAuditRecord {
+                block_hash: record.block_hash,
+                daa_score: record.daa_score as i64,
+                served_by: record.served_by,
+            })
+            .await
+            .context("persisting drained RPC fetch-audit record")?;
+    }
+    Ok(count)
 }
 
 /// What a single `apply_and_persist_notification` call did, so the
