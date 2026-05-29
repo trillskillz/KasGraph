@@ -64,16 +64,17 @@ impl Kcc20ReceiptState {
     /// Parse one receipt from a detector hit payload — the hex-string field
     /// map `kasgraph_detectors::payload_to_json` produces for a `KCC20Asset`
     /// match (`owner_identifier` / `identifier_type` / `amount` / `is_minter`).
-    /// Numeric fields are big-endian hex of their declared width; `is_minter`
-    /// is a 1-byte flag (any non-zero byte = true).
+    /// `amount` is an 8-byte **little-endian** i64 (SilverScript's on-chain int
+    /// encoding); `identifier_type` / `is_minter` are 1-byte flags.
     pub fn from_payload(payload: &Value) -> Result<Self, Kcc20DecodeError> {
         Ok(Self {
             owner_identifier: hex_str(payload, "owner_identifier")?.to_owned(),
-            identifier_type: hex_be(payload, "identifier_type", 1)? as u8,
-            // 8 bytes: silverscript `int` is i64 — matches the verified
-            // kcc20.sil state slot (amount at script bytes [37..44]).
-            amount: hex_be(payload, "amount", 8)?,
-            is_minter: hex_be(payload, "is_minter", 1)? != 0,
+            identifier_type: hex_byte(payload, "identifier_type")? as u8,
+            // 8-byte little-endian i64: silverscript stores `int` LE on chain
+            // (verified against a real kcc20.sil compile — amount 999 extracts
+            // as `e703000000000000` from script bytes [37..45)).
+            amount: hex_le_u64(payload, "amount")?,
+            is_minter: hex_byte(payload, "is_minter")? != 0,
         })
     }
 
@@ -165,19 +166,31 @@ fn hex_str<'a>(payload: &'a Value, field: &'static str) -> Result<&'a str, Kcc20
         .ok_or(Kcc20DecodeError::MissingField(field))
 }
 
-/// Decode a big-endian hex field into a `u128`, rejecting input wider than
-/// `max_bytes` (the field's declared width).
-fn hex_be(
-    payload: &Value,
-    field: &'static str,
-    max_bytes: usize,
-) -> Result<u128, Kcc20DecodeError> {
+/// Decode a single-byte hex field (`identifier_type`, `is_minter`). Endianness
+/// is moot for one byte; rejects wider input.
+fn hex_byte(payload: &Value, field: &'static str) -> Result<u8, Kcc20DecodeError> {
     let bytes =
         hex::decode(hex_str(payload, field)?).map_err(|_| Kcc20DecodeError::NotHex(field))?;
-    if bytes.len() > max_bytes {
+    match bytes.as_slice() {
+        [b] => Ok(*b),
+        _ => Err(Kcc20DecodeError::Overflow(field)),
+    }
+}
+
+/// Decode a **little-endian** hex field into a `u128`, bounded to 8 bytes (an
+/// i64 slot). SilverScript stores `int` little-endian in the redeem script, so
+/// `amount`'s extracted bytes are LE (verified against a real kcc20.sil
+/// compile).
+fn hex_le_u64(payload: &Value, field: &'static str) -> Result<u128, Kcc20DecodeError> {
+    let bytes =
+        hex::decode(hex_str(payload, field)?).map_err(|_| Kcc20DecodeError::NotHex(field))?;
+    if bytes.len() > 8 {
         return Err(Kcc20DecodeError::Overflow(field));
     }
-    Ok(bytes.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128))
+    Ok(bytes
+        .iter()
+        .enumerate()
+        .fold(0u128, |acc, (i, &b)| acc | ((b as u128) << (8 * i))))
 }
 
 #[cfg(test)]
@@ -272,7 +285,7 @@ mod tests {
         let payload = json!({
             "owner_identifier": "ab".repeat(32),
             "identifier_type": "02",
-            "amount": "0000000000000100", // 8-byte i64 slot, = 256
+            "amount": "0001000000000000", // 8-byte LE i64 slot, = 256
             "is_minter": "01",
         });
         let parsed = Kcc20ReceiptState::from_payload(&payload).unwrap();

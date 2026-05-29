@@ -30,6 +30,7 @@
 //! [`registry`] without touching the engine.
 
 pub mod fingerprint;
+pub mod kcc20_asset_fingerprint;
 pub mod kcc20_operation;
 pub mod krc20;
 pub mod krc20_ledger;
@@ -40,6 +41,7 @@ pub mod registry;
 pub use fingerprint::{
     derive_anchored_fingerprint, AnchoredFingerprint, Fingerprint, FingerprintError, MaskedWindow,
 };
+pub use kcc20_asset_fingerprint::kcc20_asset_fingerprint;
 pub use kcc20_operation::{
     classify_kcc20_operation, Kcc20DecodeError, Kcc20Operation, Kcc20ReceiptState,
 };
