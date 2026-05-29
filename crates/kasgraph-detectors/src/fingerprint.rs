@@ -199,6 +199,87 @@ impl AnchoredFingerprint {
     }
 }
 
+/// Derive an [`AnchoredFingerprint`] from the compiled scripts of the **same
+/// pattern at several loop-bound settings** (e.g. KCC20 at `maxCovIns` 4 and
+/// 8). The stable `head` is their longest common prefix and the stable `tail`
+/// their longest common suffix — everything between is the loop-unrolled body
+/// that the bound rewrites, so it's dropped. The compiles must share fixed
+/// state values (only the bounds vary) so the state region sits inside the
+/// common prefix; `state_windows` marks it masked.
+///
+/// This is the core of the per-pattern signature capture: feed it real
+/// `silverc` outputs and it yields the matcher. It is pure (the caller owns
+/// running `silverc`), so it's unit-tested over structurally-faithful inputs.
+///
+/// Errors when given fewer than two scripts, when `head`+`tail` would overlap
+/// in the shortest script (no stable variable middle to separate them — the
+/// signal is ambiguous), or when a declared state window falls outside the
+/// derived head (the state isn't in the bound-stable region).
+pub fn derive_anchored_fingerprint(
+    scripts: &[&[u8]],
+    state_windows: Vec<MaskedWindow>,
+) -> Result<AnchoredFingerprint, FingerprintError> {
+    if scripts.len() < 2 {
+        return Err(FingerprintError::TooFewSamples(scripts.len()));
+    }
+    let head_len = common_prefix_len(scripts);
+    let tail_len = common_suffix_len(scripts);
+    let min_len = scripts.iter().map(|s| s.len()).min().unwrap_or(0);
+    if head_len + tail_len > min_len {
+        return Err(FingerprintError::AnchorsOverlap {
+            head_len,
+            tail_len,
+            min_len,
+        });
+    }
+    for w in &state_windows {
+        if w.offset + w.len > head_len {
+            return Err(FingerprintError::WindowOutOfBounds {
+                field: w.field,
+                offset: w.offset,
+                len: w.len,
+                script_len: head_len,
+            });
+        }
+    }
+    let sample = scripts[0];
+    let fingerprint = AnchoredFingerprint {
+        head: sample[..head_len].to_vec(),
+        head_masked_windows: state_windows,
+        tail: sample[sample.len() - tail_len..].to_vec(),
+    };
+    fingerprint.validate()?;
+    Ok(fingerprint)
+}
+
+fn common_prefix_len(scripts: &[&[u8]]) -> usize {
+    let first = scripts[0];
+    let mut n = first.len();
+    for s in &scripts[1..] {
+        let limit = n.min(s.len());
+        let mut i = 0;
+        while i < limit && first[i] == s[i] {
+            i += 1;
+        }
+        n = i;
+    }
+    n
+}
+
+fn common_suffix_len(scripts: &[&[u8]]) -> usize {
+    let first = scripts[0];
+    let mut n = first.len();
+    for s in &scripts[1..] {
+        let limit = n.min(s.len());
+        let mut i = 0;
+        while i < limit && first[first.len() - 1 - i] == s[s.len() - 1 - i] {
+            i += 1;
+        }
+        n = i;
+    }
+    n
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {
     #[error("masked window {field} (offset {offset}, len {len}) extends past script of length {script_len}")]
@@ -210,6 +291,16 @@ pub enum FingerprintError {
     },
     #[error("masked windows {a} and {b} overlap")]
     WindowsOverlap { a: &'static str, b: &'static str },
+    #[error("need at least 2 compiled samples to derive an anchored fingerprint, got {0}")]
+    TooFewSamples(usize),
+    #[error(
+        "derived head ({head_len}) + tail ({tail_len}) overlap in the shortest script ({min_len})"
+    )]
+    AnchorsOverlap {
+        head_len: usize,
+        tail_len: usize,
+        min_len: usize,
+    },
 }
 
 #[cfg(test)]
@@ -420,6 +511,87 @@ mod tests {
             a.match_and_extract(&s2).unwrap().get("state"),
             Some(&vec![0xDE, 0xAD])
         );
+    }
+
+    // Build a script shaped like a real compile: a fixed head (with a 2-byte
+    // state region at offset 2) + a variable-length/contents body + a fixed
+    // tail. Only `body` varies between samples, mimicking loop-unrolling.
+    fn shaped(head: &[u8], body: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut s = head.to_vec();
+        s.extend_from_slice(body);
+        s.extend_from_slice(tail);
+        s
+    }
+
+    #[test]
+    fn derive_finds_stable_head_and_tail_across_bound_variants() {
+        let head = [0xA0, 0xA1, 0xDD, 0xDD, 0xA4, 0xA5]; // state masked at [2..4]
+        let tail = [0xE0, 0xE1, 0xE2, 0xE3];
+        // Three "bounds": different body lengths AND contents — the unrolled
+        // middle. State bytes are identical across samples (fixed state).
+        let s1 = shaped(&head, &[0x10; 3], &tail);
+        let s2 = shaped(&head, &[0x20; 50], &tail);
+        let s3 = shaped(&head, &[0x30; 900], &tail);
+        let windows = vec![MaskedWindow {
+            field: "state",
+            offset: 2,
+            len: 2,
+        }];
+        let fp = derive_anchored_fingerprint(&[&s1, &s2, &s3], windows).unwrap();
+        assert_eq!(fp.head, head);
+        assert_eq!(fp.tail, tail);
+        assert_eq!(fp.head_masked_windows.len(), 1);
+
+        // The derived matcher recognizes every sample and a fresh unseen bound,
+        // and extracts the (masked) state regardless of body.
+        for s in [&s1, &s2, &s3] {
+            assert!(fp.matches(s));
+        }
+        let unseen = shaped(&head, &[0x77; 123], &tail);
+        let out = fp.match_and_extract(&unseen).expect("matches unseen bound");
+        assert_eq!(out.get("state"), Some(&vec![0xDD, 0xDD]));
+
+        // A different pattern (different head/tail) is rejected.
+        let other = shaped(
+            &[0xB0, 0xB1, 0x00, 0x00, 0xB4, 0xB5],
+            &[0x10; 50],
+            &[0xF0, 0xF1, 0xF2, 0xF3],
+        );
+        assert!(!fp.matches(&other));
+    }
+
+    #[test]
+    fn derive_rejects_too_few_samples_and_overlapping_anchors() {
+        let s = vec![0x01, 0x02, 0x03];
+        assert!(matches!(
+            derive_anchored_fingerprint(&[&s], vec![]),
+            Err(FingerprintError::TooFewSamples(1))
+        ));
+        // Two identical short scripts: prefix==suffix==len, so head+tail overlap.
+        let a = vec![0x01, 0x02, 0x03, 0x04];
+        let b = vec![0x01, 0x02, 0x03, 0x04];
+        assert!(matches!(
+            derive_anchored_fingerprint(&[&a, &b], vec![]),
+            Err(FingerprintError::AnchorsOverlap { .. })
+        ));
+    }
+
+    #[test]
+    fn derive_rejects_state_window_outside_the_stable_head() {
+        let head = [0xA0, 0xA1, 0xA2, 0xA3];
+        let tail = [0xE0, 0xE1];
+        let s1 = shaped(&head, &[0x10; 10], &tail);
+        let s2 = shaped(&head, &[0x20; 40], &tail);
+        // Window at offset 3 len 4 runs past the 4-byte head.
+        let windows = vec![MaskedWindow {
+            field: "state",
+            offset: 3,
+            len: 4,
+        }];
+        assert!(matches!(
+            derive_anchored_fingerprint(&[&s1, &s2], windows),
+            Err(FingerprintError::WindowOutOfBounds { .. })
+        ));
     }
 
     #[test]

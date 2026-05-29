@@ -37,7 +37,9 @@ pub mod krc721;
 pub mod krc721_ledger;
 pub mod registry;
 
-pub use fingerprint::{AnchoredFingerprint, Fingerprint, MaskedWindow};
+pub use fingerprint::{
+    derive_anchored_fingerprint, AnchoredFingerprint, Fingerprint, FingerprintError, MaskedWindow,
+};
 pub use kcc20_operation::{
     classify_kcc20_operation, Kcc20DecodeError, Kcc20Operation, Kcc20ReceiptState,
 };
