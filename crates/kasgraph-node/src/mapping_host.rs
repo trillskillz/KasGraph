@@ -11,11 +11,16 @@
 //! wasm, resolving the handler name from the manifest, and persisting the
 //! returned records via `Store::upsert_entity_version`).
 
+use std::path::{Path, PathBuf};
+
 use kasgraph_detectors::DetectedPattern;
 use kasgraph_mapping::{
     DispatchOutcome, EntitySnapshot, MappingError, MappingEvent, MappingRuntime,
 };
 use kasgraph_store::{EntityVersionRecord, SubgraphId};
+use tracing::warn;
+
+use crate::subgraph_manifest::{BuildDescriptor, ManifestError, EVENT_COVENANT_LOCKED};
 
 /// Build the mapping event for a lock-time detector hit. The detector's
 /// extracted fields become the event payload; the handler must match an
@@ -73,6 +78,97 @@ pub fn dispatch_locked_hit(
     let outcome = runtime.dispatch_with_entities(event, snapshot)?;
     let records = entity_versions(&outcome, subgraph, block_daa_score as i64);
     Ok((records, outcome))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    #[error("failed to read mapping wasm {path}: {source}")]
+    ReadWasm {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to compile mapping wasm {path}: {source}")]
+    Compile { path: PathBuf, source: MappingError },
+}
+
+/// A subgraph's compiled mapping plus its resolved descriptor, loaded
+/// once at startup. The live ingest loop holds one per configured
+/// subgraph and dispatches each committed block's detector hits through it.
+pub struct LoadedMapping {
+    pub subgraph: SubgraphId,
+    pub dir: PathBuf,
+    pub descriptor: BuildDescriptor,
+    pub runtime: MappingRuntime,
+}
+
+impl LoadedMapping {
+    /// Load `<dir>/build/manifest.json` and the wasm it names, compiling
+    /// the mapping runtime once.
+    pub fn load(subgraph: SubgraphId, dir: impl AsRef<Path>) -> Result<Self, LoadError> {
+        let dir = dir.as_ref().to_path_buf();
+        let descriptor = BuildDescriptor::load(&dir)?;
+        let wasm_path = descriptor.wasm_path(&dir);
+        let bytes = std::fs::read(&wasm_path).map_err(|source| LoadError::ReadWasm {
+            path: wasm_path.clone(),
+            source,
+        })?;
+        let runtime = MappingRuntime::from_wasm(&bytes).map_err(|source| LoadError::Compile {
+            path: wasm_path,
+            source,
+        })?;
+        Ok(Self {
+            subgraph,
+            dir,
+            descriptor,
+            runtime,
+        })
+    }
+
+    /// Dispatch every lock-time detector hit on a committed block, seeding
+    /// `store_get` reads from `snapshot`, and return the entity-version
+    /// records to persist. A hit with no matching handler is skipped; a
+    /// handler that fails is logged and skipped so one bad mapping cannot
+    /// stall the indexer.
+    pub fn dispatch_committed_hits(
+        &self,
+        block_daa_score: u64,
+        block_hash: &str,
+        hits: &[DetectedPattern],
+        snapshot: &EntitySnapshot,
+    ) -> Vec<EntityVersionRecord> {
+        let mut records = Vec::new();
+        for hit in hits {
+            let kind = format!("{:?}", hit.kind);
+            let Some(handler) = self
+                .descriptor
+                .resolve_handler(&kind, EVENT_COVENANT_LOCKED)
+            else {
+                continue;
+            };
+            match dispatch_locked_hit(
+                &self.runtime,
+                hit,
+                block_daa_score,
+                block_hash,
+                handler,
+                &self.subgraph,
+                snapshot,
+            ) {
+                Ok((recs, _outcome)) => records.extend(recs),
+                Err(e) => warn!(
+                    subgraph = self.subgraph.schema_name(),
+                    detector_kind = kind,
+                    handler,
+                    block_hash,
+                    error = %e,
+                    "mapping handler failed on committed hit; skipping"
+                ),
+            }
+        }
+        records
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +293,55 @@ mod tests {
         match err {
             MappingError::AbiMismatch(msg) => assert!(msg.contains("handleMissing")),
             other => panic!("expected AbiMismatch, got {other:?}"),
+        }
+    }
+
+    fn loaded(patterns: &str) -> LoadedMapping {
+        let json = format!(
+            r#"{{ "name":"t", "wasm":"t.wasm", "dataSources":[
+              {{ "name":"d", "kind":"covenant_id", "patterns":[{patterns}],
+                 "collection":null, "addresses":[],
+                 "handlers":[{{"event":"CovenantLocked","handler":"handleLock"}}] }} ]}}"#
+        );
+        LoadedMapping {
+            subgraph: SubgraphId::new("kasbonds").unwrap(),
+            dir: PathBuf::from("/unused"),
+            descriptor: BuildDescriptor::from_json(&json).unwrap(),
+            runtime: MappingRuntime::from_wasm(WAT).unwrap(),
+        }
+    }
+
+    #[test]
+    fn dispatch_committed_hits_resolves_handler_and_collects_records() {
+        // hit().kind is OpenSilverOwnable → matches the descriptor pattern.
+        let lm = loaded("\"OpenSilverOwnable\"");
+        let mut snapshot = EntitySnapshot::new();
+        snapshot.insert(("Bond".into(), "b1".into()), serde_json::json!({ "n": 1 }));
+
+        let recs = lm.dispatch_committed_hits(7, "blk", &[hit()], &snapshot);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].entity_type, "Bond");
+        assert_eq!(recs[0].block_daa_score, 7);
+        assert_eq!(recs[0].payload, serde_json::json!({ "n": 7 }));
+    }
+
+    #[test]
+    fn dispatch_committed_hits_skips_a_hit_no_data_source_matches() {
+        // Descriptor patterns don't include OpenSilverOwnable.
+        let lm = loaded("\"OpenSilverMultisig\"");
+        let recs = lm.dispatch_committed_hits(7, "blk", &[hit()], &EntitySnapshot::new());
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn load_is_not_found_when_descriptor_is_missing() {
+        match LoadedMapping::load(
+            SubgraphId::new("kasbonds").unwrap(),
+            "/nonexistent/subgraph/dir",
+        ) {
+            Err(LoadError::Manifest(ManifestError::NotFound(_))) => {}
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+            Ok(_) => panic!("expected load to fail for a missing descriptor"),
         }
     }
 }
