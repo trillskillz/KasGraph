@@ -144,6 +144,13 @@ pub struct IngestedBlock {
     /// detection: each input names the UTXO it consumes.
     #[serde(default)]
     pub inputs: Vec<IngestedTransactionInput>,
+    /// Non-empty transaction payload bytes, in transaction order. Carries
+    /// the legacy KRC-20 / inscription envelopes (which live in the tx
+    /// `payload` field, not in any script). Only transactions with a
+    /// non-empty, hex-decodable payload appear here; the common empty
+    /// case is omitted to keep the wire model lean.
+    #[serde(default)]
+    pub payloads: Vec<IngestedTransactionPayload>,
 }
 
 /// One transaction output extracted from a block. Carries the
@@ -176,6 +183,20 @@ pub struct IngestedTransactionInput {
     pub previous_tx_hash: String,
     /// `previousOutpoint.index` — the consumed output's index.
     pub previous_output_index: u32,
+}
+
+/// One transaction's payload bytes, paired with the id of the tx that
+/// carries it. The legacy KRC-20 inscription parser
+/// ([`crate`]'s consumer in `kasgraph-detectors::krc20`) reads these to
+/// recover deploy/mint/transfer/burn operations. `tx_hash` lets the
+/// ledger associate the op with the transaction (and, via the block's
+/// inputs, the sender address).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestedTransactionPayload {
+    pub tx_hash: String,
+    /// Hex-decoded transaction `payload` bytes. Always non-empty for
+    /// entries that appear in [`IngestedBlock::payloads`].
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1476,6 +1497,9 @@ fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, Rp
     let inputs = txs
         .map(|t| extract_transaction_inputs(t))
         .unwrap_or_default();
+    let payloads = txs
+        .map(|t| extract_transaction_payloads(t))
+        .unwrap_or_default();
 
     Ok(IngestedBlock {
         hash,
@@ -1485,6 +1509,7 @@ fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, Rp
         served_by: served_by.to_owned(),
         outputs,
         inputs,
+        payloads,
     })
 }
 
@@ -1584,6 +1609,40 @@ fn extract_transaction_inputs(txs: &[Value]) -> Vec<IngestedTransactionInput> {
                 previous_output_index,
             });
         }
+    }
+    out
+}
+
+/// Walk a `transactions` array and collect every non-empty transaction
+/// payload, in transaction order. Resilient like the output/input
+/// extractors: a tx missing a `payload`, with an empty payload, or whose
+/// payload isn't valid hex is skipped (the overwhelming common case is an
+/// empty payload — most transactions carry no inscription). Order is
+/// preserved so the legacy KRC-20 ledger can apply ops in transaction
+/// order.
+fn extract_transaction_payloads(txs: &[Value]) -> Vec<IngestedTransactionPayload> {
+    let mut out = Vec::new();
+    for tx in txs {
+        let payload_hex = tx.get("payload").and_then(Value::as_str).unwrap_or("");
+        if payload_hex.is_empty() {
+            continue;
+        }
+        let Ok(payload) = hex::decode(payload_hex) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+
+        let tx_hash = tx
+            .pointer("/verboseData/transactionId")
+            .and_then(Value::as_str)
+            .or_else(|| tx.get("transactionId").and_then(Value::as_str))
+            .or_else(|| tx.get("id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_owned();
+
+        out.push(IngestedTransactionPayload { tx_hash, payload });
     }
     out
 }
@@ -2533,6 +2592,38 @@ mod tests {
         assert_eq!(block.outputs[0].output_index, 0);
         assert_eq!(block.outputs[1].output_index, 1);
         assert_eq!(block.outputs[2].output_index, 2);
+    }
+
+    #[test]
+    fn parse_block_value_extracts_non_empty_payloads_in_tx_order() {
+        let envelope = r#"{"p":"krc-20","op":"mint","tick":"TEST","amt":"5"}"#;
+        let block_value = json!({
+            "header": {"hash": "h", "daaScore": 1, "blueScore": 1},
+            "transactions": [
+                // Empty payload → skipped.
+                {"verboseData": {"transactionId": "tx-empty"}, "payload": ""},
+                // No payload field → skipped.
+                {"verboseData": {"transactionId": "tx-none"}},
+                // Real inscription payload → kept, decoded to bytes.
+                {"verboseData": {"transactionId": "tx-krc20"}, "payload": hex::encode(envelope)}
+            ]
+        });
+        let block = parse_block_value(&block_value, "wrpc").unwrap();
+        assert_eq!(block.payloads.len(), 1);
+        assert_eq!(block.payloads[0].tx_hash, "tx-krc20");
+        assert_eq!(block.payloads[0].payload, envelope.as_bytes());
+    }
+
+    #[test]
+    fn parse_block_value_skips_non_hex_payloads() {
+        let block_value = json!({
+            "header": {"hash": "h", "daaScore": 1, "blueScore": 1},
+            "transactions": [
+                {"verboseData": {"transactionId": "tx-bad"}, "payload": "not-hex!!"}
+            ]
+        });
+        let block = parse_block_value(&block_value, "wrpc").unwrap();
+        assert!(block.payloads.is_empty());
     }
 
     #[test]
