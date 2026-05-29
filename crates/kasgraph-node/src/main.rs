@@ -1400,6 +1400,7 @@ fn block_to_rpc(block: &BootstrapBlock) -> IngestedBlock {
         is_finalized: block.is_finalized,
         served_by: block.served_by.clone(),
         outputs: block.outputs.clone(),
+        inputs: Vec::new(),
     }
 }
 
@@ -1899,6 +1900,7 @@ mod tests {
             is_finalized: true,
             served_by: "wrpc".to_owned(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
         };
         let hits_a = vec![DetectedPattern {
             kind: DetectorKind::OpenSilverOwnable,
@@ -1939,6 +1941,7 @@ mod tests {
             is_finalized: true,
             served_by: "wrpc".to_owned(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
         };
         let hit_one = DetectedPattern {
             kind: DetectorKind::OpenSilverOwnable,
@@ -1973,6 +1976,7 @@ mod tests {
             is_finalized: true,
             served_by: "wrpc".to_owned(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
         };
         // Two payloads with the same key/value pairs but constructed
         // from different JSON literals — serde preserves source
@@ -2054,6 +2058,7 @@ mod tests {
             is_finalized: true,
             served_by: "primary".to_owned(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
         };
 
         let mapped = block_from_rpc(block);

@@ -138,6 +138,12 @@ pub struct IngestedBlock {
     /// where the detector pipeline needs script bytes.
     #[serde(default)]
     pub outputs: Vec<IngestedTransactionOutput>,
+    /// Per-input previous-outpoint references parsed from the block's
+    /// transactions. Empty when the upstream payload omits `transactions`
+    /// or the inputs (e.g. header-only notifications). Drives spend
+    /// detection: each input names the UTXO it consumes.
+    #[serde(default)]
+    pub inputs: Vec<IngestedTransactionInput>,
 }
 
 /// One transaction output extracted from a block. Carries the
@@ -155,6 +161,21 @@ pub struct IngestedTransactionOutput {
     /// Output value in sompi. `0` when the upstream payload omits it
     /// or it fails to parse.
     pub value: u64,
+}
+
+/// One transaction input extracted from a block. Carries the previous
+/// outpoint it consumes, which is what spend detection matches against a
+/// tracked covenant UTXO: when `(previous_tx_hash, previous_output_index)`
+/// equals a covenant output the indexer locked earlier, this input is that
+/// covenant's spend, performed by `spending_tx_hash`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestedTransactionInput {
+    /// Transaction id of the tx that contains this input (the spender).
+    pub spending_tx_hash: String,
+    /// `previousOutpoint.transactionId` — the tx whose output is consumed.
+    pub previous_tx_hash: String,
+    /// `previousOutpoint.index` — the consumed output's index.
+    pub previous_output_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1448,11 +1469,9 @@ fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, Rp
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let outputs = value
-        .get("transactions")
-        .and_then(Value::as_array)
-        .map(|txs| extract_transaction_outputs(txs))
-        .unwrap_or_default();
+    let txs = value.get("transactions").and_then(Value::as_array);
+    let outputs = txs.map(|t| extract_transaction_outputs(t)).unwrap_or_default();
+    let inputs = txs.map(|t| extract_transaction_inputs(t)).unwrap_or_default();
 
     Ok(IngestedBlock {
         hash,
@@ -1461,6 +1480,7 @@ fn parse_block_value(value: &Value, served_by: &str) -> Result<IngestedBlock, Rp
         is_finalized,
         served_by: served_by.to_owned(),
         outputs,
+        inputs,
     })
 }
 
@@ -1510,6 +1530,51 @@ fn extract_transaction_outputs(txs: &[Value]) -> Vec<IngestedTransactionOutput> 
                 output_index: idx as u32,
                 script_public_key,
                 value,
+            });
+        }
+    }
+    out
+}
+
+/// Walk a `transactions` array and collect every input's previous
+/// outpoint plus the id of the tx that spends it. Resilient in the same
+/// way as [`extract_transaction_outputs`]: an input that lacks a parseable
+/// `previousOutpoint` is skipped rather than failing the block parse.
+/// Coinbase inputs (no real previous outpoint) carry an all-zero
+/// transactionId and are kept as-is; spend matching never tracks a
+/// zero-hash UTXO, so they're inert downstream.
+fn extract_transaction_inputs(txs: &[Value]) -> Vec<IngestedTransactionInput> {
+    let mut out = Vec::new();
+    for tx in txs {
+        let spending_tx_hash = tx
+            .pointer("/verboseData/transactionId")
+            .and_then(Value::as_str)
+            .or_else(|| tx.get("transactionId").and_then(Value::as_str))
+            .or_else(|| tx.get("id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_owned();
+
+        let Some(inputs) = tx.get("inputs").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for input in inputs {
+            let Some(previous_tx_hash) = input
+                .pointer("/previousOutpoint/transactionId")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            // `index` is usually a JSON number but tolerate a stringified one.
+            let previous_output_index = input
+                .pointer("/previousOutpoint/index")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0) as u32;
+
+            out.push(IngestedTransactionInput {
+                spending_tx_hash: spending_tx_hash.clone(),
+                previous_tx_hash: previous_tx_hash.to_owned(),
+                previous_output_index,
             });
         }
     }
@@ -2354,6 +2419,67 @@ mod tests {
         });
         let block = parse_block_value(&block_value, "wrpc").unwrap();
         assert!(block.outputs.is_empty());
+        assert!(block.inputs.is_empty());
+    }
+
+    #[test]
+    fn parse_block_value_extracts_input_previous_outpoints() {
+        // A spend tx (tx-spend) consuming two prior outpoints, plus a
+        // coinbase-style tx whose input has an all-zero previous tx id.
+        let block_value = json!({
+            "header": {"hash": "block-in-test", "daaScore": 100, "blueScore": 99},
+            "transactions": [
+                {
+                    "verboseData": {"transactionId": "tx-spend"},
+                    "inputs": [
+                        {"previousOutpoint": {"transactionId": "cov-utxo", "index": 0}},
+                        {"previousOutpoint": {"transactionId": "fee-utxo", "index": 3}}
+                    ],
+                    "outputs": []
+                },
+                {
+                    "verboseData": {"transactionId": "tx-coinbase"},
+                    "inputs": [
+                        {"previousOutpoint": {"transactionId": "0".repeat(64), "index": 0}}
+                    ]
+                }
+            ]
+        });
+
+        let block = parse_block_value(&block_value, "wrpc").expect("parse");
+        assert_eq!(block.inputs.len(), 3);
+
+        assert_eq!(block.inputs[0].spending_tx_hash, "tx-spend");
+        assert_eq!(block.inputs[0].previous_tx_hash, "cov-utxo");
+        assert_eq!(block.inputs[0].previous_output_index, 0);
+
+        assert_eq!(block.inputs[1].spending_tx_hash, "tx-spend");
+        assert_eq!(block.inputs[1].previous_tx_hash, "fee-utxo");
+        assert_eq!(block.inputs[1].previous_output_index, 3);
+
+        assert_eq!(block.inputs[2].spending_tx_hash, "tx-coinbase");
+    }
+
+    #[test]
+    fn parse_block_value_skips_inputs_without_a_previous_outpoint() {
+        // An input missing previousOutpoint is skipped; a valid sibling
+        // is still extracted (index tolerated as a stringified number).
+        let block_value = json!({
+            "header": {"hash": "h", "daaScore": 1, "blueScore": 1},
+            "transactions": [
+                {
+                    "verboseData": {"transactionId": "tx-1"},
+                    "inputs": [
+                        {"signatureScript": "ab"},
+                        {"previousOutpoint": {"transactionId": "u", "index": "7"}}
+                    ]
+                }
+            ]
+        });
+        let block = parse_block_value(&block_value, "wrpc").unwrap();
+        assert_eq!(block.inputs.len(), 1);
+        assert_eq!(block.inputs[0].previous_tx_hash, "u");
+        assert_eq!(block.inputs[0].previous_output_index, 7);
     }
 
     #[test]
