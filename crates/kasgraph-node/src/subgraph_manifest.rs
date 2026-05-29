@@ -11,6 +11,14 @@ use serde::Deserialize;
 /// on a committed block fires the `CovenantLocked` handler.
 pub const EVENT_COVENANT_LOCKED: &str = "CovenantLocked";
 
+/// A spend that consumes a previously-locked covenant UTXO fires the
+/// `CovenantSpent` handler. The detector kind used to resolve this handler
+/// is the kind of the *locked* covenant being spent (carried on the lineage
+/// head), so the same data source whose `patterns` matched the lock also
+/// owns the spend transition.
+#[allow(dead_code)]
+pub const EVENT_COVENANT_SPENT: &str = "CovenantSpent";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("manifest descriptor not found at {0}")]

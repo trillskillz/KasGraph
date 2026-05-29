@@ -18,6 +18,7 @@ use kasgraph_mapping::{
     DispatchOutcome, EntitySnapshot, MappingError, MappingEvent, MappingRuntime,
 };
 use kasgraph_store::{EntityVersionRecord, SubgraphId};
+use serde::Serialize;
 use tracing::warn;
 
 use crate::subgraph_manifest::{BuildDescriptor, ManifestError, EVENT_COVENANT_LOCKED};
@@ -75,6 +76,68 @@ pub fn dispatch_locked_hit(
     snapshot: &EntitySnapshot,
 ) -> Result<(Vec<EntityVersionRecord>, DispatchOutcome), MappingError> {
     let event = locked_mapping_event(hit, block_daa_score, block_hash, handler);
+    let outcome = runtime.dispatch_with_entities(event, snapshot)?;
+    let records = entity_versions(&outcome, subgraph, block_daa_score as i64);
+    Ok((records, outcome))
+}
+
+/// The protocol-observable envelope for a covenant spend, matching the
+/// `CovenantSpend` interface the CLI codegen emits. These fields come from
+/// the spend transaction plus the KIP-20 lineage tracker, so they stay
+/// honest even when the locked covenant's pattern isn't registered.
+/// Subgraph-specific quantities (token amounts, balances) are derived by
+/// the mapping, not carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CovenantSpend {
+    /// The covenant operation the spend performed (protocol-defined).
+    pub operation: String,
+    /// Value moved by the spend, in sompi, as a decimal string (matches
+    /// the codegen type, which avoids JS number precision loss).
+    pub spent_value_sompi: String,
+    /// The covenant id this spend rolled forward into, or `None` when the
+    /// spend terminates the lineage (a final redeem/burn).
+    pub successor_covenant_id: Option<String>,
+}
+
+/// Build the mapping event for a `CovenantSpent` transition. The payload is
+/// `{ "spend": <CovenantSpend>, "state": <prior locked state> }`, mirroring
+/// the `{ spend; state }` shape the codegen types for spend handlers. The
+/// prior locked state is the detector payload captured when the covenant was
+/// locked (the indexer holds it on the lineage head / committed hit row).
+#[allow(dead_code)]
+pub fn spend_mapping_event(
+    spend: &CovenantSpend,
+    prior_state: serde_json::Value,
+    block_daa_score: u64,
+    block_hash: &str,
+    handler: impl Into<String>,
+) -> MappingEvent {
+    MappingEvent {
+        block_daa_score,
+        block_hash: block_hash.to_string(),
+        payload: serde_json::json!({ "spend": spend, "state": prior_state }),
+        handler: handler.into(),
+    }
+}
+
+/// Dispatch one spend transition through a compiled subgraph mapping,
+/// seeding the handler's `store_get` reads from `snapshot`, and return the
+/// versioned records it produced alongside the raw outcome. Symmetric to
+/// [`dispatch_locked_hit`] but for the `CovenantSpent` event; dispatch
+/// errors propagate so the caller decides how a bad mapping is handled.
+#[allow(dead_code)]
+pub fn dispatch_spend_hit(
+    runtime: &MappingRuntime,
+    spend: &CovenantSpend,
+    prior_state: serde_json::Value,
+    block_daa_score: u64,
+    block_hash: &str,
+    handler: &str,
+    subgraph: &SubgraphId,
+    snapshot: &EntitySnapshot,
+) -> Result<(Vec<EntityVersionRecord>, DispatchOutcome), MappingError> {
+    let event = spend_mapping_event(spend, prior_state, block_daa_score, block_hash, handler);
     let outcome = runtime.dispatch_with_entities(event, snapshot)?;
     let records = entity_versions(&outcome, subgraph, block_daa_score as i64);
     Ok((records, outcome))
@@ -328,6 +391,80 @@ mod tests {
         let lm = loaded("\"OpenSilverMultisig\"");
         let recs = lm.dispatch_committed_hits(7, "blk", &[hit()], &EntitySnapshot::new());
         assert!(recs.is_empty());
+    }
+
+    fn spend() -> CovenantSpend {
+        CovenantSpend {
+            operation: "transfer".into(),
+            spent_value_sompi: "100000000".into(),
+            successor_covenant_id: Some("cov-2".into()),
+        }
+    }
+
+    #[test]
+    fn spend_mapping_event_wraps_spend_and_prior_state() {
+        let ev = spend_mapping_event(
+            &spend(),
+            serde_json::json!({ "owner": "abcd" }),
+            42,
+            "block-h",
+            "handleSpent",
+        );
+        assert_eq!(ev.block_daa_score, 42);
+        assert_eq!(ev.block_hash, "block-h");
+        assert_eq!(ev.handler, "handleSpent");
+        // CovenantSpend serializes camelCase under the `spend` key, with the
+        // prior locked state preserved verbatim under `state`.
+        assert_eq!(
+            ev.payload,
+            serde_json::json!({
+                "spend": {
+                    "operation": "transfer",
+                    "spentValueSompi": "100000000",
+                    "successorCovenantId": "cov-2"
+                },
+                "state": { "owner": "abcd" }
+            })
+        );
+    }
+
+    #[test]
+    fn spend_mapping_event_emits_null_successor_when_lineage_terminates() {
+        let terminal = CovenantSpend {
+            operation: "burn".into(),
+            spent_value_sompi: "0".into(),
+            successor_covenant_id: None,
+        };
+        let ev = spend_mapping_event(&terminal, serde_json::Value::Null, 1, "b", "handleSpent");
+        assert_eq!(ev.payload["spend"]["successorCovenantId"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn dispatch_spend_hit_seeds_snapshot_and_returns_versioned_records() {
+        // Reuses the WAT handler (it ignores the payload), proving the spend
+        // path drives dispatch + snapshot seeding identically to the locked path.
+        let runtime = MappingRuntime::from_wasm(WAT).unwrap();
+        let subgraph = SubgraphId::new("kasbonds").unwrap();
+        let mut snapshot = EntitySnapshot::new();
+        snapshot.insert(("Bond".into(), "b1".into()), serde_json::json!({ "n": 1 }));
+
+        let (recs, outcome) = dispatch_spend_hit(
+            &runtime,
+            &spend(),
+            serde_json::json!({ "owner": "abcd" }),
+            777,
+            "block-h",
+            "handleLock",
+            &subgraph,
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].entity_type, "Bond");
+        assert_eq!(recs[0].block_daa_score, 777);
+        assert_eq!(recs[0].payload, serde_json::json!({ "n": 7 }));
+        assert!(outcome.fuel_consumed > 0);
     }
 
     #[test]
