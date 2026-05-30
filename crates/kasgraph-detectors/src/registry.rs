@@ -18,6 +18,7 @@ use crate::fingerprint::{Fingerprint, MaskedWindow, PatternMatcher};
 use crate::kcc20_asset_fingerprint::kcc20_asset_fingerprint;
 use crate::opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
 use crate::opensilver_timelock_fingerprint::opensilver_timelock_fingerprint;
+use crate::opensilver_vault_fingerprint::opensilver_vault_fingerprint;
 use crate::DetectorKind;
 
 /// One entry in the detector registry.
@@ -55,15 +56,14 @@ fn build_registry() -> Vec<DetectorEntry> {
             kind: DetectorKind::OpenSilverTimeLock,
             matcher: PatternMatcher::Exact(opensilver_timelock_fingerprint()),
         },
-        opensilver(
-            DetectorKind::OpenSilverVault,
-            0x04,
-            &[
-                ("owner_pubkey", 32),
-                ("recovery_pubkey", 32),
-                ("recovery_delay_blocks", 8),
-            ],
-        ),
+        // Real exact fingerprint (captured from vault.sil — fixed-size). The
+        // nine-field state (owner / has_pending / pending_owner / threshold /
+        // pk1..3 / unlock_time / beneficiary) replaces the placeholder's wrong
+        // three-field guess.
+        DetectorEntry {
+            kind: DetectorKind::OpenSilverVault,
+            matcher: PatternMatcher::Exact(opensilver_vault_fingerprint()),
+        },
         opensilver(
             DetectorKind::OpenSilverEscrowBilateral,
             0x05,
@@ -223,7 +223,7 @@ fn opensilver(
     for &(field, len) in fields {
         // Pad with zero bytes inside the state window; bytes here
         // don't matter for matching, only the offset/len does.
-        bytes.extend(std::iter::repeat(0u8).take(len));
+        bytes.extend(std::iter::repeat_n(0u8, len));
         windows.push(MaskedWindow {
             field: field_label(kind, field),
             offset: cursor,

@@ -48,8 +48,14 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
     kind: "OpenSilverVault",
     fields: [
       { name: "owner_pubkey", byteLen: 32 },
-      { name: "recovery_pubkey", byteLen: 32 },
-      { name: "recovery_delay_blocks", byteLen: 8 },
+      { name: "has_pending", byteLen: 1 },
+      { name: "pending_owner_pubkey", byteLen: 32 },
+      { name: "threshold", byteLen: 8 },
+      { name: "signer_pubkey_1", byteLen: 32 },
+      { name: "signer_pubkey_2", byteLen: 32 },
+      { name: "signer_pubkey_3", byteLen: 32 },
+      { name: "unlock_time", byteLen: 8 },
+      { name: "beneficiary_pubkey", byteLen: 32 },
     ],
   },
   {

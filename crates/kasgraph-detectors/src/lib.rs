@@ -38,6 +38,7 @@ pub mod krc721;
 pub mod krc721_ledger;
 pub mod opensilver_ownable_fingerprint;
 pub mod opensilver_timelock_fingerprint;
+pub mod opensilver_vault_fingerprint;
 pub mod registry;
 
 pub use fingerprint::{
@@ -55,6 +56,7 @@ pub use krc721::{parse_krc721_inscription, Krc721Inscription, Krc721Op, Krc721Pa
 pub use krc721_ledger::{CollectionState, Krc721Ledger};
 pub use opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
 pub use opensilver_timelock_fingerprint::opensilver_timelock_fingerprint;
+pub use opensilver_vault_fingerprint::opensilver_vault_fingerprint;
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::{Deserialize, Serialize};
