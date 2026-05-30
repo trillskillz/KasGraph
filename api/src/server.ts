@@ -91,6 +91,10 @@ export function createKasGraphServer(
           resolvers.covenantLineage(
             args as Parameters<GatewayResolvers['covenantLineage']>[0],
           ),
+        entity: (_root, args) =>
+          resolvers.entity(args as Parameters<GatewayResolvers['entity']>[0]),
+        entities: (_root, args) =>
+          resolvers.entities(args as Parameters<GatewayResolvers['entities']>[0]),
       },
       Subscription: {
         detectedPatterns: {

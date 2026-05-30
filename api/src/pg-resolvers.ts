@@ -25,6 +25,9 @@ import type {
   CovenantLineageEntry,
   DetectedPattern,
   DetectedPatternsArgs,
+  EntitiesArgs,
+  Entity,
+  EntityArgs,
   GatewayResolvers,
   PoiCheckpoint,
   PoiCheckpointsArgs,
@@ -123,6 +126,38 @@ interface LineageEntryRow extends QueryResultRow {
   output_index: number;
   daa_score: unknown;
   state_bytes: unknown;
+}
+
+interface EntityRow extends QueryResultRow {
+  entity_type: string;
+  entity_id: string;
+  block_daa_score: unknown;
+  payload: unknown;
+}
+
+function rowToEntity(row: EntityRow): Entity {
+  return {
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    blockDaaScore: bigIntString(row.block_daa_score),
+    ...(row.payload != null && typeof row.payload === 'object'
+      ? { data: row.payload as Record<string, unknown> }
+      : {}),
+  };
+}
+
+// A subgraph's entities live in its own Postgres schema (`"<id>".entity_versions`),
+// so the id is interpolated into the table-qualified name. It is NOT a bind
+// parameter, so it must be validated to the same charset the store's
+// `SubgraphId` enforces (lowercase ASCII + digits + underscore) — never trust
+// it raw.
+function validatedSchema(subgraph: string): string {
+  if (!/^[a-z0-9_]+$/.test(subgraph)) {
+    throw new Error(
+      `invalid subgraph id \`${subgraph}\`: only lowercase letters, digits, and underscores are allowed`,
+    );
+  }
+  return subgraph;
 }
 
 function rowToCommittedBlock(row: CommittedBlockRow): CommittedBlock {
@@ -274,5 +309,35 @@ export class PgGatewayResolvers implements GatewayResolvers {
       lastSeenDaa: bigIntString(head.last_seen_daa),
       entries: rowsResult.rows.map(rowToLineageEntry),
     };
+  }
+
+  async entity(args: EntityArgs): Promise<Entity | null> {
+    const schema = validatedSchema(args.subgraph);
+    const result = await this.pool.query<EntityRow>(
+      `SELECT entity_type, entity_id, block_daa_score, payload
+       FROM "${schema}".entity_versions
+       WHERE entity_type = $1 AND entity_id = $2
+       ORDER BY block_daa_score DESC
+       LIMIT 1`,
+      [args.entityType, args.id],
+    );
+    const row = result.rows[0];
+    return row === undefined ? null : rowToEntity(row);
+  }
+
+  async entities(args: EntitiesArgs): Promise<Entity[]> {
+    const schema = validatedSchema(args.subgraph);
+    const limit = boundedFirst(args.first);
+    // Latest version of each entity id of this type: DISTINCT ON the id,
+    // taking the highest block_daa_score per id.
+    const result = await this.pool.query<EntityRow>(
+      `SELECT DISTINCT ON (entity_id) entity_type, entity_id, block_daa_score, payload
+       FROM "${schema}".entity_versions
+       WHERE entity_type = $1
+       ORDER BY entity_id, block_daa_score DESC
+       LIMIT $2`,
+      [args.entityType, limit],
+    );
+    return result.rows.map(rowToEntity);
   }
 }

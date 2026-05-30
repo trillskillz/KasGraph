@@ -254,3 +254,71 @@ describe('PgGatewayResolvers — covenantLineage', () => {
     expect('stateBytesHex' in got!.entries[0]!).toBe(false);
   });
 });
+
+describe('PgGatewayResolvers — entity / entities', () => {
+  it('reads one entity from the subgraph schema, binds (entityType, id)', async () => {
+    const pool = new MockPool([
+      [{ entity_type: 'Bond', entity_id: 'b1', block_daa_score: '200', payload: { n: 7 } }],
+    ]);
+    const got = await new PgGatewayResolvers(pool).entity({
+      subgraph: 'kasbonds',
+      entityType: 'Bond',
+      id: 'b1',
+    });
+    const call = lastCall(pool);
+    expect(call.sql).toMatch(/FROM "kasbonds"\.entity_versions/);
+    expect(call.sql).toMatch(/WHERE entity_type = \$1 AND entity_id = \$2/);
+    expect(normalizeSql(call.sql)).toMatch(/ORDER BY block_daa_score DESC LIMIT 1/);
+    expect(call.values).toEqual(['Bond', 'b1']);
+    expect(got).toEqual({
+      entityType: 'Bond',
+      entityId: 'b1',
+      data: { n: 7 },
+      blockDaaScore: '200',
+    });
+  });
+
+  it('returns null when the entity is missing', async () => {
+    const pool = new MockPool([[]]);
+    const got = await new PgGatewayResolvers(pool).entity({
+      subgraph: 'kasbonds',
+      entityType: 'Bond',
+      id: 'nope',
+    });
+    expect(got).toBeNull();
+  });
+
+  it('lists latest-per-id entities with DISTINCT ON and a bounded LIMIT', async () => {
+    const pool = new MockPool([
+      [
+        { entity_type: 'Bond', entity_id: 'b1', block_daa_score: '200', payload: { v: 1 } },
+        { entity_type: 'Bond', entity_id: 'b2', block_daa_score: '150', payload: { v: 2 } },
+      ],
+    ]);
+    const got = await new PgGatewayResolvers(pool).entities({
+      subgraph: 'kasbonds',
+      entityType: 'Bond',
+      first: 25,
+    });
+    const call = lastCall(pool);
+    expect(normalizeSql(call.sql)).toMatch(/SELECT DISTINCT ON \(entity_id\)/);
+    expect(call.sql).toMatch(/FROM "kasbonds"\.entity_versions/);
+    expect(normalizeSql(call.sql)).toMatch(/ORDER BY entity_id, block_daa_score DESC LIMIT \$2/);
+    expect(call.values).toEqual(['Bond', 25]);
+    expect(got).toHaveLength(2);
+    expect(got[0]).toMatchObject({ entityId: 'b1', data: { v: 1 } });
+  });
+
+  it('rejects an injection-unsafe subgraph id before querying', async () => {
+    const pool = new MockPool([]);
+    await expect(
+      new PgGatewayResolvers(pool).entity({
+        subgraph: 'evil"; DROP TABLE x; --',
+        entityType: 'Bond',
+        id: 'b1',
+      }),
+    ).rejects.toThrow(/invalid subgraph id/);
+    // No query was issued.
+    expect(pool.calls).toHaveLength(0);
+  });
+});

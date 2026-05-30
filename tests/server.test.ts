@@ -57,6 +57,24 @@ class InMemoryResolvers implements GatewayResolvers {
   async covenantLineage() {
     return null;
   }
+  async entity() {
+    return {
+      entityType: 'Bond',
+      entityId: 'b1',
+      data: { n: 7 },
+      blockDaaScore: '100',
+    };
+  }
+  async entities() {
+    return [
+      {
+        entityType: 'Bond',
+        entityId: 'b1',
+        data: { n: 7 },
+        blockDaaScore: '100',
+      },
+    ];
+  }
 }
 
 async function postQuery(

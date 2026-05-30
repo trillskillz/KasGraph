@@ -137,6 +137,16 @@ export interface CovenantLineage {
   entries: CovenantLineageEntry[];
 }
 
+/// One mapping-emitted entity, at its latest committed version. `data` is the
+/// subgraph-defined entity state (schema-less JSON); `blockDaaScore` is the
+/// version height.
+export interface Entity {
+  entityType: string;
+  entityId: string;
+  data?: Record<string, unknown>;
+  blockDaaScore: string; // BigInt over the wire
+}
+
 // ---------------------------------------------------------------
 // Query argument shapes
 // ---------------------------------------------------------------
@@ -168,6 +178,18 @@ export interface CovenantLineageArgs {
   covenantId: string;
 }
 
+export interface EntityArgs {
+  subgraph: string;
+  entityType: string;
+  id: string;
+}
+
+export interface EntitiesArgs {
+  subgraph: string;
+  entityType: string;
+  first?: number;
+}
+
 // ---------------------------------------------------------------
 // Resolver contract — production impl talks to Postgres, test impl
 // is in-memory. Same dispatch either way.
@@ -179,6 +201,8 @@ export interface GatewayResolvers {
   poiCheckpoints(args: PoiCheckpointsArgs): Promise<PoiCheckpoint[]>;
   detectedPatterns(args: DetectedPatternsArgs): Promise<DetectedPattern[]>;
   covenantLineage(args: CovenantLineageArgs): Promise<CovenantLineage | null>;
+  entity(args: EntityArgs): Promise<Entity | null>;
+  entities(args: EntitiesArgs): Promise<Entity[]>;
 }
 
 // ---------------------------------------------------------------
@@ -231,6 +255,14 @@ export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
     entries: [CovenantLineageEntry!]!
   }
 
+  "A mapping-emitted entity at its latest committed version."
+  type Entity {
+    entityType: String!
+    entityId: String!
+    data: JSON
+    blockDaaScore: BigInt!
+  }
+
   type Query {
     committedBlock(subgraph: String!, hash: String!): CommittedBlock
     committedBlocks(subgraph: String!, first: Int = 50): [CommittedBlock!]!
@@ -246,6 +278,10 @@ export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
       first: Int = 50
     ): [DetectedPattern!]!
     covenantLineage(covenantId: String!): CovenantLineage
+    "Latest committed state of one entity in a subgraph."
+    entity(subgraph: String!, entityType: String!, id: String!): Entity
+    "Latest committed state of every entity of a type in a subgraph."
+    entities(subgraph: String!, entityType: String!, first: Int = 50): [Entity!]!
   }
 
   type Subscription {
