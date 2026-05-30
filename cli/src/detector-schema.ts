@@ -158,34 +158,40 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
   {
     kind: "KCC20OwnableController",
     fields: [
-      { name: "owner_pubkey", byteLen: 32 },
-      { name: "pending_owner_pubkey", byteLen: 32 },
-      { name: "asset_covenant_id", byteLen: 32 },
+      { name: "admin_pubkey", byteLen: 32 },
+      { name: "has_pending_admin", byteLen: 1 },
+      { name: "pending_admin_pubkey", byteLen: 32 },
+      { name: "kcc20_covenant_id", byteLen: 32 },
+      { name: "initialized", byteLen: 1 },
     ],
   },
   {
     kind: "KCC20PausableController",
     fields: [
-      { name: "owner_pubkey", byteLen: 32 },
-      { name: "paused_flag", byteLen: 1 },
-      { name: "asset_covenant_id", byteLen: 32 },
+      { name: "kcc20_covenant_id", byteLen: 32 },
+      { name: "paused", byteLen: 1 },
+      { name: "initialized", byteLen: 1 },
     ],
   },
   {
     kind: "KCC20CappedController",
     fields: [
-      { name: "owner_pubkey", byteLen: 32 },
-      { name: "remaining_allowance", byteLen: 16 },
-      { name: "asset_covenant_id", byteLen: 32 },
+      { name: "kcc20_covenant_id", byteLen: 32 },
+      { name: "total_cap", byteLen: 8 },
+      { name: "remaining_allowance", byteLen: 8 },
+      { name: "initialized", byteLen: 1 },
     ],
   },
   {
     kind: "KCC20VestingController",
     fields: [
-      { name: "owner_pubkey", byteLen: 32 },
-      { name: "schedule_root", byteLen: 32 },
-      { name: "schedule_count", byteLen: 1 },
-      { name: "asset_covenant_id", byteLen: 32 },
+      { name: "total_allocation", byteLen: 8 },
+      { name: "minted_amount", byteLen: 8 },
+      { name: "cliff_time", byteLen: 8 },
+      { name: "period", byteLen: 8 },
+      { name: "release_per_period", byteLen: 8 },
+      { name: "kcc20_covenant_id", byteLen: 32 },
+      { name: "initialized", byteLen: 1 },
     ],
   },
 ];

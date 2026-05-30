@@ -31,7 +31,11 @@
 
 pub mod fingerprint;
 pub mod kcc20_asset_fingerprint;
+pub mod kcc20_capped_controller;
 pub mod kcc20_operation;
+pub mod kcc20_ownable_controller;
+pub mod kcc20_pausable_controller;
+pub mod kcc20_vesting_controller;
 pub mod krc20;
 pub mod krc20_ledger;
 pub mod krc721;
@@ -55,10 +59,14 @@ pub use fingerprint::{
     PatternMatcher,
 };
 pub use kcc20_asset_fingerprint::kcc20_asset_fingerprint;
+pub use kcc20_capped_controller::kcc20_capped_controller_fingerprint;
 pub use kcc20_operation::{
     classify_kcc20_operation, kcc20_spend_operation, Kcc20DecodeError, Kcc20Operation,
     Kcc20ReceiptState,
 };
+pub use kcc20_ownable_controller::kcc20_ownable_controller_fingerprint;
+pub use kcc20_pausable_controller::kcc20_pausable_controller_fingerprint;
+pub use kcc20_vesting_controller::kcc20_vesting_controller_fingerprint;
 pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 pub use krc20_ledger::{ApplyOutcome, Krc20Ledger, TokenState};
 pub use krc721::{parse_krc721_inscription, Krc721Inscription, Krc721Op, Krc721Parse};
