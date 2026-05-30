@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use crate::fingerprint::{Fingerprint, MaskedWindow, PatternMatcher};
 use crate::kcc20_asset_fingerprint::kcc20_asset_fingerprint;
 use crate::opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
+use crate::opensilver_timelock_fingerprint::opensilver_timelock_fingerprint;
 use crate::DetectorKind;
 
 /// One entry in the detector registry.
@@ -49,11 +50,11 @@ fn build_registry() -> Vec<DetectorEntry> {
             0x02,
             &[("signer_pubkeys", 96), ("threshold", 1)],
         ),
-        opensilver(
-            DetectorKind::OpenSilverTimeLock,
-            0x03,
-            &[("unlock_daa_score", 8), ("beneficiary_pubkey", 32)],
-        ),
+        // Real exact fingerprint (captured from timelock.sil — fixed-size).
+        DetectorEntry {
+            kind: DetectorKind::OpenSilverTimeLock,
+            matcher: PatternMatcher::Exact(opensilver_timelock_fingerprint()),
+        },
         opensilver(
             DetectorKind::OpenSilverVault,
             0x04,
@@ -328,13 +329,18 @@ mod tests {
     }
 
     #[test]
-    fn every_exact_entry_has_a_unique_discriminator() {
-        // Discriminators are the placeholder-fingerprint scheme; anchored
-        // (real-script) entries are distinguished by head/tail content instead
-        // and are covered by the cross-match test below.
+    fn every_placeholder_entry_has_a_unique_discriminator() {
+        // The `0xFE`-prefixed discriminator is the *placeholder* fingerprint
+        // scheme. Real captured fingerprints (exact or anchored) don't follow
+        // it — they share a common SilverScript prologue and are distinguished
+        // by full content instead (the cross-match test below). So this
+        // uniqueness check applies only while placeholders remain.
         let mut seen = std::collections::HashSet::new();
         for entry in all() {
             if let PatternMatcher::Exact(f) = &entry.matcher {
+                if f.bytes.first() != Some(&0xFE) {
+                    continue; // a real captured fingerprint, not a placeholder
+                }
                 let disc = (f.bytes[0], f.bytes[1]);
                 assert!(
                     seen.insert(disc),

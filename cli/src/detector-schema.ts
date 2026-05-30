@@ -38,8 +38,10 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
   {
     kind: "OpenSilverTimeLock",
     fields: [
-      { name: "unlock_daa_score", byteLen: 8 },
+      { name: "owner_pubkey", byteLen: 32 },
       { name: "beneficiary_pubkey", byteLen: 32 },
+      { name: "unlock_time", byteLen: 8 },
+      { name: "soft_cancel", byteLen: 1 },
     ],
   },
   {
