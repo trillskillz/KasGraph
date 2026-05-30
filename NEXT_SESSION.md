@@ -2,7 +2,15 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-29 — GraphQL entity-state queries: index → queryable)
+## Latest commit arc (2026-05-29 — GraphQL covenantSpends query)
+
+Exposes the spend records the now-live `CovenantSpent` dispatch persists, mirroring the entity resolver.
+
+- **`@kasgraph/api`**: `CovenantSpend { spendingTxHash, previousTxHash, previousOutputIndex, blockDaaScore, detectorKind, covenantId, spentValueSompi, successorCovenantId }` type + `covenantSpends(subgraph, covenantId, first)` Query. `PgGatewayResolvers.covenantSpends` reads the per-subgraph `"<schema>".covenant_spends` (same validated schema interpolation as `entity`), optional `covenant_id` filter, ordered by DAA desc. (`operation` isn't on the record — its effect lands in entity state, queryable via `entity`.) Wired into `server.ts` + `InMemoryResolvers` + `GatewayResolvers`.
+- Verified: typecheck clean; vitest 192 (+2 resolver tests: BIGINT/nullable mapping + covenant-id filter). No Rust change.
+- **Next query-layer:** typed per-subgraph GraphQL schema (entities/data are generic `JSON` today). Other open tracks: capture xtask for remaining fingerprints; `persist_lineage` fork model; `deploy/status/logs/remove` CLI + Phase 5.
+
+## Previous commit arc (2026-05-29 — GraphQL entity-state queries: index → queryable)
 
 The headline product gap: the indexer persisted mapping-emitted entities (`entity_versions`) but the GraphQL gateway had no way to read them. Now it does — closing the loop from "indexed" to "queryable."
 

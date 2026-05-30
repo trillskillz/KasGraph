@@ -75,6 +75,9 @@ class InMemoryResolvers implements GatewayResolvers {
       },
     ];
   }
+  async covenantSpends() {
+    return [];
+  }
 }
 
 async function postQuery(

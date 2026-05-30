@@ -322,3 +322,63 @@ describe('PgGatewayResolvers — entity / entities', () => {
     expect(pool.calls).toHaveLength(0);
   });
 });
+
+describe('PgGatewayResolvers — covenantSpends', () => {
+  it('reads spends from the subgraph schema, maps BIGINT + nullable cols', async () => {
+    const pool = new MockPool([
+      [
+        {
+          spending_tx_hash: 'txs',
+          previous_tx_hash: 'txl',
+          previous_output_index: 0,
+          block_daa_score: '200',
+          detector_kind: 'KCC20Asset',
+          covenant_id: 'cid-A',
+          spent_value_sompi: '1000',
+          successor_covenant_id: 'cid-A',
+        },
+        {
+          spending_tx_hash: 'txs2',
+          previous_tx_hash: 'txl2',
+          previous_output_index: 1,
+          block_daa_score: '150',
+          detector_kind: 'KCC20Asset',
+          covenant_id: null,
+          spent_value_sompi: 500,
+          successor_covenant_id: null,
+        },
+      ],
+    ]);
+    const got = await new PgGatewayResolvers(pool).covenantSpends({ subgraph: 'krc20' });
+    const call = lastCall(pool);
+    expect(call.sql).toMatch(/FROM "krc20"\.covenant_spends/);
+    expect(normalizeSql(call.sql)).toMatch(/ORDER BY block_daa_score DESC, spending_tx_hash/);
+    expect(call.values).toEqual([50]); // no covenantId filter → just the LIMIT
+    expect(got[0]).toEqual({
+      spendingTxHash: 'txs',
+      previousTxHash: 'txl',
+      previousOutputIndex: 0,
+      blockDaaScore: '200',
+      detectorKind: 'KCC20Asset',
+      covenantId: 'cid-A',
+      spentValueSompi: '1000',
+      successorCovenantId: 'cid-A',
+    });
+    // Nullable covenant_id / successor omitted; numeric BIGINT stringified.
+    expect(got[1]!.spentValueSompi).toBe('500');
+    expect('covenantId' in got[1]!).toBe(false);
+    expect('successorCovenantId' in got[1]!).toBe(false);
+  });
+
+  it('filters by covenant id when provided', async () => {
+    const pool = new MockPool([[]]);
+    await new PgGatewayResolvers(pool).covenantSpends({
+      subgraph: 'krc20',
+      covenantId: 'cid-A',
+      first: 10,
+    });
+    const call = lastCall(pool);
+    expect(call.sql).toMatch(/WHERE covenant_id = \$1/);
+    expect(call.values).toEqual(['cid-A', 10]);
+  });
+});

@@ -23,6 +23,8 @@ import type {
   CovenantLineage,
   CovenantLineageArgs,
   CovenantLineageEntry,
+  CovenantSpend,
+  CovenantSpendsArgs,
   DetectedPattern,
   DetectedPatternsArgs,
   EntitiesArgs,
@@ -142,6 +144,32 @@ function rowToEntity(row: EntityRow): Entity {
     blockDaaScore: bigIntString(row.block_daa_score),
     ...(row.payload != null && typeof row.payload === 'object'
       ? { data: row.payload as Record<string, unknown> }
+      : {}),
+  };
+}
+
+interface CovenantSpendRow extends QueryResultRow {
+  spending_tx_hash: string;
+  previous_tx_hash: string;
+  previous_output_index: number;
+  block_daa_score: unknown;
+  detector_kind: string;
+  covenant_id: string | null;
+  spent_value_sompi: unknown;
+  successor_covenant_id: string | null;
+}
+
+function rowToCovenantSpend(row: CovenantSpendRow): CovenantSpend {
+  return {
+    spendingTxHash: row.spending_tx_hash,
+    previousTxHash: row.previous_tx_hash,
+    previousOutputIndex: row.previous_output_index,
+    blockDaaScore: bigIntString(row.block_daa_score),
+    detectorKind: row.detector_kind,
+    spentValueSompi: bigIntString(row.spent_value_sompi),
+    ...(row.covenant_id != null ? { covenantId: row.covenant_id } : {}),
+    ...(row.successor_covenant_id != null
+      ? { successorCovenantId: row.successor_covenant_id }
       : {}),
   };
 }
@@ -339,5 +367,28 @@ export class PgGatewayResolvers implements GatewayResolvers {
       [args.entityType, limit],
     );
     return result.rows.map(rowToEntity);
+  }
+
+  async covenantSpends(args: CovenantSpendsArgs): Promise<CovenantSpend[]> {
+    const schema = validatedSchema(args.subgraph);
+    const limit = boundedFirst(args.first);
+    const clauses: string[] = [];
+    const values: unknown[] = [];
+    if (args.covenantId !== undefined) {
+      values.push(args.covenantId);
+      clauses.push(`covenant_id = $${values.length}`);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    values.push(limit);
+    const result = await this.pool.query<CovenantSpendRow>(
+      `SELECT spending_tx_hash, previous_tx_hash, previous_output_index, block_daa_score,
+              detector_kind, covenant_id, spent_value_sompi, successor_covenant_id
+       FROM "${schema}".covenant_spends
+       ${where}
+       ORDER BY block_daa_score DESC, spending_tx_hash
+       LIMIT $${values.length}`,
+      values,
+    );
+    return result.rows.map(rowToCovenantSpend);
   }
 }

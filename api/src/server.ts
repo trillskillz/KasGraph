@@ -95,6 +95,10 @@ export function createKasGraphServer(
           resolvers.entity(args as Parameters<GatewayResolvers['entity']>[0]),
         entities: (_root, args) =>
           resolvers.entities(args as Parameters<GatewayResolvers['entities']>[0]),
+        covenantSpends: (_root, args) =>
+          resolvers.covenantSpends(
+            args as Parameters<GatewayResolvers['covenantSpends']>[0],
+          ),
       },
       Subscription: {
         detectedPatterns: {

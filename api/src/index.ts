@@ -147,6 +147,20 @@ export interface Entity {
   blockDaaScore: string; // BigInt over the wire
 }
 
+/// A detected covenant spend: a block input consumed a tracked covenant UTXO.
+/// `operation` is not stored on the record (its effect lands in entity state);
+/// this is the protocol-observable spend itself.
+export interface CovenantSpend {
+  spendingTxHash: string;
+  previousTxHash: string;
+  previousOutputIndex: number;
+  blockDaaScore: string;
+  detectorKind: string;
+  covenantId?: string;
+  spentValueSompi: string;
+  successorCovenantId?: string;
+}
+
 // ---------------------------------------------------------------
 // Query argument shapes
 // ---------------------------------------------------------------
@@ -190,6 +204,12 @@ export interface EntitiesArgs {
   first?: number;
 }
 
+export interface CovenantSpendsArgs {
+  subgraph: string;
+  covenantId?: string;
+  first?: number;
+}
+
 // ---------------------------------------------------------------
 // Resolver contract — production impl talks to Postgres, test impl
 // is in-memory. Same dispatch either way.
@@ -203,6 +223,7 @@ export interface GatewayResolvers {
   covenantLineage(args: CovenantLineageArgs): Promise<CovenantLineage | null>;
   entity(args: EntityArgs): Promise<Entity | null>;
   entities(args: EntitiesArgs): Promise<Entity[]>;
+  covenantSpends(args: CovenantSpendsArgs): Promise<CovenantSpend[]>;
 }
 
 // ---------------------------------------------------------------
@@ -263,6 +284,18 @@ export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
     blockDaaScore: BigInt!
   }
 
+  "A detected covenant spend (a block input consumed a tracked covenant UTXO)."
+  type CovenantSpend {
+    spendingTxHash: String!
+    previousTxHash: String!
+    previousOutputIndex: Int!
+    blockDaaScore: BigInt!
+    detectorKind: String!
+    covenantId: String
+    spentValueSompi: BigInt!
+    successorCovenantId: String
+  }
+
   type Query {
     committedBlock(subgraph: String!, hash: String!): CommittedBlock
     committedBlocks(subgraph: String!, first: Int = 50): [CommittedBlock!]!
@@ -282,6 +315,8 @@ export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
     entity(subgraph: String!, entityType: String!, id: String!): Entity
     "Latest committed state of every entity of a type in a subgraph."
     entities(subgraph: String!, entityType: String!, first: Int = 50): [Entity!]!
+    "Detected covenant spends in a subgraph, optionally filtered by covenant id."
+    covenantSpends(subgraph: String!, covenantId: String, first: Int = 50): [CovenantSpend!]!
   }
 
   type Subscription {
