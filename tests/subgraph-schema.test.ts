@@ -33,7 +33,7 @@ const SDL = `
     issuer: String!
     faceValueSompi: BigInt!
     redeemed: Boolean!
-    holdings: [Holding!]
+    holdings: [Holding!] @derivedFrom(field: "bond")
   }
 
   type Holding @entity {
@@ -153,5 +153,53 @@ describe('executeSubgraphQuery', () => {
     });
     expect(res.errors).toBeDefined();
     expect(pool.calls).toHaveLength(0);
+  });
+
+  it('resolves a @derivedFrom reverse relation (Bond.holdings)', async () => {
+    const pool = new MockPool([
+      [{ entity_id: 'b1', payload: { id: 'b1', issuer: 'alice' } }], // bond(id: b1)
+      [
+        { entity_id: 'h1', payload: { id: 'h1', bond: 'b1', holder: 'alice' } },
+        { entity_id: 'h2', payload: { id: 'h2', bond: 'b1', holder: 'bob' } },
+      ], // holdings where bond = b1
+    ]);
+    const res = await executeSubgraphQuery({
+      subgraphId: 'kasbonds',
+      sdl: SDL,
+      query: '{ bond(id: "b1") { id issuer holdings { id holder } } }',
+      pool,
+    });
+    expect(res.errors).toBeUndefined();
+    expect(res.data).toEqual({
+      bond: {
+        id: 'b1',
+        issuer: 'alice',
+        holdings: [
+          { id: 'h1', holder: 'alice' },
+          { id: 'h2', holder: 'bob' },
+        ],
+      },
+    });
+    // Second query is the derived-relation filter: payload->>'bond' = 'b1'.
+    expect(pool.calls[1]!.sql).toMatch(/payload->>\$2 = \$3/);
+    expect(pool.calls[1]!.values).toEqual(['Holding', 'bond', 'b1']);
+  });
+
+  it('resolves a direct entity reference by id (Holding.bond)', async () => {
+    const pool = new MockPool([
+      [{ entity_id: 'h1', payload: { id: 'h1', bond: 'b1', holder: 'alice' } }], // holding(id: h1)
+      [{ entity_id: 'b1', payload: { id: 'b1', issuer: 'alice' } }], // bond ref loaded by id
+    ]);
+    const res = await executeSubgraphQuery({
+      subgraphId: 'kasbonds',
+      sdl: SDL,
+      query: '{ holding(id: "h1") { id holder bond { id issuer } } }',
+      pool,
+    });
+    expect(res.errors).toBeUndefined();
+    expect(res.data).toEqual({
+      holding: { id: 'h1', holder: 'alice', bond: { id: 'b1', issuer: 'alice' } },
+    });
+    expect(pool.calls[1]!.values).toEqual(['Bond', 'b1']);
   });
 });

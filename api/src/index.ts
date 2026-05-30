@@ -22,7 +22,9 @@
 import {
   buildSchema,
   execute,
+  getNamedType,
   GraphQLError,
+  GraphQLObjectType,
   GraphQLScalarType,
   Kind,
   parse,
@@ -33,6 +35,7 @@ import {
 
 import {
   subgraphEntitiesOfType,
+  subgraphEntitiesWhere,
   subgraphEntityById,
   type PgPoolLike,
 } from './pg-resolvers.js';
@@ -514,6 +517,53 @@ export async function executeGraphQLQuery(
 }
 
 /**
+ * Attach resolvers for entity-to-entity relation fields on a subgraph schema.
+ * A field whose (unwrapped) type is another entity type is a relation:
+ *   - `@derivedFrom(field: F)` → a reverse relation; load the target entities
+ *     whose payload field `F` equals this entity's `id`.
+ *   - otherwise → a direct reference; the payload holds the target id (load it)
+ *     or an already-inlined object (return as-is).
+ * Scalar fields keep GraphQL's default resolution (read off the payload).
+ */
+function attachRelationResolvers(
+  schema: GraphQLSchema,
+  entityNames: Set<string>,
+  pool: PgPoolLike,
+  subgraphId: string,
+): void {
+  for (const typeName of entityNames) {
+    const type = schema.getType(typeName);
+    if (!(type instanceof GraphQLObjectType)) continue;
+    for (const [fieldName, field] of Object.entries(type.getFields())) {
+      const named = getNamedType(field.type);
+      if (!(named instanceof GraphQLObjectType) || !entityNames.has(named.name)) {
+        continue; // scalar / non-entity field: default resolution
+      }
+      const targetType = named.name;
+      const derived = (field.astNode?.directives ?? []).find(
+        (d) => d.name.value === 'derivedFrom',
+      );
+      if (derived !== undefined) {
+        const arg = (derived.arguments ?? []).find((a) => a.name.value === 'field');
+        const refField =
+          arg !== undefined && arg.value.kind === Kind.STRING ? arg.value.value : undefined;
+        if (refField !== undefined) {
+          field.resolve = (source: Record<string, unknown>) =>
+            subgraphEntitiesWhere(pool, subgraphId, targetType, refField, String(source['id']));
+        }
+        continue;
+      }
+      field.resolve = (source: Record<string, unknown>) => {
+        const ref = source?.[fieldName];
+        if (ref == null) return null;
+        if (typeof ref === 'object') return ref; // already inlined in the payload
+        return subgraphEntityById(pool, subgraphId, targetType, String(ref));
+      };
+    }
+  }
+}
+
+/**
  * Execute a typed query against a *subgraph's own* schema (generated from its
  * `schema.graphql`). Builds + scalar-patches the schema, wires per-entity
  * resolvers that read the subgraph's `entity_versions` (returning payloads, so
@@ -542,6 +592,13 @@ export async function executeSubgraphQuery(args: {
     };
   }
   patchKasGraphScalars(schema);
+  const entities = subgraphEntities(args.sdl);
+  attachRelationResolvers(
+    schema,
+    new Set(entities.map((e) => e.name)),
+    args.pool,
+    args.subgraphId,
+  );
 
   let document;
   try {
@@ -555,7 +612,7 @@ export async function executeSubgraphQuery(args: {
   }
 
   const rootValue: Record<string, unknown> = {};
-  for (const entity of subgraphEntities(args.sdl)) {
+  for (const entity of entities) {
     rootValue[entity.queryName] = (a: { id: string }) =>
       subgraphEntityById(args.pool, args.subgraphId, entity.name, a.id);
     rootValue[`${entity.queryName}s`] = (a: { first?: number }) =>

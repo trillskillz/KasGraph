@@ -219,6 +219,32 @@ export async function subgraphEntitiesOfType(
   return result.rows.map(mergeEntityPayload);
 }
 
+/**
+ * Latest payload of every entity of a type whose JSON payload field `field`
+ * equals `value` — the read behind a `@derivedFrom(field: …)` reverse relation
+ * (e.g. a Bond's `holdings: [Holding!] @derivedFrom(field: "bond")` loads
+ * Holdings whose `bond` equals the Bond's id). `field` is a bind parameter to
+ * the `->>` operator, so it's injection-safe; only `subgraph` is interpolated
+ * (validated).
+ */
+export async function subgraphEntitiesWhere(
+  pool: PgPoolLike,
+  subgraph: string,
+  entityType: string,
+  field: string,
+  value: string,
+): Promise<Record<string, unknown>[]> {
+  const schema = validatedSchema(subgraph);
+  const result = await pool.query<EntityRow>(
+    `SELECT DISTINCT ON (entity_id) entity_id, payload
+     FROM "${schema}".entity_versions
+     WHERE entity_type = $1 AND payload->>$2 = $3
+     ORDER BY entity_id, block_daa_score DESC`,
+    [entityType, field, value],
+  );
+  return result.rows.map(mergeEntityPayload);
+}
+
 function mergeEntityPayload(row: EntityRow): Record<string, unknown> {
   const data =
     row.payload != null && typeof row.payload === 'object'
