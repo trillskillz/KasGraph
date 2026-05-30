@@ -246,6 +246,44 @@ export async function subgraphEntitiesWhere(
   return result.rows.map(mergeEntityPayload);
 }
 
+/** A deployed subgraph's registry entry, as the gateway needs it for query
+ * routing: its `schema.graphql` SDL + manifest + (if built) wasm hash. */
+export interface SubgraphDeploymentInfo {
+  schemaSdl: string;
+  manifestJson: unknown;
+  wasmSha256?: string;
+}
+
+interface SubgraphDeploymentRow extends QueryResultRow {
+  schema_sdl: string;
+  manifest_json: unknown;
+  wasm_sha256: string | null;
+}
+
+/** Read a deployed subgraph's registry entry from `kasgraph_subgraph`, or
+ * `null` if it isn't deployed (or was removed). The gateway routes a query to
+ * the subgraph's own typed schema when this returns non-null, and to the base
+ * meta gateway otherwise. `subgraph` is a bound parameter — no interpolation. */
+export async function fetchSubgraphDeployment(
+  pool: PgPoolLike,
+  subgraph: string,
+): Promise<SubgraphDeploymentInfo | null> {
+  const result = await pool.query<SubgraphDeploymentRow>(
+    `SELECT schema_sdl, manifest_json, wasm_sha256
+     FROM kasgraph_subgraph
+     WHERE subgraph = $1 AND status <> 'removed'
+     LIMIT 1`,
+    [subgraph],
+  );
+  const row = result.rows[0];
+  if (row === undefined) return null;
+  return {
+    schemaSdl: row.schema_sdl,
+    manifestJson: row.manifest_json,
+    ...(row.wasm_sha256 != null && { wasmSha256: row.wasm_sha256 }),
+  };
+}
+
 function mergeEntityPayload(row: EntityRow): Record<string, unknown> {
   const data =
     row.payload != null && typeof row.payload === 'object'

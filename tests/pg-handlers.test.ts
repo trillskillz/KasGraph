@@ -85,24 +85,42 @@ describe('PgMcpHandlers — list_subgraphs', () => {
 });
 
 describe('PgMcpHandlers — get_schema', () => {
-  it('returns the canonical KasGraph SDL for any subgraph id', async () => {
-    // No pool query is issued for the schema endpoint today, so
-    // an empty MockPool is fine.
-    const pool = new MockPool([]);
+  it('returns the canonical KasGraph base schema for an undeployed subgraph', async () => {
+    // The registry lookup returns no row → base/meta schema.
+    const pool = new MockPool([[]]);
     const got = await new PgMcpHandlers(pool).get_schema({
       subgraph_id: 'any',
     });
     expect(got.subgraph_id).toBe('any');
     expect(got.schema_sdl).toContain('type CommittedBlock');
     expect(got.schema_sdl).toContain('scalar BigInt');
-    expect(pool.calls).toHaveLength(0);
+    expect(pool.calls).toHaveLength(1);
+    expect(pool.calls[0]!.sql).toMatch(/FROM kasgraph_subgraph/);
+  });
+
+  it('returns the deployed subgraph\'s own typed schema', async () => {
+    const pool = new MockPool([
+      [
+        {
+          schema_sdl: 'type Bond @entity { id: ID! owner: String! }',
+          manifest_json: { name: 'kasbonds' },
+          wasm_sha256: null,
+        },
+      ],
+    ]);
+    const got = await new PgMcpHandlers(pool).get_schema({ subgraph_id: 'kasbonds' });
+    // The generated SDL exposes the entity's typed queries, not the base meta types.
+    expect(got.schema_sdl).toContain('bond(id: ID!): Bond');
+    expect(got.schema_sdl).toContain('bonds(first: Int = 100): [Bond!]!');
+    expect(got.schema_sdl).not.toContain('type CommittedBlock');
   });
 });
 
 describe('PgMcpHandlers — execute_query', () => {
-  it('round-trips a real GraphQL query through the gateway', async () => {
-    // One canned response for the GraphQL resolver under the hood.
+  it('falls back to the base meta gateway for an undeployed subgraph', async () => {
+    // 1st query: registry lookup (empty → undeployed). 2nd: the base resolver.
     const pool = new MockPool([
+      [],
       [
         {
           subgraph: 'kasbonds',
@@ -126,17 +144,42 @@ describe('PgMcpHandlers — execute_query', () => {
       (res.data as { committedBlocks: Array<{ blockHash: string }> })
         .committedBlocks[0]?.blockHash,
     ).toBe('h1');
+    expect(pool.calls[0]!.sql).toMatch(/FROM kasgraph_subgraph/);
+  });
+
+  it('routes a deployed subgraph query to its own typed schema', async () => {
+    // 1st query: registry lookup returns the deployed SDL. 2nd: the typed
+    // entity query against "<id>".entity_versions.
+    const pool = new MockPool([
+      [
+        {
+          schema_sdl: 'type Bond @entity { id: ID! owner: String! }',
+          manifest_json: { name: 'kasbonds' },
+          wasm_sha256: null,
+        },
+      ],
+      [{ entity_id: 'b1', payload: { id: 'b1', owner: 'alice' } }],
+    ]);
+    const res = await new PgMcpHandlers(pool).execute_query({
+      subgraph_id: 'kasbonds',
+      query: '{ bond(id: "b1") { id owner } }',
+    });
+    expect(res.errors).toBeUndefined();
+    expect(res.data).toEqual({ bond: { id: 'b1', owner: 'alice' } });
+    // The typed query hits the subgraph's own entity_versions table.
+    expect(pool.calls[1]!.sql).toMatch(/"kasbonds"\.entity_versions/);
   });
 
   it('surfaces GraphQL parse errors as response.errors', async () => {
-    const pool = new MockPool([]); // no query should be issued
+    // Registry lookup (undeployed) then the base gateway parse-errors before querying.
+    const pool = new MockPool([[]]);
     const res = await new PgMcpHandlers(pool).execute_query({
       subgraph_id: 'x',
       query: '{ bad',
     });
     expect(res.errors).toBeDefined();
     expect(res.errors!.length).toBeGreaterThan(0);
-    expect(pool.calls).toHaveLength(0);
+    expect(pool.calls).toHaveLength(1); // only the registry lookup
   });
 });
 

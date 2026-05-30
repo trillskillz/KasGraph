@@ -16,7 +16,10 @@
 // (not in the current schema); the third needs an LLM hook.
 
 import {
+  buildSubgraphSchemaSdl,
   executeGraphQLQuery,
+  executeSubgraphQuery,
+  fetchSubgraphDeployment,
   KASGRAPH_BASE_SCHEMA_SDL,
   PgGatewayResolvers,
   type PgPoolLike,
@@ -144,24 +147,39 @@ export class PgMcpHandlers implements McpHandlers {
   }
 
   async get_schema(input: GetSchemaInput): Promise<GetSchemaOutput> {
-    // For now every subgraph publishes the canonical KasGraph base
-    // schema. Per-subgraph SDL (from each manifest's
-    // `schema.graphql`) wires in when the codegen pipeline lands.
+    // A deployed subgraph publishes its own typed schema (generated from the
+    // `schema.graphql` it deployed); anything else gets the canonical KasGraph
+    // base/meta schema.
+    const deployment = await fetchSubgraphDeployment(this.pool, input.subgraph_id);
     return {
       subgraph_id: input.subgraph_id,
-      schema_sdl: KASGRAPH_BASE_SCHEMA_SDL,
+      schema_sdl:
+        deployment !== null
+          ? buildSubgraphSchemaSdl(deployment.schemaSdl)
+          : KASGRAPH_BASE_SCHEMA_SDL,
     };
   }
 
   async execute_query(input: ExecuteQueryInput): Promise<ExecuteQueryOutput> {
-    // Delegate to the GraphQL gateway against the same pool so an
-    // MCP client and a GraphQL client see the same results.
+    // Route a known deployed subgraph's query to its own typed schema (its
+    // entity types over `"<id>".entity_versions`). For an undeployed id (e.g. a
+    // cross-subgraph meta query like `committedBlocks`/`covenantLineage`) fall
+    // back to the base gateway, so MCP and GraphQL clients see the same results.
+    const deployment = await fetchSubgraphDeployment(this.pool, input.subgraph_id);
+    if (deployment !== null) {
+      return executeSubgraphQuery({
+        subgraphId: input.subgraph_id,
+        sdl: deployment.schemaSdl,
+        query: input.query,
+        ...(input.variables !== undefined && { variables: input.variables }),
+        pool: this.pool,
+      });
+    }
     const request: Parameters<typeof executeGraphQLQuery>[0] = {
       query: input.query,
       ...(input.variables !== undefined && { variables: input.variables }),
     };
-    const result = await executeGraphQLQuery(request, this.gateway);
-    return result;
+    return executeGraphQLQuery(request, this.gateway);
   }
 
   async search_by_pattern(input: SearchByPatternInput): Promise<SearchByPatternOutput> {
