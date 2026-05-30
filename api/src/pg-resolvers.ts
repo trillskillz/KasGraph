@@ -174,12 +174,67 @@ function rowToCovenantSpend(row: CovenantSpendRow): CovenantSpend {
   };
 }
 
+/**
+ * Read one entity's latest payload as a plain object (for the per-subgraph
+ * typed schema, where GraphQL default field resolution reads the entity's
+ * fields off this object). `id` is taken from the payload if present, else the
+ * `entity_id` column. Returns `null` when the entity is absent.
+ */
+export async function subgraphEntityById(
+  pool: PgPoolLike,
+  subgraph: string,
+  entityType: string,
+  id: string,
+): Promise<Record<string, unknown> | null> {
+  const schema = validatedSchema(subgraph);
+  const result = await pool.query<EntityRow>(
+    `SELECT entity_id, payload
+     FROM "${schema}".entity_versions
+     WHERE entity_type = $1 AND entity_id = $2
+     ORDER BY block_daa_score DESC
+     LIMIT 1`,
+    [entityType, id],
+  );
+  const row = result.rows[0];
+  return row === undefined ? null : mergeEntityPayload(row);
+}
+
+/** Latest payload of every entity of a type, as plain objects (see above). */
+export async function subgraphEntitiesOfType(
+  pool: PgPoolLike,
+  subgraph: string,
+  entityType: string,
+  first: number | undefined,
+): Promise<Record<string, unknown>[]> {
+  const schema = validatedSchema(subgraph);
+  const limit = boundedFirst(first);
+  const result = await pool.query<EntityRow>(
+    `SELECT DISTINCT ON (entity_id) entity_id, payload
+     FROM "${schema}".entity_versions
+     WHERE entity_type = $1
+     ORDER BY entity_id, block_daa_score DESC
+     LIMIT $2`,
+    [entityType, limit],
+  );
+  return result.rows.map(mergeEntityPayload);
+}
+
+function mergeEntityPayload(row: EntityRow): Record<string, unknown> {
+  const data =
+    row.payload != null && typeof row.payload === 'object'
+      ? (row.payload as Record<string, unknown>)
+      : {};
+  // entity_id is the canonical id; a payload `id` (if the mapping set one)
+  // takes precedence so the typed `id: ID!` field always resolves.
+  return { id: row.entity_id, ...data };
+}
+
 // A subgraph's entities live in its own Postgres schema (`"<id>".entity_versions`),
 // so the id is interpolated into the table-qualified name. It is NOT a bind
 // parameter, so it must be validated to the same charset the store's
 // `SubgraphId` enforces (lowercase ASCII + digits + underscore) — never trust
 // it raw.
-function validatedSchema(subgraph: string): string {
+export function validatedSchema(subgraph: string): string {
   if (!/^[a-z0-9_]+$/.test(subgraph)) {
     throw new Error(
       `invalid subgraph id \`${subgraph}\`: only lowercase letters, digits, and underscores are allowed`,

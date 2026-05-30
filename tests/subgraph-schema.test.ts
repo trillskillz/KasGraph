@@ -3,8 +3,29 @@ import { GraphQLObjectType, parse, validate } from 'graphql';
 import {
   buildSubgraphSchema,
   buildSubgraphSchemaSdl,
+  executeSubgraphQuery,
   subgraphEntities,
+  type PgPoolLike,
+  type QueryResult,
+  type QueryResultRow,
 } from '../api/src/index.js';
+
+class MockPool implements PgPoolLike {
+  readonly calls: Array<{ sql: string; values: ReadonlyArray<unknown> | undefined }> = [];
+  private readonly responses: Array<QueryResultRow[]>;
+  constructor(responses: Array<QueryResultRow[]>) {
+    this.responses = [...responses];
+  }
+  async query<TRow extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values?: ReadonlyArray<unknown>,
+  ): Promise<QueryResult<TRow>> {
+    this.calls.push({ sql: text, values });
+    const next = this.responses.shift();
+    if (next === undefined) throw new Error('MockPool: out of canned responses');
+    return { rows: next as TRow[] };
+  }
+}
 
 const SDL = `
   type Bond @entity {
@@ -76,5 +97,61 @@ describe('buildSubgraphSchema', () => {
     const schema = buildSubgraphSchema(SDL);
     const errors = validate(schema, parse('{ bonds(first: 5) { id issuer faceValueSompi } }'));
     expect(errors).toEqual([]);
+  });
+});
+
+describe('executeSubgraphQuery', () => {
+  it('serves a typed list query from entity_versions payloads', async () => {
+    const pool = new MockPool([
+      [
+        {
+          entity_id: 'b1',
+          payload: { id: 'b1', issuer: 'alice', faceValueSompi: '1000', redeemed: false },
+        },
+        // No `id` in the payload → falls back to entity_id ('b2').
+        { entity_id: 'b2', payload: { issuer: 'bob', faceValueSompi: '2000', redeemed: true } },
+      ],
+    ]);
+    const res = await executeSubgraphQuery({
+      subgraphId: 'kasbonds',
+      sdl: SDL,
+      query: '{ bonds(first: 5) { id issuer faceValueSompi redeemed } }',
+      pool,
+    });
+    expect(res.errors).toBeUndefined();
+    expect(res.data).toEqual({
+      bonds: [
+        { id: 'b1', issuer: 'alice', faceValueSompi: '1000', redeemed: false },
+        { id: 'b2', issuer: 'bob', faceValueSompi: '2000', redeemed: true },
+      ],
+    });
+    expect(pool.calls[0]!.sql).toMatch(/FROM "kasbonds"\.entity_versions/);
+    expect(pool.calls[0]!.values).toEqual(['Bond', 5]);
+  });
+
+  it('serves a typed by-id query and binds (entityType, id)', async () => {
+    const pool = new MockPool([
+      [{ entity_id: 'b1', payload: { id: 'b1', issuer: 'alice', faceValueSompi: '1000', redeemed: false } }],
+    ]);
+    const res = await executeSubgraphQuery({
+      subgraphId: 'kasbonds',
+      sdl: SDL,
+      query: '{ bond(id: "b1") { id issuer } }',
+      pool,
+    });
+    expect(res.data).toEqual({ bond: { id: 'b1', issuer: 'alice' } });
+    expect(pool.calls[0]!.values).toEqual(['Bond', 'b1']);
+  });
+
+  it('returns a validation error for an unknown field without querying', async () => {
+    const pool = new MockPool([]);
+    const res = await executeSubgraphQuery({
+      subgraphId: 'kasbonds',
+      sdl: SDL,
+      query: '{ bonds { nope } }',
+      pool,
+    });
+    expect(res.errors).toBeDefined();
+    expect(pool.calls).toHaveLength(0);
   });
 });

@@ -31,6 +31,13 @@ import {
   type ExecutionResult,
 } from 'graphql';
 
+import {
+  subgraphEntitiesOfType,
+  subgraphEntityById,
+  type PgPoolLike,
+} from './pg-resolvers.js';
+import { buildSubgraphSchema, subgraphEntities } from './subgraph-schema.js';
+
 export const KASGRAPH_API_VERSION = '0.1.0';
 
 // Postgres-backed `GatewayResolvers` impl (Phase 2.4 + 2.5 schema).
@@ -405,14 +412,12 @@ function parseAstLiteral(ast: import('graphql').ValueNode): unknown {
 
 let cachedSchema: GraphQLSchema | null = null;
 
-/** Returns the executable KasGraph base schema (lazily built once). */
-export function getKasGraphSchema(): GraphQLSchema {
-  if (cachedSchema !== null) {
-    return cachedSchema;
-  }
-  const schema = buildSchema(KASGRAPH_BASE_SCHEMA_SDL);
-  // Patch in the scalar implementations (buildSchema can't see
-  // them from SDL alone).
+/**
+ * Patch the `BigInt` / `JSON` scalar *implementations* onto a schema that
+ * declared them in SDL (`buildSchema` can't see the impls from SDL alone).
+ * Shared by the base schema and the per-subgraph schemas.
+ */
+export function patchKasGraphScalars(schema: GraphQLSchema): void {
   const bigIntType = schema.getType('BigInt');
   if (bigIntType instanceof GraphQLScalarType) {
     Object.assign(bigIntType, {
@@ -429,6 +434,15 @@ export function getKasGraphSchema(): GraphQLSchema {
       parseLiteral: JSONScalar.parseLiteral,
     });
   }
+}
+
+/** Returns the executable KasGraph base schema (lazily built once). */
+export function getKasGraphSchema(): GraphQLSchema {
+  if (cachedSchema !== null) {
+    return cachedSchema;
+  }
+  const schema = buildSchema(KASGRAPH_BASE_SCHEMA_SDL);
+  patchKasGraphScalars(schema);
   cachedSchema = schema;
   return schema;
 }
@@ -486,6 +500,74 @@ export async function executeGraphQLQuery(
     rootValue,
     ...(request.variables !== undefined && { variableValues: request.variables }),
     ...(request.operationName !== undefined && { operationName: request.operationName }),
+  };
+  const result = await execute(executeOptions);
+
+  const response: ExecuteQueryResponse = {};
+  if (result.data !== undefined) {
+    response.data = result.data;
+  }
+  if (result.errors && result.errors.length > 0) {
+    response.errors = result.errors.map((e) => ({ message: e.message }));
+  }
+  return response;
+}
+
+/**
+ * Execute a typed query against a *subgraph's own* schema (generated from its
+ * `schema.graphql`). Builds + scalar-patches the schema, wires per-entity
+ * resolvers that read the subgraph's `entity_versions` (returning payloads, so
+ * GraphQL's default field resolution serves the typed scalar fields), and
+ * executes. Schema-build / parse / validation errors come back in `errors`.
+ *
+ * The subgraph SDL is supplied by the caller; the runtime SDL source (storing
+ * each subgraph's `schema.graphql` at deploy time + caching the built schema)
+ * is the remaining infra. Relation / `@derivedFrom` fields are present in the
+ * schema but resolve only if the entity payload carries them.
+ */
+export async function executeSubgraphQuery(args: {
+  subgraphId: string;
+  sdl: string;
+  query: string;
+  variables?: Record<string, unknown>;
+  operationName?: string;
+  pool: PgPoolLike;
+}): Promise<ExecuteQueryResponse> {
+  let schema: GraphQLSchema;
+  try {
+    schema = buildSubgraphSchema(args.sdl);
+  } catch (err) {
+    return {
+      errors: [{ message: err instanceof Error ? err.message : 'schema build error' }],
+    };
+  }
+  patchKasGraphScalars(schema);
+
+  let document;
+  try {
+    document = parse(args.query);
+  } catch (err) {
+    return { errors: [{ message: err instanceof Error ? err.message : 'parse error' }] };
+  }
+  const validationErrors = validate(schema, document);
+  if (validationErrors.length > 0) {
+    return { errors: validationErrors.map((e) => ({ message: e.message })) };
+  }
+
+  const rootValue: Record<string, unknown> = {};
+  for (const entity of subgraphEntities(args.sdl)) {
+    rootValue[entity.queryName] = (a: { id: string }) =>
+      subgraphEntityById(args.pool, args.subgraphId, entity.name, a.id);
+    rootValue[`${entity.queryName}s`] = (a: { first?: number }) =>
+      subgraphEntitiesOfType(args.pool, args.subgraphId, entity.name, a.first);
+  }
+
+  const executeOptions: Parameters<typeof execute>[0] = {
+    schema,
+    document,
+    rootValue,
+    ...(args.variables !== undefined && { variableValues: args.variables }),
+    ...(args.operationName !== undefined && { operationName: args.operationName }),
   };
   const result = await execute(executeOptions);
 

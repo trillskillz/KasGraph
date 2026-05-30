@@ -2,7 +2,17 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-29 — typed per-subgraph schema generation (core))
+## Latest commit arc (2026-05-30 — typed per-subgraph queries EXECUTE end-to-end)
+
+Builds on the schema-generation core: typed subgraph queries now actually run against `entity_versions`.
+
+- **`executeSubgraphQuery({subgraphId, sdl, query, variables, pool})`** (`@kasgraph/api`) — builds + scalar-patches the subgraph schema, wires per-entity resolvers (`<entity>(id)` → `subgraphEntityById`, `<entity>s(first)` → `subgraphEntitiesOfType`, both reading `"<schema>".entity_versions` and returning the payload object so GraphQL's default field resolution serves the typed scalar fields), and parse/validate/executes. Build/parse/validation errors come back in `errors`.
+- **Supporting**: factored `patchKasGraphScalars` (shared by base + subgraph schemas); added `subgraphEntityById`/`subgraphEntitiesOfType` to `pg-resolvers` (return `{id: entity_id, ...payload}` so `id: ID!` always resolves, payload `id` wins); exported `validatedSchema`.
+- 3 new tests (typed list serves payloads incl. BigInt/Boolean + id fallback to `entity_id`; by-id binds `(entityType, id)`; unknown-field validation error issues no query). vitest 200; typecheck clean. No Rust change.
+- **The typed-schema feature is now functionally complete** — what remains is **runtime plumbing, not logic**: (1) store each subgraph's `schema.graphql` at deploy time + cache the built schema, and route `execute_query(subgraph_id, …)` / `get_schema` through `executeSubgraphQuery`/`buildSubgraphSchemaSdl` (couples to the deploy pipeline / Phase 5); (2) relation / `@derivedFrom` cross-entity resolution (fields are in the schema but resolve only from payload today).
+- Other open tracks unchanged: capture xtask, `persist_lineage` fork model, `deploy/status/logs/remove` CLI + Phase 5.
+
+## Previous commit arc (2026-05-29 — typed per-subgraph schema generation (core))
 
 The pure core of the headline "each subgraph gets its own typed GraphQL API" feature.
 
