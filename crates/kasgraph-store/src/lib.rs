@@ -106,6 +106,18 @@ pub struct CovenantLineageRow {
     pub daa_score: i64,
 }
 
+/// A deployed subgraph's registry entry: its identity (`schema.graphql` SDL +
+/// manifest) plus the deployed mapping's wasm hash. One global row per
+/// subgraph; the typed GraphQL surface reads `schema_sdl` to build the
+/// subgraph's schema at query time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubgraphDeployment {
+    pub subgraph: SubgraphId,
+    pub schema_sdl: String,
+    pub manifest_json: serde_json::Value,
+    pub wasm_sha256: Option<String>,
+}
+
 /// Audit record for which RPC endpoint served a block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcBlockAuditRecord {
@@ -431,6 +443,89 @@ impl Store {
             .map_err(|err| StoreError::Query(err.to_string()))?;
 
         Ok(())
+    }
+
+    /// Record (or re-record) a deployed subgraph in the registry. A redeploy of
+    /// the same `subgraph` overwrites its SDL/manifest/wasm and bumps
+    /// `deployed_at`; `status` is reset to `'active'` so a previously removed
+    /// subgraph comes back live.
+    pub async fn upsert_subgraph_deployment(
+        &self,
+        deployment: &SubgraphDeployment,
+    ) -> Result<(), StoreError> {
+        sqlx::query(upsert_subgraph_deployment_sql())
+            .bind(deployment.subgraph.schema_name())
+            .bind(&deployment.schema_sdl)
+            .bind(&deployment.manifest_json)
+            .bind(&deployment.wasm_sha256)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Fetch a deployed subgraph's registry entry, if one exists and is not
+    /// removed. Removed subgraphs (`status = 'removed'`) are treated as absent.
+    pub async fn fetch_subgraph_deployment(
+        &self,
+        subgraph: &SubgraphId,
+    ) -> Result<Option<SubgraphDeployment>, StoreError> {
+        let row: Option<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(
+            "SELECT subgraph, schema_sdl, manifest_json, wasm_sha256 \
+             FROM kasgraph_subgraph WHERE subgraph = $1 AND status <> 'removed'",
+        )
+        .bind(subgraph.schema_name())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        row.map(|(subgraph, schema_sdl, manifest_json, wasm_sha256)| {
+            Ok(SubgraphDeployment {
+                subgraph: SubgraphId::new(subgraph)?,
+                schema_sdl,
+                manifest_json,
+                wasm_sha256,
+            })
+        })
+        .transpose()
+    }
+
+    /// All active (non-removed) deployed subgraphs, ordered by id — the source
+    /// list a gateway iterates to know which subgraphs it can serve.
+    pub async fn list_subgraph_deployments(&self) -> Result<Vec<SubgraphDeployment>, StoreError> {
+        let rows: Vec<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(
+            "SELECT subgraph, schema_sdl, manifest_json, wasm_sha256 \
+             FROM kasgraph_subgraph WHERE status <> 'removed' ORDER BY subgraph ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|(subgraph, schema_sdl, manifest_json, wasm_sha256)| {
+                Ok(SubgraphDeployment {
+                    subgraph: SubgraphId::new(subgraph)?,
+                    schema_sdl,
+                    manifest_json,
+                    wasm_sha256,
+                })
+            })
+            .collect()
+    }
+
+    /// Mark a deployed subgraph removed (soft delete) so `fetch`/`list` skip it
+    /// but its data schema + history remain for audit. Returns whether a row
+    /// was affected. (`remove` CLI / Phase 5.)
+    pub async fn set_subgraph_removed(&self, subgraph: &SubgraphId) -> Result<bool, StoreError> {
+        let result =
+            sqlx::query("UPDATE kasgraph_subgraph SET status = 'removed' WHERE subgraph = $1")
+                .bind(subgraph.schema_name())
+                .execute(&self.pool)
+                .await
+                .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn upsert_covenant_lineage_head(
@@ -1434,6 +1529,21 @@ impl Store {
 // table-qualified name is injection-safe, matching `ensure_subgraph_schema`.
 // Kept as pure functions so the SQL shape is unit-testable without a DB.
 
+/// The deployed-subgraph registry upsert. Global table (no schema
+/// interpolation), so a `&'static str`. A redeploy overwrites the SDL/manifest/
+/// wasm, refreshes `deployed_at`, and resets `status` to `'active'`.
+fn upsert_subgraph_deployment_sql() -> &'static str {
+    "INSERT INTO kasgraph_subgraph \
+     (subgraph, schema_sdl, manifest_json, wasm_sha256) \
+     VALUES ($1, $2, $3, $4) \
+     ON CONFLICT (subgraph) DO UPDATE SET \
+         schema_sdl = EXCLUDED.schema_sdl, \
+         manifest_json = EXCLUDED.manifest_json, \
+         wasm_sha256 = EXCLUDED.wasm_sha256, \
+         status = 'active', \
+         deployed_at = NOW()"
+}
+
 fn upsert_entity_version_sql(schema: &str) -> String {
     format!(
         "INSERT INTO \"{schema}\".entity_versions \
@@ -1615,6 +1725,18 @@ mod tests {
     }
 
     #[test]
+    fn upsert_subgraph_deployment_sql_lists_columns_and_is_idempotent_on_subgraph() {
+        let sql = upsert_subgraph_deployment_sql();
+        assert!(sql.contains("INSERT INTO kasgraph_subgraph"));
+        assert!(sql.contains("(subgraph, schema_sdl, manifest_json, wasm_sha256)"));
+        assert!(sql.contains("ON CONFLICT (subgraph) DO UPDATE SET"));
+        // A redeploy refreshes content + reactivates a previously removed one.
+        assert!(sql.contains("schema_sdl = EXCLUDED.schema_sdl"));
+        assert!(sql.contains("status = 'active'"));
+        assert!(sql.contains("deployed_at = NOW()"));
+    }
+
+    #[test]
     fn upsert_entity_version_sql_targets_the_subgraph_schema_and_is_idempotent() {
         let sql = upsert_entity_version_sql("kasbonds_mainnet_v1");
         assert!(sql.contains("\"kasbonds_mainnet_v1\".entity_versions"));
@@ -1780,7 +1902,7 @@ mod tests {
     #[test]
     fn migrator_embeds_all_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 7);
+        assert_eq!(migrations.len(), 8);
         assert_eq!(migrations[0].version, 20260526110500);
         assert_eq!(migrations[1].version, 20260526150000);
         assert_eq!(migrations[2].version, 20260526160000);
@@ -1788,5 +1910,6 @@ mod tests {
         assert_eq!(migrations[4].version, 20260529120000);
         assert_eq!(migrations[5].version, 20260529130000);
         assert_eq!(migrations[6].version, 20260530120000);
+        assert_eq!(migrations[7].version, 20260530140000);
     }
 }

@@ -19,7 +19,7 @@
 use kasgraph_store::{
     CommittedBlockRecord, CovenantLineageHead, CovenantLineageRow, CovenantSpendRecord,
     CovenantUtxoRecord, EntityVersionRecord, Krc20LegacyOpRecord, Krc721LegacyOpRecord,
-    PoiCheckpoint, Store, SubgraphId,
+    PoiCheckpoint, Store, SubgraphDeployment, SubgraphId,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -39,6 +39,7 @@ async fn migrations_apply_and_base_tables_exist(pool: PgPool) -> sqlx::Result<()
         "kasgraph_detected_pattern",
         "kasgraph_krc20_legacy_ledger",
         "kasgraph_krc721_legacy_ledger",
+        "kasgraph_subgraph",
     ] {
         let regclass: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
             .bind(table)
@@ -417,6 +418,72 @@ async fn covenant_lineage_population_and_spend_lifecycle(pool: PgPool) -> sqlx::
     store.record_covenant_spend(&spend).await.unwrap(); // idempotent re-apply
     let removed = store.unwind_covenant_spends(&sg, 200).await.unwrap();
     assert_eq!(removed, 1, "idempotent record → exactly one spend row");
+    Ok(())
+}
+
+/// The deployed-subgraph registry: a deploy records SDL + manifest + wasm hash;
+/// a redeploy overwrites them; `list` returns active deployments; `remove` soft-
+/// deletes so `fetch`/`list` skip it but a later redeploy reactivates it.
+#[sqlx::test]
+async fn subgraph_registry_deploy_fetch_redeploy_remove(pool: PgPool) -> sqlx::Result<()> {
+    let store = Store::from_pool(pool);
+    let sg = SubgraphId::new("itest_registry").unwrap();
+
+    // Unknown subgraph → no deployment.
+    assert!(store
+        .fetch_subgraph_deployment(&sg)
+        .await
+        .unwrap()
+        .is_none());
+
+    let v1 = SubgraphDeployment {
+        subgraph: sg.clone(),
+        schema_sdl: "type Bond @entity { id: ID! }".into(),
+        manifest_json: json!({ "name": "kasbonds", "specVersion": "0.1.0" }),
+        wasm_sha256: Some("abc123".into()),
+    };
+    store.upsert_subgraph_deployment(&v1).await.unwrap();
+
+    // Round-trips SDL + manifest JSON + wasm hash verbatim.
+    let got = store
+        .fetch_subgraph_deployment(&sg)
+        .await
+        .unwrap()
+        .expect("deployment exists after deploy");
+    assert_eq!(got, v1);
+
+    // Redeploy overwrites in place (no duplicate row).
+    let v2 = SubgraphDeployment {
+        schema_sdl: "type Bond @entity { id: ID! owner: String! }".into(),
+        manifest_json: json!({ "name": "kasbonds", "specVersion": "0.2.0" }),
+        wasm_sha256: Some("def456".into()),
+        ..v1.clone()
+    };
+    store.upsert_subgraph_deployment(&v2).await.unwrap();
+    assert_eq!(
+        store.fetch_subgraph_deployment(&sg).await.unwrap(),
+        Some(v2.clone())
+    );
+    assert_eq!(
+        store.list_subgraph_deployments().await.unwrap(),
+        vec![v2.clone()]
+    );
+
+    // Soft-remove hides it from fetch/list but leaves the row for audit.
+    assert!(store.set_subgraph_removed(&sg).await.unwrap());
+    assert!(store
+        .fetch_subgraph_deployment(&sg)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store.list_subgraph_deployments().await.unwrap().is_empty());
+
+    // A redeploy reactivates a removed subgraph.
+    store.upsert_subgraph_deployment(&v2).await.unwrap();
+    assert_eq!(
+        store.fetch_subgraph_deployment(&sg).await.unwrap(),
+        Some(v2)
+    );
     Ok(())
 }
 
