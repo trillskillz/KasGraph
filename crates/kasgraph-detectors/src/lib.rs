@@ -36,6 +36,7 @@ pub mod krc20;
 pub mod krc20_ledger;
 pub mod krc721;
 pub mod krc721_ledger;
+pub mod opensilver_multisig_fingerprint;
 pub mod opensilver_ownable_fingerprint;
 pub mod opensilver_timelock_fingerprint;
 pub mod opensilver_vault_fingerprint;
@@ -54,6 +55,7 @@ pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 pub use krc20_ledger::{ApplyOutcome, Krc20Ledger, TokenState};
 pub use krc721::{parse_krc721_inscription, Krc721Inscription, Krc721Op, Krc721Parse};
 pub use krc721_ledger::{CollectionState, Krc721Ledger};
+pub use opensilver_multisig_fingerprint::opensilver_multisig_fingerprint;
 pub use opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
 pub use opensilver_timelock_fingerprint::opensilver_timelock_fingerprint;
 pub use opensilver_vault_fingerprint::opensilver_vault_fingerprint;
@@ -342,16 +344,26 @@ mod tests {
             .iter()
             .find(|d| d.kind == DetectorKind::OpenSilverMultisig)
             .expect("multisig in schema");
+        // Real MultiSig layout (captured from multisig.sil): threshold as an
+        // 8-byte int, then three separate 32-byte signer pubkey windows.
         assert_eq!(
             multisig.fields,
             vec![
                 DetectorFieldSchema {
-                    name: "signer_pubkeys".to_owned(),
-                    byte_len: 96
+                    name: "threshold".to_owned(),
+                    byte_len: 8
                 },
                 DetectorFieldSchema {
-                    name: "threshold".to_owned(),
-                    byte_len: 1
+                    name: "signer_pubkey_1".to_owned(),
+                    byte_len: 32
+                },
+                DetectorFieldSchema {
+                    name: "signer_pubkey_2".to_owned(),
+                    byte_len: 32
+                },
+                DetectorFieldSchema {
+                    name: "signer_pubkey_3".to_owned(),
+                    byte_len: 32
                 },
             ],
         );

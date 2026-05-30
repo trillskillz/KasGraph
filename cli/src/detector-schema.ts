@@ -31,8 +31,10 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
   {
     kind: "OpenSilverMultisig",
     fields: [
-      { name: "signer_pubkeys", byteLen: 96 },
-      { name: "threshold", byteLen: 1 },
+      { name: "threshold", byteLen: 8 },
+      { name: "signer_pubkey_1", byteLen: 32 },
+      { name: "signer_pubkey_2", byteLen: 32 },
+      { name: "signer_pubkey_3", byteLen: 32 },
     ],
   },
   {

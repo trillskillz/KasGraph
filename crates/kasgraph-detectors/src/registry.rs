@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use crate::fingerprint::{Fingerprint, MaskedWindow, PatternMatcher};
 use crate::kcc20_asset_fingerprint::kcc20_asset_fingerprint;
 use crate::opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
+use crate::opensilver_multisig_fingerprint::opensilver_multisig_fingerprint;
 use crate::opensilver_timelock_fingerprint::opensilver_timelock_fingerprint;
 use crate::opensilver_vault_fingerprint::opensilver_vault_fingerprint;
 use crate::DetectorKind;
@@ -46,11 +47,14 @@ fn build_registry() -> Vec<DetectorEntry> {
             kind: DetectorKind::OpenSilverOwnable,
             matcher: PatternMatcher::Exact(opensilver_ownable_fingerprint()),
         },
-        opensilver(
-            DetectorKind::OpenSilverMultisig,
-            0x02,
-            &[("signer_pubkeys", 96), ("threshold", 1)],
-        ),
+        // Real exact fingerprint (captured from multisig.sil — fixed-size,
+        // fixed 3-signer quorum). The real layout is `threshold` (8-byte int)
+        // then three separate 32-byte pubkey windows, replacing the
+        // placeholder's bundled 96-byte `signer_pubkeys` + 1-byte `threshold`.
+        DetectorEntry {
+            kind: DetectorKind::OpenSilverMultisig,
+            matcher: PatternMatcher::Exact(opensilver_multisig_fingerprint()),
+        },
         // Real exact fingerprint (captured from timelock.sil — fixed-size).
         DetectorEntry {
             kind: DetectorKind::OpenSilverTimeLock,

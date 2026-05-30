@@ -242,7 +242,8 @@ dataSources:
     expect(out).toContain('detectorKind: "OpenSilverVault";');
     expect(out).toContain('  owner_pubkey: string;');
     expect(out).toContain('export interface OpenSilverMultisigState');
-    expect(out).toContain('  signer_pubkeys: string;');
+    expect(out).toContain('  threshold: string;');
+    expect(out).toContain('  signer_pubkey_1: string;');
     // Payload is the union of the data source's pattern states.
     expect(out).toContain(
       'payload: OpenSilverMultisigState | OpenSilverVaultState;',
