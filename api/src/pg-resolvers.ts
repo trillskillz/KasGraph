@@ -344,16 +344,37 @@ function rowToDetectedPattern(row: DetectedPatternRow): DetectedPattern {
   };
 }
 
-function rowToLineageEntry(row: LineageEntryRow): CovenantLineageEntry {
+function rowToLineageEntry(
+  row: LineageEntryRow,
+  childrenByParent: Map<string, string[]>,
+): CovenantLineageEntry {
   const stateBytesHex = hexFromBytes(row.state_bytes);
+  const utxo = `${row.tx_hash}:${row.output_index}`;
   return {
     seq: row.seq,
     txHash: row.tx_hash,
     outputIndex: row.output_index,
+    utxo,
+    childUtxos: childrenByParent.get(utxo) ?? [],
     daaScore: bigIntString(row.daa_score),
     ...(row.parent_utxo != null && { parentUtxo: row.parent_utxo }),
     ...(stateBytesHex.length > 0 && { stateBytesHex }),
   };
+}
+
+/** Map each entry's UTXO → the UTXOs of the entries whose `parent_utxo` is it
+ * (the forward / child edges). Lets the response carry the lineage DAG in both
+ * directions without a second query. */
+function buildChildEdges(rows: LineageEntryRow[]): Map<string, string[]> {
+  const byParent = new Map<string, string[]>();
+  for (const r of rows) {
+    if (r.parent_utxo == null) continue;
+    const child = `${r.tx_hash}:${r.output_index}`;
+    const siblings = byParent.get(r.parent_utxo);
+    if (siblings === undefined) byParent.set(r.parent_utxo, [child]);
+    else siblings.push(child);
+  }
+  return byParent;
 }
 
 export class PgGatewayResolvers implements GatewayResolvers {
@@ -450,13 +471,14 @@ export class PgGatewayResolvers implements GatewayResolvers {
       [args.covenantId],
     );
 
+    const childEdges = buildChildEdges(rowsResult.rows);
     return {
       covenantId: head.covenant_id,
       genesisTx: head.genesis_tx,
       currentUtxo: head.current_utxo,
       lineageCount: head.lineage_count,
       lastSeenDaa: bigIntString(head.last_seen_daa),
-      entries: rowsResult.rows.map(rowToLineageEntry),
+      entries: rowsResult.rows.map((r) => rowToLineageEntry(r, childEdges)),
     };
   }
 

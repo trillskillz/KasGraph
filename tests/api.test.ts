@@ -80,8 +80,16 @@ class InMemoryResolvers implements GatewayResolvers {
       lineageCount: 2,
       lastSeenDaa: '101',
       entries: [
-        { seq: 0, txHash: 'gen', outputIndex: 0, daaScore: '99' },
-        { seq: 1, txHash: 't1', outputIndex: 0, daaScore: '100' },
+        { seq: 0, txHash: 'gen', outputIndex: 0, utxo: 'gen:0', childUtxos: ['t1:0'], daaScore: '99' },
+        {
+          seq: 1,
+          txHash: 't1',
+          outputIndex: 0,
+          utxo: 't1:0',
+          parentUtxo: 'gen:0',
+          childUtxos: [],
+          daaScore: '100',
+        },
       ],
     },
   };
@@ -284,7 +292,8 @@ describe('@kasgraph/api — executeGraphQLQuery', () => {
       {
         query: `{
           covenantLineage(covenantId: "0xabc") {
-            covenantId lineageCount entries { seq txHash daaScore }
+            covenantId lineageCount
+            entries { seq txHash daaScore utxo parentUtxo childUtxos }
           }
         }`,
       },
@@ -292,11 +301,23 @@ describe('@kasgraph/api — executeGraphQLQuery', () => {
     );
     expect(res.errors).toBeUndefined();
     const lineage = (
-      res.data as { covenantLineage: { covenantId: string; lineageCount: number; entries: unknown[] } }
+      res.data as {
+        covenantLineage: {
+          covenantId: string;
+          lineageCount: number;
+          entries: Array<{ utxo: string; parentUtxo: string | null; childUtxos: string[] }>;
+        };
+      }
     ).covenantLineage;
     expect(lineage.covenantId).toBe('0xabc');
     expect(lineage.lineageCount).toBe(2);
     expect(lineage.entries).toHaveLength(2);
+    // The forward/backward DAG edges are first-class on each entry.
+    expect(lineage.entries[0]!.utxo).toBe('gen:0');
+    expect(lineage.entries[0]!.parentUtxo).toBeNull();
+    expect(lineage.entries[0]!.childUtxos).toEqual(['t1:0']);
+    expect(lineage.entries[1]!.parentUtxo).toBe('gen:0');
+    expect(lineage.entries[1]!.childUtxos).toEqual([]);
   });
 
   it('covenantLineage returns null for an unknown id', async () => {

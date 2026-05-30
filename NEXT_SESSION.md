@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-30 — list_subgraphs is registry-sourced: a deployed subgraph shows before it indexes a block)
+## Latest commit arc (2026-05-30 — first-class lineage DAG: utxo + childUtxos on CovenantLineageEntry)
+
+Surfaces the fork structure the `parent_utxo` edge enabled as an explicit DAG in the GraphQL `covenantLineage` response, in both directions, with no extra query.
+
+- **`CovenantLineageEntry`** (`@kasgraph/api` interface + SDL) gains `utxo: String!` (the entry's own `txHash:outputIndex` — the value a child's `parentUtxo` points at) and `childUtxos: [String!]!` (the forward edges — the UTXOs of entries whose `parentUtxo` is this one; empty for a tip, length > 1 where a transfer forked). `parentUtxo` (added earlier) is the backward edge.
+- **Derived in-resolver, query-free**: `buildChildEdges(rows)` maps each `parent_utxo` → child UTXOs from the already-loaded lineage rows; `rowToLineageEntry(row, childEdges)` fills `utxo`/`childUtxos`. So a single `covenantLineage` response carries the whole DAG (genesis = the entry with no `parentUtxo`; tips = entries with empty `childUtxos`) without a second round-trip.
+- Tests: pg-resolvers — extended the existing chain test (asserts `utxo` + `childUtxos`) + a new **fork test** (one parent → two children: genesis `childUtxos = ['xfer:0','xfer:1']`, both children tips); api.test — the in-memory fixture + query updated to select/assert `utxo`/`parentUtxo`/`childUtxos`. vitest 221 | 1 skipped; typecheck clean. No Rust change.
+- **State unchanged otherwise:** all self-contained logic tracks DONE; remaining is **Phase 5 hosted infra**. The lineage DAG is now fully first-class server-side, so that polish item is closed too. Remaining logic-side polish: node-loads-subgraphs-from-registry at startup (partly infra-coupled via the wasm path); the LLM/address-indexed MCP tools (externally blocked).
+
+## Previous commit arc (2026-05-30 — list_subgraphs is registry-sourced: a deployed subgraph shows before it indexes a block)
 
 Completes the registry's role as the source of truth across the whole MCP surface (list / get_schema / execute_query now all registry-aware).
 

@@ -258,6 +258,36 @@ describe('PgGatewayResolvers — covenantLineage', () => {
     // The genesis has no parent; the transition records the spent edge.
     expect('parentUtxo' in got!.entries[0]!).toBe(false);
     expect(got!.entries[1]!.parentUtxo).toBe('gen:0');
+    // Each entry exposes its own utxo + forward child edges (derived).
+    expect(got!.entries[0]!.utxo).toBe('gen:0');
+    expect(got!.entries[0]!.childUtxos).toEqual(['spend:0']);
+    expect(got!.entries[1]!.utxo).toBe('spend:0');
+    expect(got!.entries[1]!.childUtxos).toEqual([]);
+  });
+
+  it('exposes forked child edges (one parent → multiple children)', async () => {
+    const pool = new MockPool([
+      [
+        {
+          covenant_id: '0xfork',
+          genesis_tx: 'gen',
+          current_utxo: 'xfer:1',
+          last_seen_daa: '150',
+          lineage_count: 3,
+        },
+      ],
+      [
+        { seq: 0, tx_hash: 'gen', output_index: 0, parent_utxo: null, daa_score: '99', state_bytes: '' },
+        // A transfer spends gen:0 and forks into two same-id outputs.
+        { seq: 1, tx_hash: 'xfer', output_index: 0, parent_utxo: 'gen:0', daa_score: '100', state_bytes: '' },
+        { seq: 2, tx_hash: 'xfer', output_index: 1, parent_utxo: 'gen:0', daa_score: '100', state_bytes: '' },
+      ],
+    ]);
+    const got = await new PgGatewayResolvers(pool).covenantLineage({ covenantId: '0xfork' });
+    // The genesis lists both forked children; each child is a tip.
+    expect(got!.entries[0]!.childUtxos).toEqual(['xfer:0', 'xfer:1']);
+    expect(got!.entries[1]!.childUtxos).toEqual([]);
+    expect(got!.entries[2]!.childUtxos).toEqual([]);
   });
 });
 
