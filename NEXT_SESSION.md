@@ -2,7 +2,15 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-30 — end-to-end build→deploy→query test vs real Postgres)
+## Latest commit arc (2026-05-30 — list_subgraphs is registry-sourced: a deployed subgraph shows before it indexes a block)
+
+Completes the registry's role as the source of truth across the whole MCP surface (list / get_schema / execute_query now all registry-aware).
+
+- **`PgMcpHandlers.list_subgraphs`** now lists active rows from `kasgraph_subgraph` (was: derived from `kasgraph_committed_block`, so a just-deployed subgraph with no indexed blocks yet was invisible). `blocks_indexed` becomes enrichment via a `LEFT JOIN` to the committed-block counts (0 until ingestion catches up); the display `name` comes from the deployed manifest (`manifest_json->>'name'`, falling back to the id); `status='removed'` rows are hidden; the keyword `LIKE` filter is preserved.
+- Tests: the 3 `list_subgraphs` unit tests updated to the registry-sourced query (incl. the null-display-name → id fallback and the never-indexed → 0 case); the e2e test extended to assert `list_subgraphs` includes the subgraph after deploy (with `blocks_indexed: 0`) and excludes it after `remove`. Default vitest **220 | 1 skipped**; e2e passes vs the live container; typecheck clean. No Rust change.
+- **State unchanged otherwise:** all self-contained logic tracks DONE; remaining is **Phase 5 hosted infra**. Smaller logic-side polish still open: load the node's active subgraph set from the registry at startup; a richer GraphQL `lineage`/`successor` shape; the LLM/address-indexed MCP tools.
+
+## Previous commit arc (2026-05-30 — end-to-end build→deploy→query test vs real Postgres)
 
 Proves the last three arcs (registry + typed-schema routing + deploy CLI) actually compose against a live DB, not just under mock pools — the first real-Postgres **TS** test.
 

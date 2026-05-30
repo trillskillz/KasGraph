@@ -40,45 +40,44 @@ function lastCall(pool: MockPool) {
 }
 
 describe('PgMcpHandlers — list_subgraphs', () => {
-  it('groups by subgraph with no WHERE clause when no keyword', async () => {
+  it('lists active deployed subgraphs (registry-sourced) with indexed-block counts', async () => {
     const pool = new MockPool([
       [
-        { subgraph: 'kasbonds', blocks_indexed: 12345 },
-        { subgraph: 'opensilver_patterns', blocks_indexed: 67890 },
+        { subgraph: 'kasbonds', display_name: 'KasBonds', blocks_indexed: 12345 },
+        // No manifest name → id is the display fallback; never-indexed → 0.
+        { subgraph: 'network_stats', display_name: null, blocks_indexed: 0 },
       ],
     ]);
     const handlers = new PgMcpHandlers(pool);
     const got = await handlers.list_subgraphs({});
 
     const call = lastCall(pool);
-    expect(call.sql).toMatch(/FROM kasgraph_committed_block/);
-    expect(call.sql).toMatch(/GROUP BY subgraph/);
-    expect(call.sql).not.toMatch(/WHERE/);
+    expect(call.sql).toMatch(/FROM kasgraph_subgraph s/);
+    expect(call.sql).toMatch(/LEFT JOIN/);
+    expect(call.sql).toMatch(/status <> 'removed'/);
     expect(call.values).toEqual([]);
     expect(got).toEqual([
-      { id: 'kasbonds', name: 'kasbonds', blocks_indexed: 12345 },
-      {
-        id: 'opensilver_patterns',
-        name: 'opensilver_patterns',
-        blocks_indexed: 67890,
-      },
+      { id: 'kasbonds', name: 'KasBonds', blocks_indexed: 12345 },
+      { id: 'network_stats', name: 'network_stats', blocks_indexed: 0 },
     ]);
   });
 
   it('adds a LIKE filter when a keyword is provided (lowercased)', async () => {
     const pool = new MockPool([
-      [{ subgraph: 'kasbonds', blocks_indexed: 12345 }],
+      [{ subgraph: 'kasbonds', display_name: 'KasBonds', blocks_indexed: 12345 }],
     ]);
     const handlers = new PgMcpHandlers(pool);
     const got = await handlers.list_subgraphs({ keyword: 'KasB' });
     const call = lastCall(pool);
-    expect(call.sql).toMatch(/WHERE LOWER\(subgraph\) LIKE \$1/);
+    expect(call.sql).toMatch(/LOWER\(s\.subgraph\) LIKE \$1/);
     expect(call.values).toEqual(['%kasb%']);
     expect(got).toHaveLength(1);
   });
 
   it('coerces a string-shaped COUNT to a number', async () => {
-    const pool = new MockPool([[{ subgraph: 'k', blocks_indexed: '42' }]]);
+    const pool = new MockPool([
+      [{ subgraph: 'k', display_name: null, blocks_indexed: '42' }],
+    ]);
     const got = await new PgMcpHandlers(pool).list_subgraphs({});
     expect(got[0]!.blocks_indexed).toBe(42);
   });

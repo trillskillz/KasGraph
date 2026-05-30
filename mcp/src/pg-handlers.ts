@@ -82,6 +82,7 @@ function boundedLimit(n: number | undefined): number {
 
 interface SubgraphRow extends QueryResultRow {
   subgraph: string;
+  display_name: string | null;
   blocks_indexed: unknown;
 }
 
@@ -120,27 +121,41 @@ export class PgMcpHandlers implements McpHandlers {
   // -----------------------------------------------------------
 
   async list_subgraphs(input: ListSubgraphsInput): Promise<ListSubgraphsOutput> {
-    const clauses: string[] = [];
+    // The registry (`kasgraph_subgraph`) is the source of truth for which
+    // subgraphs exist, so a just-deployed subgraph shows up before it has
+    // indexed a single block. `blocks_indexed` is enrichment from the committed
+    // -block history (0 until ingestion catches up). Removed subgraphs are
+    // hidden. The display name comes from the deployed manifest.
+    const clauses = [`s.status <> 'removed'`];
     const values: unknown[] = [];
     if (input.keyword !== undefined && input.keyword.length > 0) {
       values.push(`%${input.keyword.toLowerCase()}%`);
-      clauses.push(`LOWER(subgraph) LIKE $${values.length}`);
+      clauses.push(`LOWER(s.subgraph) LIKE $${values.length}`);
     }
-    const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const result = (await this.pool.query<SubgraphRow>(
-      `SELECT subgraph, COUNT(*) AS blocks_indexed
-       FROM kasgraph_committed_block
-       ${whereClause}
-       GROUP BY subgraph
-       ORDER BY subgraph ASC`,
+      `SELECT s.subgraph,
+              s.manifest_json->>'name' AS display_name,
+              COALESCE(b.blocks_indexed, 0) AS blocks_indexed
+       FROM kasgraph_subgraph s
+       LEFT JOIN (
+         SELECT subgraph, COUNT(*) AS blocks_indexed
+         FROM kasgraph_committed_block
+         GROUP BY subgraph
+       ) b ON b.subgraph = s.subgraph
+       WHERE ${clauses.join(' AND ')}
+       ORDER BY s.subgraph ASC`,
       values,
     )) as QueryResult<SubgraphRow>;
 
     return result.rows.map<SubgraphSummary>((row) => {
       const blocks = Number(bigIntString(row.blocks_indexed)) || 0;
+      const displayName =
+        typeof row.display_name === 'string' && row.display_name.length > 0
+          ? row.display_name
+          : row.subgraph;
       return {
         id: row.subgraph,
-        name: row.subgraph,
+        name: displayName,
         blocks_indexed: blocks,
       };
     });

@@ -42,6 +42,18 @@ suite('e2e: deploy → typed query → remove (real Postgres)', () => {
          deployed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )`,
     );
+    // Committed-block history table (list_subgraphs LEFT JOINs it for the
+    // indexed-block count; empty here → 0).
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS kasgraph_committed_block (
+         subgraph TEXT NOT NULL,
+         block_hash TEXT NOT NULL,
+         daa_score BIGINT NOT NULL,
+         served_by TEXT NOT NULL,
+         committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         PRIMARY KEY (subgraph, block_hash)
+       )`,
+    );
     // The subgraph's own data schema + entity table (what ensure_subgraph_schema
     // creates) + one entity version to query back.
     await pool.query(`CREATE SCHEMA IF NOT EXISTS "${SG}"`);
@@ -86,6 +98,11 @@ suite('e2e: deploy → typed query → remove (real Postgres)', () => {
     // Deploy → the registry row is written.
     await registry.upsertDeployment(bundle);
 
+    // list_subgraphs (registry-sourced) now includes it, before any blocks.
+    const listed = await handlers.list_subgraphs({ keyword: SG });
+    expect(listed.map((s) => s.id)).toContain(SG);
+    expect(listed.find((s) => s.id === SG)!.blocks_indexed).toBe(0);
+
     // get_schema now returns the subgraph's OWN typed schema.
     const after = await handlers.get_schema({ subgraph_id: SG });
     expect(after.schema_sdl).toContain('bond(id: ID!): Bond');
@@ -108,5 +125,9 @@ suite('e2e: deploy → typed query → remove (real Postgres)', () => {
     });
     expect(afterRemove.errors).toBeDefined();
     expect(afterRemove.errors!.length).toBeGreaterThan(0);
+
+    // …and list_subgraphs no longer reports the removed subgraph.
+    const listedAfter = await handlers.list_subgraphs({ keyword: SG });
+    expect(listedAfter.map((s) => s.id)).not.toContain(SG);
   });
 });
