@@ -37,8 +37,11 @@ export interface DeployBundle {
   schemaSdl: string;
   /** The resolved `build/manifest.json` descriptor. */
   manifestJson: unknown;
-  /** Hex sha256 of the compiled wasm (provenance; the bytes live on disk). */
+  /** Hex sha256 of the compiled wasm (provenance + integrity check). */
   wasmSha256: string;
+  /** The compiled mapping wasm, base64-encoded — persisted so a node can run
+   * the mapping without a separate file transfer. */
+  wasmBase64: string;
 }
 
 /** A deployed subgraph's registry state, as `status` reports it. */
@@ -134,6 +137,7 @@ export async function assembleDeployBundle(
   }
   const wasmBytes = await readFile(wasmPath);
   const wasmSha256 = createHash('sha256').update(wasmBytes).digest('hex');
+  const wasmBase64 = wasmBytes.toString('base64');
 
   const schemaPath = path.join(root, 'schema.graphql');
   if (!existsSync(schemaPath)) {
@@ -142,7 +146,7 @@ export async function assembleDeployBundle(
   const schemaSdl = await readFile(schemaPath, 'utf8');
 
   return {
-    bundle: { subgraphId, schemaSdl, manifestJson: descriptor, wasmSha256 },
+    bundle: { subgraphId, schemaSdl, manifestJson: descriptor, wasmSha256, wasmBase64 },
   };
 }
 
@@ -153,12 +157,13 @@ export class PgSubgraphRegistry implements SubgraphRegistryClient {
 
   async upsertDeployment(bundle: DeployBundle): Promise<void> {
     await this.pool.query(
-      `INSERT INTO kasgraph_subgraph (subgraph, schema_sdl, manifest_json, wasm_sha256)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO kasgraph_subgraph (subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (subgraph) DO UPDATE SET
          schema_sdl = EXCLUDED.schema_sdl,
          manifest_json = EXCLUDED.manifest_json,
          wasm_sha256 = EXCLUDED.wasm_sha256,
+         wasm_bytes = EXCLUDED.wasm_bytes,
          status = 'active',
          deployed_at = NOW()`,
       [
@@ -166,6 +171,7 @@ export class PgSubgraphRegistry implements SubgraphRegistryClient {
         bundle.schemaSdl,
         JSON.stringify(bundle.manifestJson),
         bundle.wasmSha256,
+        Buffer.from(bundle.wasmBase64, 'base64'),
       ],
     );
   }

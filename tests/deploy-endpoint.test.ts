@@ -41,6 +41,15 @@ describe('parseDeployBundle', () => {
     expect(parseDeployBundle({ ...BUNDLE, wasmSha256: 7 }).error).toMatch(/wasmSha256/);
     expect(parseDeployBundle('nope').error).toMatch(/JSON object/);
   });
+
+  it('carries wasmBase64 and integrity-checks it against wasmSha256', () => {
+    // No declared hash → bytes accepted as-is.
+    const noHash = { subgraphId: 'k', schemaSdl: 's', manifestJson: {}, wasmBase64: 'AGFzbQ==' };
+    expect(parseDeployBundle(noHash).input?.wasmBase64).toBe('AGFzbQ==');
+    // Declared hash that doesn't match the bytes → rejected.
+    const bad = { ...noHash, wasmSha256: 'deadbeef' };
+    expect(parseDeployBundle(bad).error).toMatch(/sha256 mismatch/);
+  });
 });
 
 describe('handleDeployRequest', () => {
@@ -50,12 +59,27 @@ describe('handleDeployRequest', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ subgraphId: 'kasbonds', status: 'active' });
     expect(pool.calls[0]!.sql).toMatch(/INSERT INTO kasgraph_subgraph/);
+    // No wasmBase64 in this bundle → wasm_bytes binds null.
     expect(pool.calls[0]!.values).toEqual([
       'kasbonds',
       BUNDLE.schemaSdl,
       JSON.stringify(BUNDLE.manifestJson),
       'deadbeef',
+      null,
     ]);
+  });
+
+  it('POST persists wasm bytes (base64 → BYTEA Buffer) when present', async () => {
+    const pool = new MockPool();
+    const res = await handleDeployRequest(
+      { method: 'POST', path: '/subgraphs', body: { ...BUNDLE, wasmBase64: 'AGFzbQ==', wasmSha256: undefined } },
+      pool,
+    );
+    expect(res.status).toBe(200);
+    expect(pool.calls[0]!.sql).toMatch(/wasm_bytes/);
+    const bytes = pool.calls[0]!.values![4];
+    expect(Buffer.isBuffer(bytes)).toBe(true);
+    expect((bytes as Buffer).equals(Buffer.from('AGFzbQ==', 'base64'))).toBe(true);
   });
 
   it('POST with an invalid bundle is a 400 and never queries', async () => {

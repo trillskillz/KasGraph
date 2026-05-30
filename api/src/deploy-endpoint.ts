@@ -13,6 +13,8 @@
 //   GET    /subgraphs/:id                                   -> 200 { … } | 404
 //   DELETE /subgraphs/:id                                   -> 200 { removed: true } | 404
 
+import { createHash } from 'node:crypto';
+
 import { fetchSubgraphDeployment, type PgPoolLike } from './pg-resolvers.js';
 
 const SUBGRAPH_ID_RE = /^[a-z0-9_]+$/;
@@ -23,6 +25,9 @@ export interface DeploySubgraphInput {
   schemaSdl: string;
   manifestJson: unknown;
   wasmSha256?: string;
+  /** The compiled mapping wasm, base64-encoded. When present it is persisted
+   * (and, if `wasmSha256` is given too, integrity-checked against it). */
+  wasmBase64?: string;
 }
 
 /** Validate + normalize a raw POST body into a `DeploySubgraphInput`, or return
@@ -48,12 +53,25 @@ export function parseDeployBundle(
   if (wasmSha256 !== undefined && typeof wasmSha256 !== 'string') {
     return { error: 'wasmSha256 must be a string when present' };
   }
+  const wasmBase64 = b['wasmBase64'];
+  if (wasmBase64 !== undefined && typeof wasmBase64 !== 'string') {
+    return { error: 'wasmBase64 must be a string when present' };
+  }
+  // Integrity: if the bytes and their declared hash are both present, they must
+  // agree — catches a corrupted/mismatched upload before it's persisted.
+  if (typeof wasmBase64 === 'string' && typeof wasmSha256 === 'string') {
+    const actual = createHash('sha256').update(Buffer.from(wasmBase64, 'base64')).digest('hex');
+    if (actual !== wasmSha256) {
+      return { error: `wasm sha256 mismatch: bundle declares ${wasmSha256}, bytes hash to ${actual}` };
+    }
+  }
   return {
     input: {
       subgraphId,
       schemaSdl: b['schemaSdl'],
       manifestJson: b['manifestJson'],
       ...(typeof wasmSha256 === 'string' && { wasmSha256 }),
+      ...(typeof wasmBase64 === 'string' && { wasmBase64 }),
     },
   };
 }
@@ -64,16 +82,25 @@ export async function deploySubgraph(
   pool: PgPoolLike,
   input: DeploySubgraphInput,
 ): Promise<void> {
+  const wasmBytes =
+    input.wasmBase64 !== undefined ? Buffer.from(input.wasmBase64, 'base64') : null;
   await pool.query(
-    `INSERT INTO kasgraph_subgraph (subgraph, schema_sdl, manifest_json, wasm_sha256)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO kasgraph_subgraph (subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (subgraph) DO UPDATE SET
        schema_sdl = EXCLUDED.schema_sdl,
        manifest_json = EXCLUDED.manifest_json,
        wasm_sha256 = EXCLUDED.wasm_sha256,
+       wasm_bytes = EXCLUDED.wasm_bytes,
        status = 'active',
        deployed_at = NOW()`,
-    [input.subgraphId, input.schemaSdl, JSON.stringify(input.manifestJson), input.wasmSha256 ?? null],
+    [
+      input.subgraphId,
+      input.schemaSdl,
+      JSON.stringify(input.manifestJson),
+      input.wasmSha256 ?? null,
+      wasmBytes,
+    ],
   );
 }
 

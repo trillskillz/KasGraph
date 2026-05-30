@@ -118,6 +118,8 @@ describe('assembleDeployBundle', () => {
     expect((bundle!.manifestJson as { name: string }).name).toBe('network-stats');
     // sha256 of the 4 magic bytes \0asm.
     expect(bundle!.wasmSha256).toMatch(/^[0-9a-f]{64}$/);
+    // The wasm bytes travel base64-encoded (\0asm = "AGFzbQ==").
+    expect(bundle!.wasmBase64).toBe('AGFzbQ==');
   });
 
   it('errors (code 66) when the subgraph is not built', async () => {
@@ -155,22 +157,28 @@ describe('PgSubgraphRegistry', () => {
     }
   }
 
-  it('upsert binds (id, sdl, manifest-json-string, wasm) and is idempotent', async () => {
+  it('upsert binds (id, sdl, manifest-json, wasm hash + bytes) and is idempotent', async () => {
     const pool = new MockPool([]);
     await new PgSubgraphRegistry(pool).upsertDeployment({
       subgraphId: 'kasbonds',
       schemaSdl: 'type Bond @entity { id: ID! }',
       manifestJson: { name: 'kasbonds' },
       wasmSha256: 'deadbeef',
+      wasmBase64: 'AGFzbQ==',
     });
     expect(pool.calls[0]!.sql).toMatch(/INSERT INTO kasgraph_subgraph/);
     expect(pool.calls[0]!.sql).toMatch(/ON CONFLICT \(subgraph\)/);
-    expect(pool.calls[0]!.values).toEqual([
+    expect(pool.calls[0]!.sql).toMatch(/wasm_bytes/);
+    const values = pool.calls[0]!.values!;
+    expect(values.slice(0, 4)).toEqual([
       'kasbonds',
       'type Bond @entity { id: ID! }',
       JSON.stringify({ name: 'kasbonds' }),
       'deadbeef',
     ]);
+    // The wasm bytes are bound as a Buffer decoded from the base64.
+    expect(Buffer.isBuffer(values[4])).toBe(true);
+    expect((values[4] as Buffer).equals(Buffer.from('AGFzbQ==', 'base64'))).toBe(true);
   });
 
   it('setRemoved reports true when a row was affected, false otherwise', async () => {
@@ -285,6 +293,7 @@ describe('HttpDeployTransport', () => {
     schemaSdl: 'type Bond @entity { id: ID! }',
     manifestJson: { name: 'kasbonds' },
     wasmSha256: 'deadbeef',
+    wasmBase64: 'AGFzbQ==',
   };
 
   it('upsertDeployment POSTs the bundle to /subgraphs', async () => {

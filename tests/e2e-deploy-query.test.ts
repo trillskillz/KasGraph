@@ -38,10 +38,14 @@ suite('e2e: deploy → typed query → remove (real Postgres)', () => {
          schema_sdl TEXT NOT NULL,
          manifest_json JSONB NOT NULL,
          wasm_sha256 TEXT,
+         wasm_bytes BYTEA,
          status TEXT NOT NULL DEFAULT 'active',
          deployed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
        )`,
     );
+    // A pre-existing table from an older run won't have gained the column via
+    // CREATE IF NOT EXISTS — add it idempotently to match the latest migration.
+    await pool.query('ALTER TABLE kasgraph_subgraph ADD COLUMN IF NOT EXISTS wasm_bytes BYTEA');
     // Committed-block history table (list_subgraphs LEFT JOINs it for the
     // indexed-block count; empty here → 0).
     await pool.query(
@@ -89,6 +93,7 @@ suite('e2e: deploy → typed query → remove (real Postgres)', () => {
       schemaSdl: SDL,
       manifestJson: { name: SG, dataSources: [] },
       wasmSha256: 'a'.repeat(64),
+      wasmBase64: 'AGFzbQ==', // \0asm — 4 bytes
     };
 
     // Not deployed yet → get_schema falls back to the base meta schema.
@@ -97,6 +102,13 @@ suite('e2e: deploy → typed query → remove (real Postgres)', () => {
 
     // Deploy → the registry row is written.
     await registry.upsertDeployment(bundle);
+
+    // The deployed wasm bytes are persisted in the registry (4 bytes here).
+    const wasmRow = await pool.query<{ len: number }>(
+      'SELECT octet_length(wasm_bytes) AS len FROM kasgraph_subgraph WHERE subgraph = $1',
+      [SG],
+    );
+    expect(Number(wasmRow.rows[0]!.len)).toBe(4);
 
     // list_subgraphs (registry-sourced) now includes it, before any blocks.
     const listed = await handlers.list_subgraphs({ keyword: SG });

@@ -1902,7 +1902,7 @@ mod tests {
     #[test]
     fn migrator_embeds_all_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 8);
+        assert_eq!(migrations.len(), 9);
         assert_eq!(migrations[0].version, 20260526110500);
         assert_eq!(migrations[1].version, 20260526150000);
         assert_eq!(migrations[2].version, 20260526160000);
@@ -1911,5 +1911,6 @@ mod tests {
         assert_eq!(migrations[5].version, 20260529130000);
         assert_eq!(migrations[6].version, 20260530120000);
         assert_eq!(migrations[7].version, 20260530140000);
+        assert_eq!(migrations[8].version, 20260530160000);
     }
 }
