@@ -146,6 +146,54 @@ async fn covenant_utxo_track_lookup_unwind(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// `covenant_utxos_created_by_tx` returns exactly the covenant outputs a
+/// transaction produced (the successor receipt set spend-operation
+/// classification consumes), ordered by output index, and excludes other txs'.
+#[sqlx::test]
+async fn covenant_utxos_created_by_tx_returns_a_txs_outputs(pool: PgPool) -> sqlx::Result<()> {
+    let store = Store::from_pool(pool);
+    let sg = SubgraphId::new("itest_utxo_by_tx").unwrap();
+    store.ensure_subgraph_schema(&sg).await.unwrap();
+
+    // Spend tx "txspend" produces two covenant receipts; an unrelated tx one.
+    for (tx, idx, amt) in [
+        ("txspend", 0i32, 600i64),
+        ("txspend", 1, 400),
+        ("other", 0, 999),
+    ] {
+        store
+            .track_covenant_utxo(&CovenantUtxoRecord {
+                subgraph: sg.clone(),
+                tx_hash: tx.into(),
+                output_index: idx,
+                block_daa_score: 200,
+                detector_kind: "KCC20Asset".into(),
+                covenant_id: Some("cid-A".into()),
+                value_sompi: amt,
+                locked_state: serde_json::json!({ "amount": amt }),
+            })
+            .await
+            .unwrap();
+    }
+
+    let created = store
+        .covenant_utxos_created_by_tx(&sg, "txspend")
+        .await
+        .unwrap();
+    assert_eq!(created.len(), 2, "only txspend's two outputs");
+    // Ordered by output_index → 600 (idx 0) then 400 (idx 1).
+    assert_eq!(created[0].value_sompi, 600);
+    assert_eq!(created[1].value_sompi, 400);
+    assert!(created.iter().all(|m| m.detector_kind == "KCC20Asset"));
+
+    assert!(store
+        .covenant_utxos_created_by_tx(&sg, "nonexistent")
+        .await
+        .unwrap()
+        .is_empty());
+    Ok(())
+}
+
 /// The legacy-KRC-20 journal: per-tick `seq` allocation, the replay guard,
 /// the ordered read that feeds `Krc20Ledger::replay`, and reorg unwind. The
 /// round-trip also proves the write/read column mappings agree against a

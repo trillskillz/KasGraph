@@ -802,6 +802,37 @@ impl Store {
         ))
     }
 
+    /// Every tracked covenant UTXO **created by** transaction `tx_hash` — the
+    /// output receipt set a spend produced. Spend-operation classification is a
+    /// pure function of the consumed-vs-created receipt sets (per `kcc20.sil`'s
+    /// supply-conservation invariant), so the spend path pairs the inputs it
+    /// already looked up with this call to classify the operation. Empty when
+    /// the transaction produced no tracked covenant outputs (a terminal spend).
+    pub async fn covenant_utxos_created_by_tx(
+        &self,
+        subgraph: &SubgraphId,
+        tx_hash: &str,
+    ) -> Result<Vec<CovenantUtxoMatch>, StoreError> {
+        let rows: Vec<(String, Option<String>, i64, serde_json::Value)> =
+            sqlx::query_as(&covenant_utxos_by_tx_sql(subgraph.schema_name()))
+                .bind(tx_hash)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(detector_kind, covenant_id, value_sompi, locked_state)| CovenantUtxoMatch {
+                    detector_kind,
+                    covenant_id,
+                    value_sompi,
+                    locked_state,
+                },
+            )
+            .collect())
+    }
+
     /// Drop every covenant UTXO locked at or above `from_daa`, part of a
     /// reorg unwind. Mirrors the entity-version/POI rollback so the same
     /// chain bytes reproduce the same tracker state. Returns rows removed.
@@ -1392,6 +1423,15 @@ fn lookup_covenant_utxo_sql(schema: &str) -> String {
     )
 }
 
+fn covenant_utxos_by_tx_sql(schema: &str) -> String {
+    format!(
+        "SELECT detector_kind, covenant_id, value_sompi, locked_state \
+         FROM \"{schema}\".covenant_utxos \
+         WHERE tx_hash = $1 \
+         ORDER BY output_index"
+    )
+}
+
 fn unwind_covenant_utxos_sql(schema: &str) -> String {
     format!("DELETE FROM \"{schema}\".covenant_utxos WHERE block_daa_score >= $1")
 }
@@ -1556,6 +1596,15 @@ mod tests {
         assert!(sql.contains("SELECT detector_kind, covenant_id, value_sompi, locked_state"));
         assert!(sql.contains("\"krc20\".covenant_utxos"));
         assert!(sql.contains("WHERE tx_hash = $1 AND output_index = $2"));
+    }
+
+    #[test]
+    fn covenant_utxos_by_tx_sql_reads_a_txs_created_outputs_in_order() {
+        let sql = covenant_utxos_by_tx_sql("krc20");
+        assert!(sql.contains("SELECT detector_kind, covenant_id, value_sompi, locked_state"));
+        assert!(sql.contains("\"krc20\".covenant_utxos"));
+        assert!(sql.contains("WHERE tx_hash = $1"));
+        assert!(sql.contains("ORDER BY output_index"));
     }
 
     #[test]
