@@ -24,6 +24,7 @@ export const DETECTOR_SCHEMA: readonly DetectorSchema[] = [
     kind: "OpenSilverOwnable",
     fields: [
       { name: "owner_pubkey", byteLen: 32 },
+      { name: "has_pending", byteLen: 1 },
       { name: "pending_owner_pubkey", byteLen: 32 },
     ],
   },

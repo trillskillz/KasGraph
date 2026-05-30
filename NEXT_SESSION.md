@@ -2,7 +2,16 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-29 — 🎯 CovenantSpent dispatch LIVE, verified end-to-end)
+## Latest commit arc (2026-05-29 — second real fingerprint: OpenSilverOwnable (exact))
+
+Generalizes the real-fingerprint capture beyond KCC20/anchored to a fixed-size (non-looping) pattern.
+
+- **`opensilver_ownable_fingerprint()`** — a real **exact** `Fingerprint` for `ownable.sil`, captured from a `silverc` compile. Ownable takes no loop-bound ctor params (state is just `owner`/`has_pending`/`pending_owner`), so it's fixed-size → exact match (no anchoring). State windows verified: `owner_pubkey[2..34)`, `has_pending[35]`, `pending_owner_pubkey[37..69)`. Canonical script + a distinct-state instance committed as `testdata/*.hex` and `include_str!`d (not hand-inlined — the KCC20-tail-truncation lesson). 3 tests (validate, match real instance + extract, reject unrelated).
+- **Registry**: `OpenSilverOwnable` switched from the placeholder `opensilver(...)` to `PatternMatcher::Exact(opensilver_ownable_fingerprint())`. The capture revealed the placeholder **omitted the `has_pending` flag** — the real 3-field layout is now in the schema (`detector-schema.ts` regenerated; codegen + 186 TS tests green; the `OpenSilverOwnableState` interface gains `has_pending`). Cross-collision test passes with two real fingerprints (Ownable exact 420B + KCC20 anchored) mixed among placeholders.
+- detectors lib 95; default workspace 254; node 64 (its tests build scripts from the entry's own bytes, so they adapted); fmt/clippy clean.
+- **Next:** the remaining placeholders are the per-pattern capture toil this proves out — best automated by the capture **xtask** (compile each `.sil` at its ctor recipe, diff for state windows, emit Exact or Anchored consts programmatically). Plus the still-open tracks: `persist_lineage` fork-handling (design decision), `deploy/status/logs/remove` CLI + Phase 5, and Phase 3 query-surface expansion.
+
+## Previous commit arc (2026-05-29 — 🎯 CovenantSpent dispatch LIVE, verified end-to-end)
 
 The culmination of the detection/operation thread: the node now dispatches `CovenantSpent` for real KCC20 covenant spends, classifying the operation from on-chain receipt state.
 

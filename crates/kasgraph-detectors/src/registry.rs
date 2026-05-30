@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 
 use crate::fingerprint::{Fingerprint, MaskedWindow, PatternMatcher};
 use crate::kcc20_asset_fingerprint::kcc20_asset_fingerprint;
+use crate::opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
 use crate::DetectorKind;
 
 /// One entry in the detector registry.
@@ -35,12 +36,14 @@ pub fn all() -> &'static [DetectorEntry] {
 
 fn build_registry() -> Vec<DetectorEntry> {
     vec![
-        // OpenSilver core patterns.
-        opensilver(
-            DetectorKind::OpenSilverOwnable,
-            0x01,
-            &[("owner_pubkey", 32), ("pending_owner_pubkey", 32)],
-        ),
+        // OpenSilver core patterns. Ownable is a real exact fingerprint
+        // (captured from a `silverc` compile of ownable.sil — fixed-size, no
+        // loop-bound params); its state slot adds the `has_pending` flag the
+        // placeholder omitted. The rest remain placeholders pending capture.
+        DetectorEntry {
+            kind: DetectorKind::OpenSilverOwnable,
+            matcher: PatternMatcher::Exact(opensilver_ownable_fingerprint()),
+        },
         opensilver(
             DetectorKind::OpenSilverMultisig,
             0x02,
