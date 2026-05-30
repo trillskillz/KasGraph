@@ -36,10 +36,18 @@ pub mod krc20;
 pub mod krc20_ledger;
 pub mod krc721;
 pub mod krc721_ledger;
+pub mod opensilver_atomic_swap_htlc;
+pub mod opensilver_dead_mans_switch;
+pub mod opensilver_escrow_bilateral;
+pub mod opensilver_escrow_milestone;
+pub mod opensilver_freelance_payroll;
 pub mod opensilver_multisig_fingerprint;
 pub mod opensilver_ownable_fingerprint;
+pub mod opensilver_social_recovery;
+pub mod opensilver_streaming_payment;
 pub mod opensilver_timelock_fingerprint;
 pub mod opensilver_vault_fingerprint;
+pub mod opensilver_vesting;
 pub mod registry;
 
 pub use fingerprint::{
@@ -55,10 +63,18 @@ pub use krc20::{parse_krc20_inscription, Krc20Inscription, Krc20Op, Krc20Parse};
 pub use krc20_ledger::{ApplyOutcome, Krc20Ledger, TokenState};
 pub use krc721::{parse_krc721_inscription, Krc721Inscription, Krc721Op, Krc721Parse};
 pub use krc721_ledger::{CollectionState, Krc721Ledger};
+pub use opensilver_atomic_swap_htlc::opensilver_atomic_swap_htlc_fingerprint;
+pub use opensilver_dead_mans_switch::opensilver_dead_mans_switch_fingerprint;
+pub use opensilver_escrow_bilateral::opensilver_escrow_bilateral_fingerprint;
+pub use opensilver_escrow_milestone::opensilver_escrow_milestone_fingerprint;
+pub use opensilver_freelance_payroll::opensilver_freelance_payroll_fingerprint;
 pub use opensilver_multisig_fingerprint::opensilver_multisig_fingerprint;
 pub use opensilver_ownable_fingerprint::opensilver_ownable_fingerprint;
+pub use opensilver_social_recovery::opensilver_social_recovery_fingerprint;
+pub use opensilver_streaming_payment::opensilver_streaming_payment_fingerprint;
 pub use opensilver_timelock_fingerprint::opensilver_timelock_fingerprint;
 pub use opensilver_vault_fingerprint::opensilver_vault_fingerprint;
+pub use opensilver_vesting::opensilver_vesting_fingerprint;
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::{Deserialize, Serialize};
