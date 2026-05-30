@@ -128,7 +128,6 @@ pub struct CovenantSpend {
 /// the `{ spend; state }` shape the codegen types for spend handlers. The
 /// prior locked state is the detector payload captured when the covenant was
 /// locked (the indexer holds it on the lineage head / committed hit row).
-#[allow(dead_code)]
 pub fn spend_mapping_event(
     spend: &CovenantSpend,
     prior_state: serde_json::Value,
@@ -149,7 +148,6 @@ pub fn spend_mapping_event(
 /// versioned records it produced alongside the raw outcome. Symmetric to
 /// [`dispatch_locked_hit`] but for the `CovenantSpent` event; dispatch
 /// errors propagate so the caller decides how a bad mapping is handled.
-#[allow(dead_code)]
 pub fn dispatch_spend_hit(
     runtime: &MappingRuntime,
     spend: &CovenantSpend,

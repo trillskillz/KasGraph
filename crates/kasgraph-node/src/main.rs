@@ -25,16 +25,18 @@
 use std::{collections::BTreeMap, env, time::Duration};
 
 use anyhow::{Context, Result};
-use kasgraph_detectors::{detect_in_output, genesis_covenant_id, DetectorKind};
+use kasgraph_detectors::{
+    detect_in_output, genesis_covenant_id, kcc20_spend_operation, DetectorKind,
+};
 use kasgraph_poi::{compute_poi, poi_hex, PoiHash};
 use kasgraph_rpc::{
-    parse_notifications_jsonl, ChainNotification, IngestedBlock, LiveRpcCapabilities,
-    MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
+    parse_notifications_jsonl, ChainNotification, IngestedBlock, IngestedTransactionInput,
+    LiveRpcCapabilities, MultiRpcClient, RpcClientConfig, RpcEndpoint, SubscriptionBackoff,
 };
 use kasgraph_store::{
     CommittedBlockRecord, CovenantLineageHead, CovenantLineageRow, CovenantSpendRecord,
-    CovenantUtxoRecord, DetectedPatternRecord, EntityVersionRecord, PoiCheckpoint,
-    RpcBlockAuditRecord, Store, SubgraphId,
+    CovenantUtxoMatch, CovenantUtxoRecord, DetectedPatternRecord, EntityVersionRecord,
+    PoiCheckpoint, RpcBlockAuditRecord, Store, SubgraphId,
 };
 use kasgraph_stream::{StreamEvent, StreamHub};
 use tokio::sync::mpsc;
@@ -48,6 +50,7 @@ mod mapping_host;
 // Rust-side view of the `build/manifest.json` descriptor the CLI emits;
 // resolves which handler fires for a detector hit.
 mod subgraph_manifest;
+use subgraph_manifest::EVENT_COVENANT_SPENT;
 
 // Reconstructs legacy KRC-20/721 inscriptions from journaled op rows and
 // replays them into a ledger — the read-back inverse of the store journal,
@@ -1085,74 +1088,175 @@ async fn apply_and_persist_notification(
         // would feed them wrong data. Everything else on the persisted spend
         // row is protocol-observable or lineage-derived, so it is honest
         // today.
-        if mapping.is_some() && !committed.block.inputs.is_empty() {
-            let mut spends = 0usize;
-            for input in &committed.block.inputs {
-                let Some(spent) = store
-                    .lookup_covenant_utxo(
-                        subgraph,
-                        &input.previous_tx_hash,
-                        input.previous_output_index as i32,
-                    )
-                    .await
-                    .context("looking up covenant UTXO for spend detection")?
-                else {
-                    continue;
-                };
-                spends += 1;
-                // Resolve the successor: a lineage transition inherits the
-                // predecessor's id, so the successor equals the spent
-                // covenant's id when the spending transaction produced a
-                // tracked covenant output carrying that id. No such output
-                // means the lineage terminates here.
-                let successor_covenant_id = match &spent.covenant_id {
-                    Some(cid)
-                        if store
-                            .covenant_lineage_continues(subgraph, &input.spending_tx_hash, cid)
-                            .await
-                            .context("resolving covenant lineage successor")? =>
+        if let Some(mapping) = mapping {
+            if !committed.block.inputs.is_empty() {
+                // Group the block's inputs that consume a tracked covenant UTXO
+                // by their spending transaction. The operation a spend performs
+                // is a tx-level fact (the consumed-vs-created receipt-set delta),
+                // so it's resolved once per spending tx and shared across that
+                // tx's consumed covenants.
+                let mut consumed_by_tx: BTreeMap<
+                    String,
+                    Vec<(&IngestedTransactionInput, CovenantUtxoMatch)>,
+                > = BTreeMap::new();
+                for input in &committed.block.inputs {
+                    if let Some(spent) = store
+                        .lookup_covenant_utxo(
+                            subgraph,
+                            &input.previous_tx_hash,
+                            input.previous_output_index as i32,
+                        )
+                        .await
+                        .context("looking up covenant UTXO for spend detection")?
                     {
-                        Some(cid.clone())
+                        consumed_by_tx
+                            .entry(input.spending_tx_hash.clone())
+                            .or_default()
+                            .push((input, spent));
                     }
-                    _ => None,
-                };
-                let spend_record = CovenantSpendRecord {
-                    subgraph: subgraph.clone(),
-                    spending_tx_hash: input.spending_tx_hash.clone(),
-                    previous_tx_hash: input.previous_tx_hash.clone(),
-                    previous_output_index: input.previous_output_index as i32,
-                    block_daa_score: committed.block.daa_score,
-                    detector_kind: spent.detector_kind.clone(),
-                    covenant_id: spent.covenant_id.clone(),
-                    spent_value_sompi: spent.value_sompi,
-                    successor_covenant_id: successor_covenant_id.clone(),
-                };
-                store
-                    .record_covenant_spend(&spend_record)
-                    .await
-                    .context("recording detected covenant spend")?;
-                info!(
-                    subgraph = subgraph.schema_name(),
-                    block_hash = committed.block.hash,
-                    daa_score = committed.block.daa_score,
-                    spending_tx = input.spending_tx_hash,
-                    spent_outpoint =
-                        format!("{}:{}", input.previous_tx_hash, input.previous_output_index),
-                    detector_kind = spent.detector_kind,
-                    covenant_id = spent.covenant_id.as_deref().unwrap_or(""),
-                    spent_value_sompi = spent.value_sompi,
-                    successor_covenant_id = successor_covenant_id.as_deref().unwrap_or(""),
-                    "covenant spend detected (CovenantSpent dispatch pending operation decoder)"
-                );
-            }
-            if spends > 0 {
-                info!(
-                    subgraph = subgraph.schema_name(),
-                    block_hash = committed.block.hash,
-                    daa_score = committed.block.daa_score,
-                    spends,
-                    "covenant spends detected on committed block"
-                );
+                }
+
+                // Snapshot the committed entity state once for this block's
+                // spend dispatches (same discipline as the locked path).
+                let snapshot = load_entity_snapshot(store, subgraph).await?;
+                let mut spends = 0usize;
+                let mut dispatched_spends = 0usize;
+
+                for (spending_tx, consumed) in &consumed_by_tx {
+                    // KCC20 asset operation: classify the consumed-vs-created
+                    // receipt-set delta. Only when every covenant this tx
+                    // consumes is a KCC20 asset (a homogeneous KCC20 tx);
+                    // otherwise the operation stays undetermined and we don't
+                    // dispatch — better than feeding the mapping a guess.
+                    let operation: Option<String> = if consumed
+                        .iter()
+                        .all(|(_, m)| m.detector_kind == "KCC20Asset")
+                    {
+                        let created = store
+                            .covenant_utxos_created_by_tx(subgraph, spending_tx)
+                            .await
+                            .context("fetching covenant outputs created by the spending tx")?;
+                        let consumed_states: Vec<serde_json::Value> = consumed
+                            .iter()
+                            .map(|(_, m)| m.locked_state.clone())
+                            .collect();
+                        let created_states: Vec<serde_json::Value> = created
+                            .into_iter()
+                            .filter(|c| c.detector_kind == "KCC20Asset")
+                            .map(|c| c.locked_state)
+                            .collect();
+                        kcc20_spend_operation(&consumed_states, &created_states)
+                            .ok()
+                            .map(|op| op.as_str().to_owned())
+                    } else {
+                        None
+                    };
+
+                    for (input, spent) in consumed {
+                        spends += 1;
+                        // Successor id: a transition inherits the predecessor's
+                        // id, so the successor equals the spent covenant's id
+                        // when the spending tx produced a tracked covenant
+                        // output carrying it (fork-agnostic EXISTS); else the
+                        // lineage terminates here.
+                        let successor_covenant_id = match &spent.covenant_id {
+                            Some(cid)
+                                if store
+                                    .covenant_lineage_continues(subgraph, spending_tx, cid)
+                                    .await
+                                    .context("resolving covenant lineage successor")? =>
+                            {
+                                Some(cid.clone())
+                            }
+                            _ => None,
+                        };
+                        let spend_record = CovenantSpendRecord {
+                            subgraph: subgraph.clone(),
+                            spending_tx_hash: input.spending_tx_hash.clone(),
+                            previous_tx_hash: input.previous_tx_hash.clone(),
+                            previous_output_index: input.previous_output_index as i32,
+                            block_daa_score: committed.block.daa_score,
+                            detector_kind: spent.detector_kind.clone(),
+                            covenant_id: spent.covenant_id.clone(),
+                            spent_value_sompi: spent.value_sompi,
+                            successor_covenant_id: successor_covenant_id.clone(),
+                        };
+                        store
+                            .record_covenant_spend(&spend_record)
+                            .await
+                            .context("recording detected covenant spend")?;
+
+                        // Dispatch CovenantSpent when the operation is resolved
+                        // and the mapping binds a handler for this covenant kind.
+                        // Each consumed covenant UTXO is one spend event; the
+                        // operation is the tx-level action it was part of.
+                        if let Some(op) = &operation {
+                            if let Some(handler) = mapping
+                                .descriptor
+                                .resolve_handler(&spent.detector_kind, EVENT_COVENANT_SPENT)
+                            {
+                                let spend = mapping_host::CovenantSpend {
+                                    operation: op.clone(),
+                                    spent_value_sompi: spent.value_sompi.to_string(),
+                                    successor_covenant_id: successor_covenant_id.clone(),
+                                };
+                                match mapping_host::dispatch_spend_hit(
+                                    &mapping.runtime,
+                                    &spend,
+                                    spent.locked_state.clone(),
+                                    committed.block.daa_score as u64,
+                                    &committed.block.hash,
+                                    handler,
+                                    subgraph,
+                                    &snapshot,
+                                ) {
+                                    Ok((records, _)) => {
+                                        for record in &records {
+                                            store.upsert_entity_version(record).await.context(
+                                                "persisting spend-emitted entity version",
+                                            )?;
+                                        }
+                                        dispatched_spends += 1;
+                                    }
+                                    Err(e) => warn!(
+                                        subgraph = subgraph.schema_name(),
+                                        detector_kind = spent.detector_kind,
+                                        handler,
+                                        error = %e,
+                                        "CovenantSpent mapping handler failed; skipping"
+                                    ),
+                                }
+                            }
+                        }
+
+                        info!(
+                            subgraph = subgraph.schema_name(),
+                            block_hash = committed.block.hash,
+                            daa_score = committed.block.daa_score,
+                            spending_tx = input.spending_tx_hash,
+                            spent_outpoint = format!(
+                                "{}:{}",
+                                input.previous_tx_hash, input.previous_output_index
+                            ),
+                            detector_kind = spent.detector_kind,
+                            covenant_id = spent.covenant_id.as_deref().unwrap_or(""),
+                            spent_value_sompi = spent.value_sompi,
+                            operation = operation.as_deref().unwrap_or("(undetermined)"),
+                            successor_covenant_id = successor_covenant_id.as_deref().unwrap_or(""),
+                            "covenant spend detected"
+                        );
+                    }
+                }
+                if spends > 0 {
+                    info!(
+                        subgraph = subgraph.schema_name(),
+                        block_hash = committed.block.hash,
+                        daa_score = committed.block.daa_score,
+                        spends,
+                        dispatched_spends,
+                        "covenant spends detected on committed block"
+                    );
+                }
             }
         }
 
@@ -2806,6 +2910,138 @@ mod integration_pg_persist {
             kasgraph_poi::verify_poi_chain(&checkpoints).unwrap(),
             kasgraph_poi::PoiVerification::Valid { .. }
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    // A real `silverc` compile of `kcc20.sil` (the (5,5) instance: owner=07×32,
+    // identifier_type=2, amount=999, is_minter=true) — used as a KCC20 covenant
+    // output so the real anchored fingerprint detects + extracts it.
+    const KCC20_INSTANCE_HEX: &str = include_str!("testdata/kcc20_asset_instance.hex");
+
+    // handleLock is a no-op (so only the spend emission is asserted); handleSpent
+    // emits a fixed Spend/s1 entity, proving the CovenantSpent handler fired.
+    const SPEND_WAT: &str = r#"
+        (module
+          (import "kasgraph" "store_set" (func $store_set (param i32 i32)))
+          (memory (export "memory") 1)
+          (global $heap (mut i32) (i32.const 1024))
+          (func (export "kasgraph_alloc") (param $len i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+            (local.get $p))
+          (data (i32.const 0) "{\"entity\":\"Spend\",\"id\":\"s1\",\"data\":{\"n\":7}}")
+          (func (export "handleLock") (param i32 i32))
+          (func (export "handleSpent") (param i32 i32)
+            (call $store_set (i32.const 0) (i32.const 43))))
+    "#;
+
+    fn write_spend_fixture() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("kasgraph_spendit_{}_{nanos}", std::process::id()));
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let manifest = r#"{ "name":"itest", "wasm":"mapping.wasm", "dataSources":[
+            { "name":"d", "kind":"covenant_id", "patterns":["KCC20Asset"],
+              "collection":null, "addresses":[],
+              "handlers":[
+                {"event":"CovenantLocked","handler":"handleLock"},
+                {"event":"CovenantSpent","handler":"handleSpent"}] } ]}"#;
+        std::fs::write(build.join("manifest.json"), manifest).unwrap();
+        std::fs::write(build.join("mapping.wasm"), SPEND_WAT).unwrap();
+        dir
+    }
+
+    /// End-to-end CovenantSpent dispatch: lock a real KCC20 asset covenant in
+    /// one block, then spend it (consuming its outpoint and producing a
+    /// successor KCC20 output) in the next. The node must detect the spend,
+    /// classify the operation from the consumed+created receipt sets, resolve
+    /// the `CovenantSpent` handler, dispatch it, and persist the emitted entity.
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn committed_spend_dispatches_covenant_spent(pool: PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg = SubgraphId::new("itest_spend").unwrap();
+        store.ensure_subgraph_schema(&sg).await.unwrap();
+
+        let dir = write_spend_fixture();
+        let mapping = mapping_host::LoadedMapping::load(sg.clone(), &dir).unwrap();
+        let kcc20 = hex::decode(KCC20_INSTANCE_HEX.trim()).expect("valid KCC20 instance hex");
+
+        let mut ingestion = IngestionState::default();
+
+        // Block 1: locks a KCC20 asset covenant (detected via the real
+        // anchored fingerprint, tracked as a covenant UTXO).
+        let lock_block = IngestedBlock {
+            hash: "blk-lock".into(),
+            daa_score: 100,
+            blue_score: 100,
+            is_finalized: true,
+            served_by: "primary".into(),
+            outputs: vec![IngestedTransactionOutput {
+                tx_hash: "tx-lock".into(),
+                output_index: 0,
+                script_public_key: kcc20.clone(),
+                value: 1000,
+            }],
+            inputs: Vec::new(),
+            payloads: Vec::new(),
+        };
+        apply_and_persist_notification(
+            &store,
+            &sg,
+            &mut ingestion,
+            ChainNotification::BlockAdded(lock_block),
+            None,
+            Some(&mapping),
+        )
+        .await
+        .unwrap();
+
+        // Block 2: spends tx-lock:0 and produces a successor KCC20 output, so
+        // the spend loop sees a consumed + a created KCC20 receipt → transfer.
+        let spend_block = IngestedBlock {
+            hash: "blk-spend".into(),
+            daa_score: 200,
+            blue_score: 200,
+            is_finalized: true,
+            served_by: "primary".into(),
+            outputs: vec![IngestedTransactionOutput {
+                tx_hash: "tx-spend".into(),
+                output_index: 0,
+                script_public_key: kcc20.clone(),
+                value: 1000,
+            }],
+            inputs: vec![IngestedTransactionInput {
+                spending_tx_hash: "tx-spend".into(),
+                previous_tx_hash: "tx-lock".into(),
+                previous_output_index: 0,
+            }],
+            payloads: Vec::new(),
+        };
+        apply_and_persist_notification(
+            &store,
+            &sg,
+            &mut ingestion,
+            ChainNotification::BlockAdded(spend_block),
+            None,
+            Some(&mapping),
+        )
+        .await
+        .unwrap();
+
+        // The CovenantSpent handler fired and persisted its entity — proving
+        // detection → operation classification → handler resolution → dispatch.
+        assert_eq!(
+            store.latest_entity(&sg, "Spend", "s1").await.unwrap(),
+            Some(serde_json::json!({ "n": 7 })),
+            "CovenantSpent dispatch must persist the spend handler's entity"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         Ok(())

@@ -1322,6 +1322,7 @@ name = "kasgraph-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "kasgraph-detectors",
  "kasgraph-mapping",
  "kasgraph-poi",

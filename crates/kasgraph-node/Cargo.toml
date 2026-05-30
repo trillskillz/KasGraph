@@ -35,6 +35,7 @@ kasgraph-stream.workspace = true
 integration-pg = []
 
 [dev-dependencies]
-# Only the integration-pg tests use this (PgPool + #[sqlx::test]); it
-# stays unused when that feature is off.
+# Only the integration-pg tests use these (PgPool + #[sqlx::test]; hex for the
+# committed-spend test's real KCC20 instance fixture); unused when off.
 sqlx.workspace = true
+hex.workspace = true
