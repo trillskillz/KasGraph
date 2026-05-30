@@ -25,14 +25,12 @@
 //! This is the actual reference-contract model (it replaced an earlier
 //! aggregate `total_supply`/`mint_nonce` model that did not match
 //! `kcc20.sil`). The classifier is pure and extraction-agnostic: it takes
-//! structured receipt states, so it is unit-tested today over hand-built
-//! receipts and `from_payload`-parsed detector payloads. It is **not yet
-//! wired into the node spend path**: honest classification needs the receipt
-//! states read out of the on-chain state window, and the fingerprint registry
-//! still carries placeholder bytes (real OpenSilver compiled-script + state
-//! offsets are a separate, pending export). Wiring against placeholder
-//! extraction would classify fake state and mislead the spend mappings, so it
-//! lands as a pure core — the same discipline as `krc20_ledger`.
+//! structured receipt states. The `KCC20Asset` detector now carries a **real**
+//! anchored fingerprint (`crate::kcc20_asset_fingerprint`), so on-chain
+//! receipt state is honestly extractable; [`kcc20_spend_operation`] is the
+//! bridge from a spend's consumed + created receipt payloads to its operation.
+//! What remains is the node spend-loop wiring (group by spending tx, gather
+//! the consumed/created sets, classify, build `CovenantSpend`, dispatch).
 
 use std::collections::BTreeSet;
 
@@ -116,6 +114,31 @@ pub enum Kcc20DecodeError {
     NotHex(&'static str),
     #[error("field `{0}` is wider than its declared width in KCC20 receipt payload")]
     Overflow(&'static str),
+}
+
+/// Resolve a KCC20 asset spend's operation from the detector payloads (the
+/// `locked_state` JSON of each tracked covenant UTXO) of the receipts the
+/// spend **consumed** and **created**. This is the bridge the node spend path
+/// calls: it already has the consumed receipts (`lookup_covenant_utxo` per
+/// input) and the created ones (`covenant_utxos_created_by_tx`), each carrying
+/// a `locked_state` payload. Returns the classified operation, or a
+/// `Kcc20DecodeError` if any payload isn't a well-formed receipt (so the
+/// caller leaves `operation` undetermined rather than guessing). Fork-safe:
+/// classification is over the full sets, so a 1→N transfer reads correctly.
+pub fn kcc20_spend_operation(
+    consumed: &[Value],
+    created: &[Value],
+) -> Result<Kcc20Operation, Kcc20DecodeError> {
+    let parse = |payloads: &[Value]| -> Result<Vec<Kcc20ReceiptState>, Kcc20DecodeError> {
+        payloads
+            .iter()
+            .map(Kcc20ReceiptState::from_payload)
+            .collect()
+    };
+    Ok(classify_kcc20_operation(
+        &parse(consumed)?,
+        &parse(created)?,
+    ))
 }
 
 /// Classify a KCC20 spend from the input/output receipt-set delta. Operations
@@ -308,6 +331,51 @@ mod tests {
         let prev = [Kcc20ReceiptState::from_payload(&prev_p).unwrap()];
         let next = [Kcc20ReceiptState::from_payload(&next_p).unwrap()];
         assert_eq!(classify_kcc20_operation(&prev, &next).as_str(), "mint");
+    }
+
+    fn payload(owner: &str, id_type: &str, amount_le: &str, minter: &str) -> serde_json::Value {
+        json!({
+            "owner_identifier": owner,
+            "identifier_type": id_type,
+            "amount": amount_le,
+            "is_minter": minter,
+        })
+    }
+
+    #[test]
+    fn spend_operation_classifies_from_consumed_and_created_payload_sets() {
+        // 1→2 holder transfer: 1000 in -> 600 + 400 out, supply conserved.
+        let consumed = [payload("aa", "00", "e803000000000000", "00")]; // 1000 LE
+        let created = [
+            payload("aa", "00", "5802000000000000", "00"), // 600
+            payload("bb", "00", "9001000000000000", "00"), // 400
+        ];
+        assert_eq!(
+            kcc20_spend_operation(&consumed, &created).unwrap(),
+            Kcc20Operation::Transfer
+        );
+
+        // Mint: minter branch held, a new 500 holder receipt created (1000 -> 1500).
+        let consumed = [payload("ctrl", "02", "e803000000000000", "01")];
+        let created = [
+            payload("ctrl", "02", "e803000000000000", "01"),
+            payload("alice", "00", "f401000000000000", "00"), // 500
+        ];
+        assert_eq!(
+            kcc20_spend_operation(&consumed, &created).unwrap(),
+            Kcc20Operation::Mint
+        );
+    }
+
+    #[test]
+    fn spend_operation_propagates_a_malformed_receipt_payload() {
+        let consumed =
+            [json!({ "owner_identifier": "aa", "identifier_type": "00", "is_minter": "00" })];
+        let created = [payload("aa", "00", "0a", "00")];
+        assert_eq!(
+            kcc20_spend_operation(&consumed, &created),
+            Err(Kcc20DecodeError::MissingField("amount"))
+        );
     }
 
     #[test]
