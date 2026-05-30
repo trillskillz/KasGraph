@@ -1319,13 +1319,30 @@ enum LineageClass {
     /// First sighting of this covenant; carries its fresh deterministic id.
     Genesis(String),
     /// Inherits the predecessor's `covenant_id` (a lineage transition).
-    Transition(String),
+    /// Carries the spent predecessor UTXO (`tx_hash:output_index`) — the
+    /// lineage edge — so a forked transfer's sibling outputs record a shared
+    /// parent rather than a false linear order.
+    Transition {
+        covenant_id: String,
+        parent_utxo: String,
+    },
 }
 
 impl LineageClass {
     fn covenant_id(&self) -> &str {
         match self {
-            LineageClass::Genesis(id) | LineageClass::Transition(id) => id,
+            LineageClass::Genesis(id)
+            | LineageClass::Transition {
+                covenant_id: id, ..
+            } => id,
+        }
+    }
+
+    /// The spent predecessor UTXO for a transition, or `None` for a genesis.
+    fn parent_utxo(&self) -> Option<&str> {
+        match self {
+            LineageClass::Genesis(_) => None,
+            LineageClass::Transition { parent_utxo, .. } => Some(parent_utxo),
         }
     }
 }
@@ -1356,7 +1373,13 @@ async fn classify_lineage(
             .context("looking up predecessor covenant for lineage assignment")?
         {
             if let Some(id) = prev.covenant_id {
-                return Ok(LineageClass::Transition(id));
+                return Ok(LineageClass::Transition {
+                    covenant_id: id,
+                    parent_utxo: format!(
+                        "{}:{}",
+                        input.previous_tx_hash, input.previous_output_index
+                    ),
+                });
             }
         }
     }
@@ -1427,6 +1450,7 @@ async fn persist_lineage(
         seq,
         tx_hash: hit.tx_hash.clone(),
         output_index: hit.output_index as i32,
+        parent_utxo: class.parent_utxo().map(str::to_owned),
         state_bytes,
         daa_score: block_daa_score,
     };
@@ -2287,6 +2311,22 @@ mod tests {
         // A transition appends seq == prior count and increments count.
         assert_eq!(next_lineage_step(Some(1)), (1, 2));
         assert_eq!(next_lineage_step(Some(7)), (7, 8));
+    }
+
+    #[test]
+    fn lineage_class_carries_the_parent_edge_only_for_transitions() {
+        // A genesis has no predecessor; a transition records the spent UTXO so
+        // forked sibling outputs share a parent rather than a false chain order.
+        let genesis = LineageClass::Genesis("cid".into());
+        assert_eq!(genesis.covenant_id(), "cid");
+        assert_eq!(genesis.parent_utxo(), None);
+
+        let transition = LineageClass::Transition {
+            covenant_id: "cid".into(),
+            parent_utxo: "txprev:2".into(),
+        };
+        assert_eq!(transition.covenant_id(), "cid");
+        assert_eq!(transition.parent_utxo(), Some("txprev:2"));
     }
 
     #[test]

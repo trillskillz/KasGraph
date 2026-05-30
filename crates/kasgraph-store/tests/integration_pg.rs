@@ -318,11 +318,45 @@ async fn covenant_lineage_population_and_spend_lifecycle(pool: PgPool) -> sqlx::
             seq: 0,
             tx_hash: "tx0".into(),
             output_index: 0,
+            parent_utxo: None, // genesis has no predecessor
             state_bytes: vec![1, 2, 3],
             daa_score: 100,
         })
         .await
         .unwrap();
+
+    // A transfer FORKS the lineage: spending tx0:0 produces two same-id
+    // outputs (recipient + change). Both rows share the spent parent UTXO, so
+    // the branch structure is recorded rather than flattened into seq order.
+    for (seq, out) in [(1i32, 0i32), (2, 1)] {
+        store
+            .insert_covenant_lineage_row(&CovenantLineageRow {
+                covenant_id: "cid-A".into(),
+                subgraph: sg.clone(),
+                seq,
+                tx_hash: "txfork".into(),
+                output_index: out,
+                parent_utxo: Some("tx0:0".into()),
+                state_bytes: vec![seq as u8],
+                daa_score: 150,
+            })
+            .await
+            .unwrap();
+    }
+    // Both forked children point at the same parent — a branch, not a chain.
+    let forked = store
+        .covenant_lineage_rows_by_parent("cid-A", "tx0:0")
+        .await
+        .unwrap();
+    assert_eq!(forked.len(), 2, "the spend forked into two same-id outputs");
+    assert!(forked
+        .iter()
+        .all(|r| r.parent_utxo.as_deref() == Some("tx0:0")));
+    assert_eq!(
+        forked.iter().map(|r| r.output_index).collect::<Vec<_>>(),
+        vec![0, 1],
+        "children ordered by seq"
+    );
 
     // The (covenant_id, tx_hash, output_index) step is the replay key.
     assert!(store
@@ -411,7 +445,11 @@ async fn covenant_lineage_reorg_unwinds_and_reanchors_heads(pool: PgPool) -> sql
         })
         .await
         .unwrap();
-    for (seq, tx, daa) in [(0i32, "a0", 100i64), (1, "a1", 200), (2, "a2", 300)] {
+    for (seq, tx, daa, parent) in [
+        (0i32, "a0", 100i64, None),
+        (1, "a1", 200, Some("a0:0".to_string())),
+        (2, "a2", 300, Some("a1:0".to_string())),
+    ] {
         store
             .insert_covenant_lineage_row(&CovenantLineageRow {
                 covenant_id: "cid-A".into(),
@@ -419,6 +457,7 @@ async fn covenant_lineage_reorg_unwinds_and_reanchors_heads(pool: PgPool) -> sql
                 seq,
                 tx_hash: tx.into(),
                 output_index: 0,
+                parent_utxo: parent,
                 state_bytes: vec![seq as u8],
                 daa_score: daa,
             })
@@ -445,6 +484,7 @@ async fn covenant_lineage_reorg_unwinds_and_reanchors_heads(pool: PgPool) -> sql
             seq: 0,
             tx_hash: "b0".into(),
             output_index: 0,
+            parent_utxo: None,
             state_bytes: vec![0],
             daa_score: 300,
         })

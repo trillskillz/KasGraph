@@ -228,11 +228,12 @@ describe('PgGatewayResolvers — covenantLineage', () => {
         },
       ],
       [
-        { seq: 0, tx_hash: 'gen', output_index: 0, daa_score: '99', state_bytes: '' },
+        { seq: 0, tx_hash: 'gen', output_index: 0, parent_utxo: null, daa_score: '99', state_bytes: '' },
         {
           seq: 1,
           tx_hash: 'spend',
           output_index: 0,
+          parent_utxo: 'gen:0',
           daa_score: '100',
           state_bytes: Buffer.from([0xCA, 0xFE]),
         },
@@ -244,6 +245,8 @@ describe('PgGatewayResolvers — covenantLineage', () => {
     expect(pool.calls).toHaveLength(2);
     expect(pool.calls[0]?.sql).toMatch(/FROM kasgraph_covenant_lineage_head/);
     expect(pool.calls[1]?.sql).toMatch(/FROM kasgraph_covenant_lineage_row/);
+    // The entries query selects the parent_utxo lineage edge.
+    expect(pool.calls[1]?.sql).toMatch(/parent_utxo/);
     expect(got).not.toBeNull();
     expect(got!.covenantId).toBe('0xabc');
     expect(got!.lineageCount).toBe(2);
@@ -252,6 +255,9 @@ describe('PgGatewayResolvers — covenantLineage', () => {
     expect(got!.entries[1]!.stateBytesHex).toBe('cafe');
     // Empty state bytes omitted entirely (exactOptionalPropertyTypes).
     expect('stateBytesHex' in got!.entries[0]!).toBe(false);
+    // The genesis has no parent; the transition records the spent edge.
+    expect('parentUtxo' in got!.entries[0]!).toBe(false);
+    expect(got!.entries[1]!.parentUtxo).toBe('gen:0');
   });
 });
 

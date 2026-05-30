@@ -10,7 +10,7 @@
 //   kasgraph_covenant_lineage_head (covenant_id, genesis_tx, current_utxo,
 //                                   last_seen_daa, lineage_count)
 //   kasgraph_covenant_lineage_row  (covenant_id, seq, tx_hash, output_index,
-//                                   state_bytes, daa_score)
+//                                   parent_utxo, state_bytes, daa_score)
 //
 // The implementation is constructed against a minimal `PgPoolLike`
 // interface so tests can mock the pool without standing up
@@ -126,6 +126,7 @@ interface LineageEntryRow extends QueryResultRow {
   seq: number;
   tx_hash: string;
   output_index: number;
+  parent_utxo: string | null;
   daa_score: unknown;
   state_bytes: unknown;
 }
@@ -312,6 +313,7 @@ function rowToLineageEntry(row: LineageEntryRow): CovenantLineageEntry {
     txHash: row.tx_hash,
     outputIndex: row.output_index,
     daaScore: bigIntString(row.daa_score),
+    ...(row.parent_utxo != null && { parentUtxo: row.parent_utxo }),
     ...(stateBytesHex.length > 0 && { stateBytesHex }),
   };
 }
@@ -403,7 +405,7 @@ export class PgGatewayResolvers implements GatewayResolvers {
     if (head === undefined) return null;
 
     const rowsResult = await this.pool.query<LineageEntryRow>(
-      `SELECT seq, tx_hash, output_index, daa_score, state_bytes
+      `SELECT seq, tx_hash, output_index, parent_utxo, daa_score, state_bytes
        FROM kasgraph_covenant_lineage_row
        WHERE covenant_id = $1
        ORDER BY seq ASC`,

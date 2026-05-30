@@ -142,6 +142,10 @@ export interface CovenantLineageEntry {
   seq: number;
   txHash: string;
   outputIndex: number;
+  /** The spent predecessor UTXO (`txHash:outputIndex`) this transition came
+   * from, or absent for a genesis. The lineage edge: forked transfer outputs
+   * share a parent, so clients can reconstruct the branch structure. */
+  parentUtxo?: string;
   daaScore: string;
   stateBytesHex?: string;
 }
@@ -281,6 +285,7 @@ export const KASGRAPH_BASE_SCHEMA_SDL = /* GraphQL */ `
     seq: Int!
     txHash: String!
     outputIndex: Int!
+    parentUtxo: String
     daaScore: BigInt!
     stateBytesHex: String
   }

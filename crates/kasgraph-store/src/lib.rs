@@ -96,6 +96,12 @@ pub struct CovenantLineageRow {
     pub seq: i32,
     pub tx_hash: String,
     pub output_index: i32,
+    /// The spent predecessor UTXO this transition came from
+    /// (`tx_hash:output_index`), or `None` for a genesis. This is the
+    /// lineage *edge*: under the per-UTXO model a transfer forks one input
+    /// into ≥2 same-`covenant_id` outputs, and they share this parent, so the
+    /// branch structure is recorded rather than flattened into the `seq` order.
+    pub parent_utxo: Option<String>,
     pub state_bytes: Vec<u8>,
     pub daa_score: i64,
 }
@@ -516,14 +522,15 @@ impl Store {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO kasgraph_covenant_lineage_row \
-             (covenant_id, subgraph, seq, tx_hash, output_index, state_bytes, daa_score) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (covenant_id, subgraph, seq, tx_hash, output_index, parent_utxo, state_bytes, daa_score) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(&row.covenant_id)
         .bind(row.subgraph.schema_name())
         .bind(row.seq)
         .bind(&row.tx_hash)
         .bind(row.output_index)
+        .bind(&row.parent_utxo)
         .bind(&row.state_bytes)
         .bind(row.daa_score)
         .execute(&self.pool)
@@ -531,6 +538,68 @@ impl Store {
         .map_err(|err| StoreError::Query(err.to_string()))?;
 
         Ok(())
+    }
+
+    /// The lineage rows that transitioned *from* `parent_utxo` — i.e. the
+    /// forward edges (successors / children) of one UTXO in a covenant's
+    /// lineage, ordered by `seq`. With the per-UTXO model a transfer forks one
+    /// input into ≥2 same-`covenant_id` outputs, so this can return several
+    /// children; a genesis (`parent_utxo IS NULL`) is never returned here.
+    pub async fn covenant_lineage_rows_by_parent(
+        &self,
+        covenant_id: &str,
+        parent_utxo: &str,
+    ) -> Result<Vec<CovenantLineageRow>, StoreError> {
+        // (covenant_id, subgraph, seq, tx_hash, output_index, parent_utxo,
+        //  state_bytes, daa_score)
+        type LineageRowColumns = (
+            String,
+            String,
+            i32,
+            String,
+            i32,
+            Option<String>,
+            Vec<u8>,
+            i64,
+        );
+        let rows: Vec<LineageRowColumns> = sqlx::query_as(
+            "SELECT covenant_id, subgraph, seq, tx_hash, output_index, parent_utxo, \
+                 state_bytes, daa_score \
+                 FROM kasgraph_covenant_lineage_row \
+                 WHERE covenant_id = $1 AND parent_utxo = $2 \
+                 ORDER BY seq ASC",
+        )
+        .bind(covenant_id)
+        .bind(parent_utxo)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| StoreError::Query(err.to_string()))?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    covenant_id,
+                    subgraph,
+                    seq,
+                    tx_hash,
+                    output_index,
+                    parent_utxo,
+                    state_bytes,
+                    daa_score,
+                )| {
+                    Ok(CovenantLineageRow {
+                        covenant_id,
+                        subgraph: SubgraphId::new(subgraph)?,
+                        seq,
+                        tx_hash,
+                        output_index,
+                        parent_utxo,
+                        state_bytes,
+                        daa_score,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub async fn insert_poi_checkpoint(
@@ -1711,12 +1780,13 @@ mod tests {
     #[test]
     fn migrator_embeds_all_schema_slices_in_order() {
         let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-        assert_eq!(migrations.len(), 6);
+        assert_eq!(migrations.len(), 7);
         assert_eq!(migrations[0].version, 20260526110500);
         assert_eq!(migrations[1].version, 20260526150000);
         assert_eq!(migrations[2].version, 20260526160000);
         assert_eq!(migrations[3].version, 20260528120000);
         assert_eq!(migrations[4].version, 20260529120000);
         assert_eq!(migrations[5].version, 20260529130000);
+        assert_eq!(migrations[6].version, 20260530120000);
     }
 }
