@@ -441,10 +441,11 @@ async fn subgraph_registry_deploy_fetch_redeploy_remove(pool: PgPool) -> sqlx::R
         schema_sdl: "type Bond @entity { id: ID! }".into(),
         manifest_json: json!({ "name": "kasbonds", "specVersion": "0.1.0" }),
         wasm_sha256: Some("abc123".into()),
+        wasm_bytes: Some(b"\0asm-v1".to_vec()),
     };
     store.upsert_subgraph_deployment(&v1).await.unwrap();
 
-    // Round-trips SDL + manifest JSON + wasm hash verbatim.
+    // Round-trips SDL + manifest JSON + wasm hash + wasm bytes verbatim.
     let got = store
         .fetch_subgraph_deployment(&sg)
         .await
@@ -452,11 +453,12 @@ async fn subgraph_registry_deploy_fetch_redeploy_remove(pool: PgPool) -> sqlx::R
         .expect("deployment exists after deploy");
     assert_eq!(got, v1);
 
-    // Redeploy overwrites in place (no duplicate row).
+    // Redeploy overwrites in place (no duplicate row), incl. new wasm bytes.
     let v2 = SubgraphDeployment {
         schema_sdl: "type Bond @entity { id: ID! owner: String! }".into(),
         manifest_json: json!({ "name": "kasbonds", "specVersion": "0.2.0" }),
         wasm_sha256: Some("def456".into()),
+        wasm_bytes: Some(b"\0asm-v2-longer".to_vec()),
         ..v1.clone()
     };
     store.upsert_subgraph_deployment(&v2).await.unwrap();

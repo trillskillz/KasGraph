@@ -430,28 +430,50 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         "KasStream hub initialized; detector hits will be published to in-process subscribers"
     );
 
-    // Optionally load the subgraph's compiled mapping. When
-    // KASGRAPH_SUBGRAPH_DIR points at a built subgraph (containing
-    // build/manifest.json + its wasm), committed detector hits are
-    // dispatched through it and the emitted entity versions persisted.
-    // Unset → the node behaves exactly as before (no mapping dispatch).
-    let mapping = match env::var("KASGRAPH_SUBGRAPH_DIR").ok() {
-        Some(dir) => {
-            let loaded = mapping_host::LoadedMapping::load(subgraph.clone(), &dir)
-                .with_context(|| format!("loading subgraph mapping from {dir}"))?;
+    // Load the subgraph's compiled mapping. Preference order:
+    //   1. The deployed-subgraph registry (`kasgraph deploy` wrote the wasm
+    //      bytes + manifest into `kasgraph_subgraph`): materialize them to a
+    //      working dir and load — no on-disk build needed.
+    //   2. KASGRAPH_SUBGRAPH_DIR pointing at a locally-built subgraph dir.
+    //   3. Neither → no mapping dispatch (node behaves as before).
+    // A loaded mapping dispatches committed detector hits and persists the
+    // emitted entity versions.
+    let work_dir = env::var("KASGRAPH_WORK_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("kasgraph-subgraphs"));
+    let mapping = match load_mapping_from_registry(&store, &subgraph, &work_dir).await? {
+        Some(loaded) => {
             info!(
                 subgraph = subgraph.schema_name(),
-                dir,
+                source = "registry",
                 wasm = %loaded.descriptor.wasm,
                 data_sources = loaded.descriptor.data_sources.len(),
-                "loaded subgraph mapping; committed hits will be dispatched"
+                "loaded deployed subgraph mapping from the registry; committed hits will be dispatched"
             );
             Some(loaded)
         }
-        None => {
-            info!("KASGRAPH_SUBGRAPH_DIR not set; skipping WASM mapping dispatch");
-            None
-        }
+        None => match env::var("KASGRAPH_SUBGRAPH_DIR").ok() {
+            Some(dir) => {
+                let loaded = mapping_host::LoadedMapping::load(subgraph.clone(), &dir)
+                    .with_context(|| format!("loading subgraph mapping from {dir}"))?;
+                info!(
+                    subgraph = subgraph.schema_name(),
+                    source = "dir",
+                    dir,
+                    wasm = %loaded.descriptor.wasm,
+                    data_sources = loaded.descriptor.data_sources.len(),
+                    "loaded subgraph mapping; committed hits will be dispatched"
+                );
+                Some(loaded)
+            }
+            None => {
+                info!(
+                    "no deployed mapping in the registry and KASGRAPH_SUBGRAPH_DIR not set; \
+                     skipping WASM mapping dispatch"
+                );
+                None
+            }
+        },
     };
 
     let mut ingestion = IngestionState::default();
@@ -1345,6 +1367,37 @@ impl LineageClass {
             LineageClass::Transition { parent_utxo, .. } => Some(parent_utxo),
         }
     }
+}
+
+/// Load a subgraph's mapping from the deployed-subgraph registry, if one is
+/// deployed with wasm bytes. Fetches the `kasgraph_subgraph` row, materializes
+/// it (manifest + wasm + schema) to a dir under `base`, and loads it. `None`
+/// when the subgraph isn't deployed or carries no wasm bytes (a metadata-only
+/// registration) — the caller then falls back to `KASGRAPH_SUBGRAPH_DIR`.
+async fn load_mapping_from_registry(
+    store: &Store,
+    subgraph: &SubgraphId,
+    base: &std::path::Path,
+) -> anyhow::Result<Option<mapping_host::LoadedMapping>> {
+    let Some(deployment) = store
+        .fetch_subgraph_deployment(subgraph)
+        .await
+        .context("fetching subgraph deployment from the registry")?
+    else {
+        return Ok(None);
+    };
+    if deployment.wasm_bytes.is_none() {
+        return Ok(None);
+    }
+    let dir = mapping_host::materialize_subgraph_dir(&deployment, base)
+        .context("materializing the deployed subgraph to disk")?;
+    let loaded = mapping_host::LoadedMapping::load(subgraph.clone(), &dir).with_context(|| {
+        format!(
+            "loading the registry-materialized mapping for {}",
+            subgraph.schema_name()
+        )
+    })?;
+    Ok(Some(loaded))
 }
 
 /// Assign a covenant id to a detector hit via KIP-20 lineage rules.

@@ -116,7 +116,21 @@ pub struct SubgraphDeployment {
     pub schema_sdl: String,
     pub manifest_json: serde_json::Value,
     pub wasm_sha256: Option<String>,
+    /// The compiled mapping wasm bytes, if the deploy carried them. The node
+    /// materializes these to a build dir to `LoadedMapping::load` the mapping
+    /// without a separate file transfer.
+    pub wasm_bytes: Option<Vec<u8>>,
 }
+
+/// Column tuple for a `kasgraph_subgraph` row, in select order:
+/// (subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes).
+type SubgraphDeploymentRow = (
+    String,
+    String,
+    serde_json::Value,
+    Option<String>,
+    Option<Vec<u8>>,
+);
 
 /// Audit record for which RPC endpoint served a block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +472,7 @@ impl Store {
             .bind(&deployment.schema_sdl)
             .bind(&deployment.manifest_json)
             .bind(&deployment.wasm_sha256)
+            .bind(&deployment.wasm_bytes)
             .execute(&self.pool)
             .await
             .map_err(|err| StoreError::Query(err.to_string()))?;
@@ -471,46 +486,52 @@ impl Store {
         &self,
         subgraph: &SubgraphId,
     ) -> Result<Option<SubgraphDeployment>, StoreError> {
-        let row: Option<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(
-            "SELECT subgraph, schema_sdl, manifest_json, wasm_sha256 \
-             FROM kasgraph_subgraph WHERE subgraph = $1 AND status <> 'removed'",
+        let row: Option<SubgraphDeploymentRow> = sqlx::query_as(
+            "SELECT subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes \
+                 FROM kasgraph_subgraph WHERE subgraph = $1 AND status <> 'removed'",
         )
         .bind(subgraph.schema_name())
         .fetch_optional(&self.pool)
         .await
         .map_err(|err| StoreError::Query(err.to_string()))?;
 
-        row.map(|(subgraph, schema_sdl, manifest_json, wasm_sha256)| {
-            Ok(SubgraphDeployment {
-                subgraph: SubgraphId::new(subgraph)?,
-                schema_sdl,
-                manifest_json,
-                wasm_sha256,
-            })
-        })
+        row.map(
+            |(subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes)| {
+                Ok(SubgraphDeployment {
+                    subgraph: SubgraphId::new(subgraph)?,
+                    schema_sdl,
+                    manifest_json,
+                    wasm_sha256,
+                    wasm_bytes,
+                })
+            },
+        )
         .transpose()
     }
 
     /// All active (non-removed) deployed subgraphs, ordered by id — the source
-    /// list a gateway iterates to know which subgraphs it can serve.
+    /// list the node iterates at startup to load each deployed mapping.
     pub async fn list_subgraph_deployments(&self) -> Result<Vec<SubgraphDeployment>, StoreError> {
-        let rows: Vec<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(
-            "SELECT subgraph, schema_sdl, manifest_json, wasm_sha256 \
-             FROM kasgraph_subgraph WHERE status <> 'removed' ORDER BY subgraph ASC",
+        let rows: Vec<SubgraphDeploymentRow> = sqlx::query_as(
+            "SELECT subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes \
+                 FROM kasgraph_subgraph WHERE status <> 'removed' ORDER BY subgraph ASC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|err| StoreError::Query(err.to_string()))?;
 
         rows.into_iter()
-            .map(|(subgraph, schema_sdl, manifest_json, wasm_sha256)| {
-                Ok(SubgraphDeployment {
-                    subgraph: SubgraphId::new(subgraph)?,
-                    schema_sdl,
-                    manifest_json,
-                    wasm_sha256,
-                })
-            })
+            .map(
+                |(subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes)| {
+                    Ok(SubgraphDeployment {
+                        subgraph: SubgraphId::new(subgraph)?,
+                        schema_sdl,
+                        manifest_json,
+                        wasm_sha256,
+                        wasm_bytes,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -1534,12 +1555,13 @@ impl Store {
 /// wasm, refreshes `deployed_at`, and resets `status` to `'active'`.
 fn upsert_subgraph_deployment_sql() -> &'static str {
     "INSERT INTO kasgraph_subgraph \
-     (subgraph, schema_sdl, manifest_json, wasm_sha256) \
-     VALUES ($1, $2, $3, $4) \
+     (subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes) \
+     VALUES ($1, $2, $3, $4, $5) \
      ON CONFLICT (subgraph) DO UPDATE SET \
          schema_sdl = EXCLUDED.schema_sdl, \
          manifest_json = EXCLUDED.manifest_json, \
          wasm_sha256 = EXCLUDED.wasm_sha256, \
+         wasm_bytes = EXCLUDED.wasm_bytes, \
          status = 'active', \
          deployed_at = NOW()"
 }
@@ -1728,8 +1750,9 @@ mod tests {
     fn upsert_subgraph_deployment_sql_lists_columns_and_is_idempotent_on_subgraph() {
         let sql = upsert_subgraph_deployment_sql();
         assert!(sql.contains("INSERT INTO kasgraph_subgraph"));
-        assert!(sql.contains("(subgraph, schema_sdl, manifest_json, wasm_sha256)"));
+        assert!(sql.contains("(subgraph, schema_sdl, manifest_json, wasm_sha256, wasm_bytes)"));
         assert!(sql.contains("ON CONFLICT (subgraph) DO UPDATE SET"));
+        assert!(sql.contains("wasm_bytes = EXCLUDED.wasm_bytes"));
         // A redeploy refreshes content + reactivates a previously removed one.
         assert!(sql.contains("schema_sdl = EXCLUDED.schema_sdl"));
         assert!(sql.contains("status = 'active'"));

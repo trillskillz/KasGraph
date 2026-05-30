@@ -18,7 +18,7 @@ use kasgraph_mapping::{
     DispatchOutcome, EntitySnapshot, MappingError, MappingEvent, MappingRuntime,
 };
 use kasgraph_poi::{canonical_block_bytes, CanonicalEntity};
-use kasgraph_store::{EntityVersionRecord, SubgraphId};
+use kasgraph_store::{EntityVersionRecord, SubgraphDeployment, SubgraphId};
 use serde::Serialize;
 use tracing::warn;
 
@@ -184,6 +184,39 @@ pub struct LoadedMapping {
     pub subgraph: SubgraphId,
     pub descriptor: BuildDescriptor,
     pub runtime: MappingRuntime,
+}
+
+/// Write a registry deployment out to a loadable build dir under `base`:
+/// `<base>/<id>/build/manifest.json` (the stored descriptor) + the wasm it
+/// names (from `wasm_bytes`) + `<base>/<id>/schema.graphql`. Returns the
+/// subgraph dir, ready for [`LoadedMapping::load`]. This is the node side of
+/// `kasgraph deploy`: the wasm bytes that travelled with the deploy + persisted
+/// in `kasgraph_subgraph` become an on-disk mapping the runtime can load — no
+/// separate file transfer.
+pub fn materialize_subgraph_dir(
+    deployment: &SubgraphDeployment,
+    base: impl AsRef<Path>,
+) -> anyhow::Result<PathBuf> {
+    let wasm_name = deployment
+        .manifest_json
+        .get("wasm")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("deployed manifest has no `wasm` field"))?;
+    let wasm_bytes = deployment
+        .wasm_bytes
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("deployment carries no wasm bytes to materialize"))?;
+
+    let dir = base.as_ref().join(deployment.subgraph.schema_name());
+    let build = dir.join("build");
+    std::fs::create_dir_all(&build)?;
+    std::fs::write(
+        build.join("manifest.json"),
+        serde_json::to_vec_pretty(&deployment.manifest_json)?,
+    )?;
+    std::fs::write(build.join(wasm_name), wasm_bytes)?;
+    std::fs::write(dir.join("schema.graphql"), &deployment.schema_sdl)?;
+    Ok(dir)
 }
 
 impl LoadedMapping {
@@ -719,6 +752,62 @@ mod integration_pg_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn materializes_and_loads_a_mapping_deployed_to_the_registry(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg = SubgraphId::new("itest_registry_load").unwrap();
+
+        // Deploy a mapping into the registry: the manifest names the wasm, the
+        // bytes are the WAT (wasmtime parses WAT, so no asc needed).
+        store
+            .upsert_subgraph_deployment(&SubgraphDeployment {
+                subgraph: sg.clone(),
+                schema_sdl: "type Bond @entity { id: ID! }".into(),
+                manifest_json: serde_json::json!({
+                    "name": "itest", "wasm": "mapping.wasm", "dataSources": [
+                        { "name": "d", "kind": "covenant_id", "patterns": ["OpenSilverOwnable"],
+                          "collection": null, "addresses": [],
+                          "handlers": [{ "event": "CovenantLocked", "handler": "handleLock" }] }
+                    ]
+                }),
+                wasm_sha256: None,
+                wasm_bytes: Some(GATED_WAT.as_bytes().to_vec()),
+            })
+            .await
+            .unwrap();
+
+        // Node side: fetch the deployment, materialize it, and load the mapping
+        // — the registry row alone is enough to run the subgraph.
+        let dep = store
+            .fetch_subgraph_deployment(&sg)
+            .await
+            .unwrap()
+            .expect("deployment exists");
+        let base = std::env::temp_dir().join(format!(
+            "kasgraph_matz_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = materialize_subgraph_dir(&dep, &base).unwrap();
+        let lm = LoadedMapping::load(sg.clone(), &dir).unwrap();
+        assert_eq!(lm.descriptor.wasm, "mapping.wasm");
+        assert_eq!(lm.descriptor.data_sources.len(), 1);
+
+        // The materialized mapping actually dispatches (store_get hit → emit).
+        let mut snapshot = EntitySnapshot::new();
+        snapshot.insert(("Bond".into(), "b1".into()), json!({ "n": 1 }));
+        let recs = lm.dispatch_committed_hits(100, "blk", &[hit()], &snapshot);
+        assert_eq!(recs.len(), 1, "the registry-loaded mapping dispatches");
+
+        std::fs::remove_dir_all(&base).ok();
         Ok(())
     }
 }
