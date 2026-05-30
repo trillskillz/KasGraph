@@ -12,6 +12,7 @@
     "@kasgraph/sdk": "0.1.0",
     "assemblyscript": "^0.28.17",
     "graphql": "^16.10.0",
+    "pg": "^8.13.0",
     "yaml": "^2.6.0"
   },
   "scripts": {

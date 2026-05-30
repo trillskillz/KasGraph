@@ -14,12 +14,14 @@
 // This module exports a typed dispatch surface and the
 // `runCommand` entry that tests + the bin both use. Per-command
 // bodies live in sibling files (`init.ts`, `codegen.ts`,
-// `build.ts`, `mcp-config.ts`, …). The hosted-node commands
-// (deploy/status/logs/remove) still print a "not yet implemented"
-// notice pending Phase 5 infrastructure.
+// `build.ts`, `deploy.ts`, `mcp-config.ts`, …). `deploy`/`status`/
+// `remove` write/read the store's `kasgraph_subgraph` registry (the
+// row the gateway/MCP read to serve a subgraph's typed schema); only
+// `logs` remains stubbed pending the hosted-node log stream (Phase 5).
 
 import { runBuild } from './build.js';
 import { runCodegen } from './codegen.js';
+import { runDeploy, runRemove, runStatus } from './deploy.js';
 import { runInit } from './init.js';
 import { runMcpConfig } from './mcp-config.js';
 
@@ -27,6 +29,18 @@ import { runMcpConfig } from './mcp-config.js';
 // without spelunking subpaths.
 export { runBuild, type BuildResult } from './build.js';
 export { runCodegen, type CodegenResult } from './codegen.js';
+export {
+  assembleDeployBundle,
+  PgSubgraphRegistry,
+  resolveDatabaseUrl,
+  runDeploy,
+  runRemove,
+  runStatus,
+  subgraphIdFromName,
+  type DeployBundle,
+  type DeployedStatus,
+  type SubgraphRegistryClient,
+} from './deploy.js';
 export { runInit } from './init.js';
 export {
   buildMcpConfig,
@@ -111,11 +125,14 @@ export async function runCommand(argv: string[], io: CliIo): Promise<number> {
     case 'build':
       return runBuild(rest, io);
     case 'deploy':
+      return runDeploy(rest, io);
     case 'status':
-    case 'logs':
+      return runStatus(rest, io);
     case 'remove':
+      return runRemove(rest, io);
+    case 'logs':
       io.stderr.write(
-        `kasgraph: \`${command}\` is not implemented yet (Phase 4 WASM pipeline pending)\n`,
+        'kasgraph: `logs` is not implemented yet (needs the hosted-node log stream — Phase 5)\n',
       );
       return 64; // EX_USAGE-ish — recognized but not actionable.
     case 'help':

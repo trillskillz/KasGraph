@@ -75,17 +75,14 @@ describe('runCommand dispatch', () => {
     expect(io.stdoutBuf).toBe(HELP_TEXT);
   });
 
-  it('returns 64 for recognised-but-not-implemented commands', async () => {
-    // `codegen` and `build` were originally in this list but now live
-    // — see tests/cli-codegen.test.ts and tests/cli-build.test.ts. The
-    // remaining set waits on Phase 5 hosted-node infrastructure.
+  it('returns 64 for the still-stubbed `logs` command', async () => {
+    // `codegen`/`build` (tests/cli-codegen|build.test.ts) and now
+    // `deploy`/`status`/`remove` (tests/cli-deploy.test.ts) are live;
+    // only `logs` waits on the Phase 5 hosted-node log stream.
     const io = new CapturedIo(await newScratch());
-    for (const cmd of ['deploy', 'status', 'logs', 'remove']) {
-      io.stderrBuf = '';
-      const code = await runCommand([cmd], io);
-      expect(code).toBe(64);
-      expect(io.stderrBuf).toContain('not implemented yet');
-    }
+    const code = await runCommand(['logs'], io);
+    expect(code).toBe(64);
+    expect(io.stderrBuf).toContain('not implemented yet');
   });
 });
 
