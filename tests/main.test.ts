@@ -4,6 +4,7 @@ import {
   createKasGraphHttpHandler,
   createKasGraphServer,
   healthzResponse,
+  nodeDeployHandler,
   readOptionsFromEnv,
   type HealthCheck,
   type PgPoolLike,
@@ -171,6 +172,45 @@ describe('createKasGraphHttpHandler routing', () => {
       const res = await fetch(`${srv.base}/graphql`);
       expect(res.status).toBe(200);
       expect(await res.text()).toBe('yoga-was-called');
+      expect(yoga.calls).toBe(1);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('routes /subgraphs* to the deploy handler (POST a bundle) — not Yoga', async () => {
+    const yoga = newRecordingYoga();
+    // A pool that succeeds on the deploy upsert.
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: 'ok' }),
+      nodeDeployHandler(new StubPool()),
+    );
+    const srv = await listen(handler);
+    try {
+      const res = await fetch(`${srv.base}/subgraphs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          subgraphId: 'kasbonds',
+          schemaSdl: 'type Bond @entity { id: ID! }',
+          manifestJson: { name: 'kasbonds' },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ subgraphId: 'kasbonds', status: 'active' });
+      expect(yoga.calls).toBe(0); // deploy route did not fall through to Yoga
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('falls through to Yoga when no deploy handler is wired', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(yoga.handler, newCheck({ status: 200, body: 'ok' }));
+    const srv = await listen(handler);
+    try {
+      await fetch(`${srv.base}/subgraphs`);
       expect(yoga.calls).toBe(1);
     } finally {
       await srv.close();

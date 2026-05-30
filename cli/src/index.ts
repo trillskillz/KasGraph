@@ -31,14 +31,17 @@ export { runBuild, type BuildResult } from './build.js';
 export { runCodegen, type CodegenResult } from './codegen.js';
 export {
   assembleDeployBundle,
+  HttpDeployTransport,
   PgSubgraphRegistry,
   resolveDatabaseUrl,
+  resolveNodeUrl,
   runDeploy,
   runRemove,
   runStatus,
   subgraphIdFromName,
   type DeployBundle,
   type DeployedStatus,
+  type FetchLike,
   type SubgraphRegistryClient,
 } from './deploy.js';
 export { runInit } from './init.js';

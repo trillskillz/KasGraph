@@ -208,13 +208,91 @@ export function resolveDatabaseUrl(args: string[]): string | undefined {
   return process.env.DATABASE_URL;
 }
 
-/** Default factory: a Postgres-backed client from `--database-url`/`DATABASE_URL`.
- * Lazily imports `pg` so a missing driver is a clear error, not a load crash. */
+/** Resolve a hosted-node base URL from `--node <url>` or `KASGRAPH_NODE_URL`. */
+export function resolveNodeUrl(args: string[]): string | undefined {
+  const i = args.indexOf('--node');
+  if (i >= 0 && typeof args[i + 1] === 'string') return args[i + 1];
+  return process.env.KASGRAPH_NODE_URL;
+}
+
+/** The `fetch` surface the HTTP transport needs (injectable for tests). */
+export type FetchLike = (
+  url: string,
+  init?: { method?: string; headers?: Record<string, string>; body?: string },
+) => Promise<{ status: number; json(): Promise<unknown> }>;
+
+/** Registry client that talks to a hosted node's deploy endpoint over HTTP —
+ * the `kasgraph deploy --node <url>` path. Mirrors the routes in
+ * `@kasgraph/api`'s `handleDeployRequest`. */
+export class HttpDeployTransport implements SubgraphRegistryClient {
+  constructor(
+    private readonly baseUrl: string,
+    private readonly fetchImpl: FetchLike = globalThis.fetch as unknown as FetchLike,
+  ) {}
+
+  private url(suffix = ''): string {
+    return `${this.baseUrl.replace(/\/+$/, '')}/subgraphs${suffix}`;
+  }
+
+  async upsertDeployment(bundle: DeployBundle): Promise<void> {
+    const res = await this.fetchImpl(this.url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(bundle),
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`node responded ${res.status}: ${await bodyMessage(res)}`);
+    }
+  }
+
+  async setRemoved(subgraphId: string): Promise<boolean> {
+    const res = await this.fetchImpl(this.url(`/${subgraphId}`), { method: 'DELETE' });
+    if (res.status === 404) return false;
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`node responded ${res.status}: ${await bodyMessage(res)}`);
+    }
+    return true;
+  }
+
+  async fetchStatus(subgraphId: string): Promise<DeployedStatus | null> {
+    const res = await this.fetchImpl(this.url(`/${subgraphId}`), { method: 'GET' });
+    if (res.status === 404) return null;
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`node responded ${res.status}: ${await bodyMessage(res)}`);
+    }
+    const body = (await res.json()) as { subgraphId?: string; wasmSha256?: string };
+    return {
+      subgraphId: body.subgraphId ?? subgraphId,
+      status: 'active',
+      deployedAt: '',
+      wasmSha256: body.wasmSha256 ?? null,
+    };
+  }
+}
+
+async function bodyMessage(res: { json(): Promise<unknown> }): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    return typeof body.error === 'string' ? body.error : 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
+}
+
+/** Default factory. Prefers a hosted node (`--node <url>`/`KASGRAPH_NODE_URL`,
+ * HTTP transport); else a direct Postgres write (`--database-url`/`DATABASE_URL`,
+ * lazy `pg`). Errors if neither is configured. */
 const defaultClientFactory: RegistryClientFactory = (args, io) => {
+  const nodeUrl = resolveNodeUrl(args);
+  if (nodeUrl !== undefined && nodeUrl.length > 0) {
+    return new HttpDeployTransport(nodeUrl);
+  }
+
   const url = resolveDatabaseUrl(args);
   if (url === undefined || url.length === 0) {
     io.stderr.write(
-      'kasgraph: no database URL — pass `--database-url <url>` or set DATABASE_URL\n',
+      'kasgraph: no target — pass `--node <url>` (hosted) or `--database-url <url>` (direct), ' +
+        'or set KASGRAPH_NODE_URL / DATABASE_URL\n',
     );
     return null;
   }

@@ -18,6 +18,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { Client, Pool } from 'pg';
 
 import { createKasGraphServer, type KasGraphServer } from './server.js';
+import { handleDeployRequest } from './deploy-endpoint.js';
 import type { PgPoolLike } from './pg-resolvers.js';
 import { PgListenSource, type PgListenClient } from './pg-listen.js';
 
@@ -82,18 +83,62 @@ export type NodeHttpHandler = (req: IncomingMessage, res: ServerResponse) => voi
 export type HealthCheck = () => Promise<HealthzResponse>;
 
 /**
+ * A Node-http handler for the hosted-node deploy endpoint (`/subgraphs*`):
+ * reads the JSON body (if any), delegates to the pure `handleDeployRequest`,
+ * and writes the JSON response. This is the server side of
+ * `kasgraph deploy --node <url>`.
+ */
+export function nodeDeployHandler(pool: PgPoolLike): NodeHttpHandler {
+  return (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      let body: unknown;
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (raw.length > 0) {
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON body' }));
+          return;
+        }
+      }
+      const pathname = (req.url ?? '/').split('?')[0] ?? '/';
+      handleDeployRequest({ method: req.method ?? 'GET', path: pathname, body }, pool)
+        .then(({ status, body: out }) => {
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(out));
+        })
+        .catch((err: unknown) => {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: String(err) }));
+        });
+    });
+  };
+}
+
+/**
  * Build a Node-http handler that routes `GET /healthz` to the
- * supplied `healthCheck` and forwards everything else to the
- * Yoga handler. Yoga itself is a Fetch-API function, so we use
- * its built-in Node adapter (`yoga.handle`) when present, or
- * fall back to its `.requestListener` shape.
+ * supplied `healthCheck`, `/subgraphs*` to the optional deploy
+ * handler (the hosted-node deploy endpoint), and forwards
+ * everything else to the Yoga handler. Yoga itself is a Fetch-API
+ * function callable directly as a Node request listener.
  */
 export function createKasGraphHttpHandler(
   yoga: KasGraphServer,
   healthCheck: HealthCheck,
+  deployHandler?: NodeHttpHandler,
 ): NodeHttpHandler {
   return (req, res) => {
     const url = req.url ?? '/';
+    if (
+      deployHandler !== undefined &&
+      (url === '/subgraphs' || url.startsWith('/subgraphs/') || url.startsWith('/subgraphs?'))
+    ) {
+      deployHandler(req, res);
+      return;
+    }
     if (url === '/healthz' || url.startsWith('/healthz?')) {
       // Always allow GET + HEAD on healthz; anything else is
       // 405 so operators don't accidentally POST to the wrong
@@ -228,7 +273,11 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
     graphiql: options.graphiql,
     ...(subscriptionSource !== undefined && { subscriptionSource }),
   });
-  const handler = createKasGraphHttpHandler(yoga, () => healthzResponse(pool));
+  const handler = createKasGraphHttpHandler(
+    yoga,
+    () => healthzResponse(pool),
+    nodeDeployHandler(pool),
+  );
   const server = http.createServer(handler);
 
   await new Promise<void>((resolve, reject) => {

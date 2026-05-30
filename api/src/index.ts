@@ -53,6 +53,18 @@ export {
   type QueryResultRow,
 } from './pg-resolvers.js';
 
+// Hosted-node deploy endpoint (server side of `kasgraph deploy --node <url>`).
+export {
+  createDeployFetchHandler,
+  deploySubgraph,
+  handleDeployRequest,
+  parseDeployBundle,
+  removeSubgraph,
+  type DeployRequest,
+  type DeployResponse,
+  type DeploySubgraphInput,
+} from './deploy-endpoint.js';
+
 // Per-subgraph schema generation from a subgraph's `schema.graphql`.
 export {
   buildSubgraphSchema,
@@ -88,6 +100,7 @@ export {
 // Operator entry: routing + healthz + env-driven bootstrap.
 export {
   createKasGraphHttpHandler,
+  nodeDeployHandler,
   healthzResponse,
   readOptionsFromEnv,
   runKasGraphServer,

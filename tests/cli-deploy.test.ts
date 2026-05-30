@@ -5,14 +5,17 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assembleDeployBundle,
+  HttpDeployTransport,
   PgSubgraphRegistry,
   resolveDatabaseUrl,
+  resolveNodeUrl,
   runDeploy,
   runRemove,
   runStatus,
   subgraphIdFromName,
   type CliIo,
   type DeployBundle,
+  type FetchLike,
   type SubgraphRegistryClient,
 } from '../cli/src/index.js';
 
@@ -254,5 +257,90 @@ describe('runStatus / runRemove', () => {
 describe('resolveDatabaseUrl', () => {
   it('prefers --database-url over the environment', () => {
     expect(resolveDatabaseUrl(['--database-url', 'postgres://flag'])).toBe('postgres://flag');
+  });
+});
+
+describe('resolveNodeUrl', () => {
+  it('reads --node', () => {
+    expect(resolveNodeUrl(['--node', 'http://node:8080'])).toBe('http://node:8080');
+    expect(resolveNodeUrl([])).toBe(process.env.KASGRAPH_NODE_URL);
+  });
+});
+
+describe('HttpDeployTransport', () => {
+  function mockFetch(
+    impl: (url: string, init?: { method?: string; body?: string }) => { status: number; body?: unknown },
+  ): { fetch: FetchLike; calls: Array<{ url: string; method?: string; body?: string }> } {
+    const calls: Array<{ url: string; method?: string; body?: string }> = [];
+    const fetch: FetchLike = async (url, init) => {
+      calls.push({ url, method: init?.method, body: init?.body });
+      const { status, body } = impl(url, init);
+      return { status, json: async () => body };
+    };
+    return { fetch, calls };
+  }
+
+  const bundle: DeployBundle = {
+    subgraphId: 'kasbonds',
+    schemaSdl: 'type Bond @entity { id: ID! }',
+    manifestJson: { name: 'kasbonds' },
+    wasmSha256: 'deadbeef',
+  };
+
+  it('upsertDeployment POSTs the bundle to /subgraphs', async () => {
+    const { fetch, calls } = mockFetch(() => ({ status: 200, body: { subgraphId: 'kasbonds' } }));
+    await new HttpDeployTransport('http://node:8080/', fetch).upsertDeployment(bundle);
+    expect(calls[0]!.url).toBe('http://node:8080/subgraphs');
+    expect(calls[0]!.method).toBe('POST');
+    expect(JSON.parse(calls[0]!.body!)).toEqual(bundle);
+  });
+
+  it('upsertDeployment throws with the node error message on non-2xx', async () => {
+    const { fetch } = mockFetch(() => ({ status: 400, body: { error: 'bad bundle' } }));
+    await expect(
+      new HttpDeployTransport('http://node', fetch).upsertDeployment(bundle),
+    ).rejects.toThrow(/400.*bad bundle/);
+  });
+
+  it('setRemoved DELETEs and maps 200→true, 404→false', async () => {
+    const ok = mockFetch(() => ({ status: 200, body: { removed: true } }));
+    expect(await new HttpDeployTransport('http://node', ok.fetch).setRemoved('kasbonds')).toBe(true);
+    expect(ok.calls[0]!.url).toBe('http://node/subgraphs/kasbonds');
+    expect(ok.calls[0]!.method).toBe('DELETE');
+
+    const gone = mockFetch(() => ({ status: 404, body: { error: 'not deployed' } }));
+    expect(await new HttpDeployTransport('http://node', gone.fetch).setRemoved('ghost')).toBe(false);
+  });
+
+  it('fetchStatus GETs and maps 200→status, 404→null', async () => {
+    const ok = mockFetch(() => ({ status: 200, body: { subgraphId: 'kasbonds', wasmSha256: 'h' } }));
+    const got = await new HttpDeployTransport('http://node', ok.fetch).fetchStatus('kasbonds');
+    expect(got).toMatchObject({ subgraphId: 'kasbonds', wasmSha256: 'h' });
+
+    const gone = mockFetch(() => ({ status: 404, body: {} }));
+    expect(await new HttpDeployTransport('http://node', gone.fetch).fetchStatus('ghost')).toBeNull();
+  });
+});
+
+describe('runDeploy transport selection', () => {
+  it('uses the HTTP node transport when --node is given (default factory)', async () => {
+    // Capture the POST the default factory's HttpDeployTransport makes by
+    // stubbing global fetch.
+    const root = await scratch();
+    await writeBuiltSubgraph(root, { name: 'kasbonds' });
+    const calls: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      calls.push(String(url));
+      return { status: 200, json: async () => ({ subgraphId: 'kasbonds' }) };
+    }) as unknown as typeof globalThis.fetch;
+    try {
+      const { io: cio } = io(root);
+      const code = await runDeploy(['--node', 'http://node:8080'], cio);
+      expect(code).toBe(0);
+      expect(calls[0]).toBe('http://node:8080/subgraphs');
+    } finally {
+      globalThis.fetch = orig;
+    }
   });
 });
