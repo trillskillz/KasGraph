@@ -41,6 +41,14 @@ export {
   type QueryResultRow,
 } from './pg-resolvers.js';
 
+// Per-subgraph schema generation from a subgraph's `schema.graphql`.
+export {
+  buildSubgraphSchema,
+  buildSubgraphSchemaSdl,
+  subgraphEntities,
+  type SubgraphEntity,
+} from './subgraph-schema.js';
+
 // HTTP transport (graphql-yoga).
 export {
   createKasGraphServer,

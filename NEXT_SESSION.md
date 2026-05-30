@@ -2,7 +2,15 @@
 
 Autonomous work picked up by the next agent run. Phases 1–4 and 6 are substantially landed (113 cargo + 172 TS green; the example-build suite was added this arc and the example dirs regenerate `src/generated/` so the headline count moves with codegen). The **Phase 2.6 WASM mapping runtime is real** — `kasgraph-mapping` runs subgraph mappings deterministically on wasmtime (fuel-metered, NaN-canonicalized, fresh `Store` per block), with a concrete host/guest ABI that now includes **entity reads** (`kasgraph.store_get`). **Spend-semantic payload codegen** types `CovenantSpent` payloads as `{ spend: CovenantSpend; state }`. **`kasgraph build` compiles AssemblyScript mappings to ABI-compliant wasm** via `asc`, and **all six `examples/` mappings are now ported to AssemblyScript** against the new `@kasgraph/as-mapping` SDK and compile end-to-end (`tests/examples-build.test.ts`). The next track that unblocks real deployment: load each subgraph's built wasm in `kasgraph-node` and dispatch detector events through it (seed `store_get` from committed entity state, persist emitted `EntityOp`s); then `deploy`/`status`/`logs`/`remove` + Phase 5 hosted infra. Other autonomous tracks (need network/Postgres to verify): live-node wRPC recovery validation, real-Postgres `sqlx::test` coverage, real OpenSilver compiled-byte sync.
 
-## Latest commit arc (2026-05-29 — GraphQL covenantSpends query)
+## Latest commit arc (2026-05-29 — typed per-subgraph schema generation (core))
+
+The pure core of the headline "each subgraph gets its own typed GraphQL API" feature.
+
+- **`@kasgraph/api/subgraph-schema.ts`**: `subgraphEntities(sdl)` (finds the `@entity` object types) + `buildSubgraphSchemaSdl(sdl)` (declares the `@entity`/`@derivedFrom` directives + `BigInt`/`JSON` scalars, keeps the entity types verbatim, and auto-generates a `Query` with `<entity>(id: ID!): T` and `<entity>s(first: Int = 100): [T!]!` per entity) + `buildSubgraphSchema(sdl)` (→ a validated `GraphQLSchema`). 5 tests (entity discovery skips non-`@entity` types; generated SDL has the right query fields + scalars; no-entity SDL throws; the built schema's Query exposes exactly the entity fields; a scalar query validates). vitest 197.
+- **Why it's the core, not the whole feature:** entity payloads are the field map, so default field resolution serves scalar fields directly once the query resolver returns `entity_versions` payloads — but that resolver wiring, per-subgraph schema caching in `execute_query` (currently single base schema), and **storing each subgraph's `schema.graphql` at deploy time** (so the gateway knows a subgraph's types) are the remaining steps. Relation/`@derivedFrom` cross-entity resolution is also deferred (relation fields are kept in the schema but only resolve if the payload carries them).
+- **Next:** wire `buildSubgraphSchema` + entity resolvers into a per-subgraph `execute_query` path (needs SDL storage — couples to the deploy pipeline / Phase 5). Other open tracks: capture xtask, `persist_lineage` fork model, `deploy/status/logs/remove` CLI + Phase 5.
+
+## Previous commit arc (2026-05-29 — GraphQL covenantSpends query)
 
 Exposes the spend records the now-live `CovenantSpent` dispatch persists, mirroring the entity resolver.
 
