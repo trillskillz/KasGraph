@@ -22,7 +22,7 @@ You are building **KasGraph** -- the data layer for the post-Toccata Kaspa ecosy
 **Strategic positioning:**
 - Infrastructure, not a product
 - MIT licensed, public from first commit
-- Free hosted service during incubation (kasgraph.io). Sustainability model documented but not executed in v1.
+- Free hosted service during incubation (kasgraph.com). Sustainability model documented but not executed in v1.
 - Compounds with KasBonds (first dogfooding customer) and OpenSilver (patterns auto-detected)
 - AI-native from day one. MCP is a first-class interface, not bolted on later.
 - The Graph subgraph manifest format compatible where reasonable -- ease migration from other chains.
@@ -64,7 +64,7 @@ You are building **KasGraph** -- the data layer for the post-Toccata Kaspa ecosy
 - Raw SQL via `(db as any).$client.execute()` for any Next.js dashboard work
 - No em dashes anywhere
 - MIT license, public from first commit
-- Hosted at kasgraph.io free during incubation
+- Hosted at kasgraph.com free during incubation
 - Every API route exports `export const dynamic = 'force-dynamic'`
 - BigInt converted with `Number(val)` before serialization
 
@@ -129,7 +129,7 @@ You are building **KasGraph** -- the data layer for the post-Toccata Kaspa ecosy
 1. **KasGraph Node** -- Rust binary handling all ingestion, mapping, and persistence
 2. **KasGraph Interface Layer** -- GraphQL + MCP + KasStream + WebSocket, all backed by the same data
 3. **KasGraph CLI + SDK** -- TypeScript developer tools
-4. **KasGraph Hosted Service** -- kasgraph.io, free during incubation
+4. **KasGraph Hosted Service** -- kasgraph.com, free during incubation
 
 ---
 
@@ -348,7 +348,7 @@ This is the AI-native interface. Match or beat The Graph's Subgraph MCP.
 - query_natural_language(prompt)       // optional: pre-built NL→GraphQL helper
 ```
 
-Host at `mcp.kasgraph.io`. Publish Claude Desktop, Cursor, Claude Code config snippets. Document how OpenClaw agents integrate.
+Host at `mcp.kasgraph.com`. Publish Claude Desktop, Cursor, Claude Code config snippets. Document how OpenClaw agents integrate.
 
 This makes every subgraph on KasGraph instantly queryable by Claude, Cursor, agents -- without writing GraphQL.
 
@@ -407,7 +407,7 @@ kasgraph mcp-config               # generate MCP config for Claude/Cursor/OpenCl
 - Resource limits per subgraph (CPU, memory, query rate)
 
 **Task 5.2 — Developer portal**
-- Web dashboard at kasgraph.io
+- Web dashboard at kasgraph.com
 - Sign in with KAS wallet
 - Deploy subgraphs through web UI
 - View indexing status, query stats, error logs
@@ -426,7 +426,7 @@ kasgraph mcp-config               # generate MCP config for Claude/Cursor/OpenCl
 - Hosted is free during incubation
 - Document target uptime + latency
 
-**Output of Phase 5:** kasgraph.io live with all four interfaces (GraphQL, MCP, KasStream, WebSocket).
+**Output of Phase 5:** kasgraph.com live with all four interfaces (GraphQL, MCP, KasStream, WebSocket).
 
 ---
 
@@ -452,7 +452,7 @@ Block production, transaction volume, address activity, fees.
 ### Reference 6.6 — ZK Proofs and Witnesses
 All on-chain ZK proofs (per KIP-16), with witness data. Foundation for vProgs queries.
 
-**Output of Phase 6:** Six reference subgraphs deployed at kasgraph.io.
+**Output of Phase 6:** Six reference subgraphs deployed at kasgraph.com.
 
 ---
 

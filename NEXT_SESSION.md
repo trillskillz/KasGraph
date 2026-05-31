@@ -1166,7 +1166,7 @@ The fingerprint engine and per-pattern registry are live. What remains:
 ## User-gated items
 
 - Phase 0 outreach (Kaspa Foundation, Kasplex, kas.fyi, krc721.stream, Michael Sutton, Hans Moog, wallet teams).
-- Hosted-service infrastructure (Phase 5 — cloud provider, Postgres deploy shape, kasgraph.io DNS / TLS).
+- Hosted-service infrastructure (Phase 5 — cloud provider, Postgres deploy shape, kasgraph.com DNS / TLS).
 - Push the repo to a GitHub remote.
 
 ## Cross-references

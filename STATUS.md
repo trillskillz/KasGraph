@@ -73,7 +73,7 @@ NEXT_PHASE: Phase 5 operational surface (logs streaming + auth), then a live tes
 
 - **Phase 0 ecosystem coordination.** User explicitly skipped this for now. Outreach to Kaspa Foundation, Kasplex, kas.fyi, krc721.stream maintainers, Michael Sutton, Hans Moog, wallet teams remains a launch-day prerequisite per PLAN.md, but does not block implementation.
 - **Hosted infrastructure decisions** (Phase 5): cloud provider, k8s vs systemd, Postgres deploy shape.
-- **kasgraph.io domain registration** and TLS infra.
+- **kasgraph.com domain registration** and TLS infra.
 - **GitHub remote setup** — repo not yet pushed.
 
 ## What can be done autonomously next
