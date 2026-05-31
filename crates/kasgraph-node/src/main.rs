@@ -430,81 +430,25 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
         "KasStream hub initialized; detector hits will be published to in-process subscribers"
     );
 
-    // Load the subgraph's compiled mapping. Preference order:
-    //   1. The deployed-subgraph registry (`kasgraph deploy` wrote the wasm
-    //      bytes + manifest into `kasgraph_subgraph`): materialize them to a
-    //      working dir and load — no on-disk build needed.
-    //   2. KASGRAPH_SUBGRAPH_DIR pointing at a locally-built subgraph dir.
-    //   3. Neither → no mapping dispatch (node behaves as before).
-    // A loaded mapping dispatches committed detector hits and persists the
-    // emitted entity versions.
+    // Assemble the set of subgraphs to index. The deployed-subgraph registry
+    // (`kasgraph deploy`) is the source of truth: every active deployment with
+    // wasm bytes is materialized to `KASGRAPH_WORK_DIR` and loaded, and the
+    // node fans each chain notification out to all of them. With no registry
+    // deployments, it falls back to the single configured `KASGRAPH_SUBGRAPH`
+    // (mapping from the registry or `KASGRAPH_SUBGRAPH_DIR`). Each runtime
+    // re-anchors its POI chain from its own surviving checkpoint.
     let work_dir = env::var("KASGRAPH_WORK_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("kasgraph-subgraphs"));
-    let mapping = match load_mapping_from_registry(&store, &subgraph, &work_dir).await? {
-        Some(loaded) => {
-            info!(
-                subgraph = subgraph.schema_name(),
-                source = "registry",
-                wasm = %loaded.descriptor.wasm,
-                data_sources = loaded.descriptor.data_sources.len(),
-                "loaded deployed subgraph mapping from the registry; committed hits will be dispatched"
-            );
-            Some(loaded)
-        }
-        None => match env::var("KASGRAPH_SUBGRAPH_DIR").ok() {
-            Some(dir) => {
-                let loaded = mapping_host::LoadedMapping::load(subgraph.clone(), &dir)
-                    .with_context(|| format!("loading subgraph mapping from {dir}"))?;
-                info!(
-                    subgraph = subgraph.schema_name(),
-                    source = "dir",
-                    dir,
-                    wasm = %loaded.descriptor.wasm,
-                    data_sources = loaded.descriptor.data_sources.len(),
-                    "loaded subgraph mapping; committed hits will be dispatched"
-                );
-                Some(loaded)
-            }
-            None => {
-                info!(
-                    "no deployed mapping in the registry and KASGRAPH_SUBGRAPH_DIR not set; \
-                     skipping WASM mapping dispatch"
-                );
-                None
-            }
-        },
-    };
-
-    let mut ingestion = IngestionState::default();
-
-    if let Some(checkpoint) = store
-        .latest_poi_for_subgraph(&subgraph)
-        .await
-        .context("loading latest POI for subgraph on startup")?
-    {
-        ingestion.reseed_prior_poi(checkpoint.poi_hash);
-        info!(
-            subgraph = subgraph.schema_name(),
-            resumed_from_daa = checkpoint.block_daa_score,
-            prior_poi = poi_hex(&checkpoint.poi_hash),
-            "re-anchored ingestion POI chain from existing checkpoint"
-        );
-    }
+    let mut runtimes = build_subgraph_runtimes(&store, &subgraph, &work_dir).await?;
 
     match config.ingest_mode {
         IngestMode::Bootstrap => {
             let notifications = build_notifications(config, rpc_client.as_ref()).await?;
             for notification in notifications {
-                let _ = apply_and_persist_notification(
-                    &store,
-                    &subgraph,
-                    &mut ingestion,
-                    notification,
-                    Some(&stream_hub),
-                    mapping.as_ref(),
-                )
-                .await?;
+                let _ =
+                    fan_out_notification(&store, &mut runtimes, notification, Some(&stream_hub))
+                        .await?;
             }
             // Persist the provenance of any blocks the bootstrap pass fetched
             // via RPC (recorded in the client's audit log during
@@ -516,25 +460,37 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 }
             }
             info!(
-                committed_blocks = ingestion.committed.len(),
-                probabilistic_blocks = ingestion.probabilistic.len(),
+                subgraphs = runtimes.len(),
+                committed_blocks = runtimes
+                    .first()
+                    .map(|r| r.ingestion.committed.len())
+                    .unwrap_or(0),
+                probabilistic_blocks = runtimes
+                    .first()
+                    .map(|r| r.ingestion.probabilistic.len())
+                    .unwrap_or(0),
                 "ingestion pass complete"
             );
         }
         IngestMode::Continuous => {
             run_continuous_ingestion(
                 &store,
-                &subgraph,
-                &mut ingestion,
+                &mut runtimes,
                 config,
                 rpc_client.as_ref(),
                 Some(&stream_hub),
-                mapping.as_ref(),
             )
             .await?;
             info!(
-                committed_blocks = ingestion.committed.len(),
-                probabilistic_blocks = ingestion.probabilistic.len(),
+                subgraphs = runtimes.len(),
+                committed_blocks = runtimes
+                    .first()
+                    .map(|r| r.ingestion.committed.len())
+                    .unwrap_or(0),
+                probabilistic_blocks = runtimes
+                    .first()
+                    .map(|r| r.ingestion.probabilistic.len())
+                    .unwrap_or(0),
                 "continuous ingestion exited"
             );
         }
@@ -563,12 +519,10 @@ fn validate_continuous_config(config: &NodeConfig) -> Result<()> {
 ///     channel from the sender side.
 async fn run_continuous_ingestion(
     store: &Store,
-    subgraph: &SubgraphId,
-    ingestion: &mut IngestionState,
+    runtimes: &mut [SubgraphRuntime],
     config: &NodeConfig,
     rpc_client: Option<&MultiRpcClient>,
     stream: Option<&StreamHub>,
-    mapping: Option<&mapping_host::LoadedMapping>,
 ) -> Result<()> {
     validate_continuous_config(config)?;
     let continuous = &config.continuous;
@@ -659,15 +613,7 @@ async fn run_continuous_ingestion(
             break;
         };
 
-        let outcome = apply_and_persist_notification(
-            store,
-            subgraph,
-            ingestion,
-            notification,
-            stream,
-            mapping,
-        )
-        .await?;
+        let outcome = fan_out_notification(store, runtimes, notification, stream).await?;
         processed = processed.saturating_add(1);
 
         // Active gap recovery: when the driver-synthesized
@@ -679,8 +625,10 @@ async fn run_continuous_ingestion(
         // explicitly do not loop on a second RecoveryRequired to
         // avoid recovery storms.
         if let Some((from_daa, to_daa)) = outcome.recovery_requested {
+            // The chain view is identical across runtimes, so the first
+            // runtime's anchor is representative for the (shared) recovery fetch.
             let recovery_result = if let Some(anchor_hash) =
-                ingestion.recovery_anchor_hash(from_daa)
+                runtimes[0].ingestion.recovery_anchor_hash(from_daa)
             {
                 info!(
                     from_daa,
@@ -715,15 +663,9 @@ async fn run_continuous_ingestion(
 
             match recovery_result {
                 Ok(recovery_notification) => {
-                    let recovered = apply_and_persist_notification(
-                        store,
-                        subgraph,
-                        ingestion,
-                        recovery_notification,
-                        stream,
-                        mapping,
-                    )
-                    .await?;
+                    let recovered =
+                        fan_out_notification(store, runtimes, recovery_notification, stream)
+                            .await?;
                     info!(
                         from_daa,
                         to_daa,
@@ -751,7 +693,7 @@ async fn run_continuous_ingestion(
         let fetch_audit_rows = persist_drained_rpc_audit(store, &driver_client).await?;
         if fetch_audit_rows > 0 {
             info!(
-                subgraph = subgraph.schema_name(),
+                subgraphs = runtimes.len(),
                 fetch_audit_rows, "persisted RPC fetch-audit records"
             );
         }
@@ -1398,6 +1340,147 @@ async fn load_mapping_from_registry(
         )
     })?;
     Ok(Some(loaded))
+}
+
+/// One indexed subgraph's live state: its id, its block-DAG ingestion view +
+/// POI chain, and its loaded mapping (if any). The node runs a set of these
+/// concurrently over a single shared chain subscription — each observes the
+/// same blocks but maintains its own POI chain and persists into its own
+/// per-subgraph schema.
+struct SubgraphRuntime {
+    subgraph: SubgraphId,
+    ingestion: IngestionState,
+    mapping: Option<mapping_host::LoadedMapping>,
+}
+
+/// Build a `SubgraphRuntime` for `subgraph`, re-anchoring its POI chain from the
+/// highest surviving checkpoint in Postgres (so ingestion resumes, not restarts).
+async fn make_subgraph_runtime(
+    store: &Store,
+    subgraph: SubgraphId,
+    mapping: Option<mapping_host::LoadedMapping>,
+) -> Result<SubgraphRuntime> {
+    let mut ingestion = IngestionState::default();
+    if let Some(checkpoint) = store
+        .latest_poi_for_subgraph(&subgraph)
+        .await
+        .context("loading latest POI for subgraph on startup")?
+    {
+        ingestion.reseed_prior_poi(checkpoint.poi_hash);
+        info!(
+            subgraph = subgraph.schema_name(),
+            resumed_from_daa = checkpoint.block_daa_score,
+            prior_poi = poi_hex(&checkpoint.poi_hash),
+            "re-anchored ingestion POI chain from existing checkpoint"
+        );
+    }
+    Ok(SubgraphRuntime {
+        subgraph,
+        ingestion,
+        mapping,
+    })
+}
+
+/// Assemble the set of subgraphs the node will index. If the registry has
+/// deployments, run them all (each mapping materialized from its `wasm_bytes`);
+/// otherwise fall back to the single configured `subgraph`, loading its mapping
+/// from the registry or `KASGRAPH_SUBGRAPH_DIR`. Always returns ≥1 runtime.
+async fn build_subgraph_runtimes(
+    store: &Store,
+    configured: &SubgraphId,
+    work_dir: &std::path::Path,
+) -> Result<Vec<SubgraphRuntime>> {
+    let deployments = store
+        .list_subgraph_deployments()
+        .await
+        .context("listing deployed subgraphs from the registry")?;
+
+    let mut runtimes = Vec::new();
+
+    if !deployments.is_empty() {
+        for dep in deployments {
+            let sg = dep.subgraph.clone();
+            let mapping = if dep.wasm_bytes.is_some() {
+                let dir =
+                    mapping_host::materialize_subgraph_dir(&dep, work_dir).with_context(|| {
+                        format!("materializing deployed subgraph {}", sg.schema_name())
+                    })?;
+                Some(
+                    mapping_host::LoadedMapping::load(sg.clone(), &dir).with_context(|| {
+                        format!("loading deployed mapping for {}", sg.schema_name())
+                    })?,
+                )
+            } else {
+                None
+            };
+            runtimes.push(make_subgraph_runtime(store, sg, mapping).await?);
+        }
+        info!(
+            subgraphs = runtimes.len(),
+            source = "registry",
+            "indexing the deployed subgraph set from the registry"
+        );
+        return Ok(runtimes);
+    }
+
+    // No registry deployments → legacy/dev single-subgraph path.
+    let mapping = match load_mapping_from_registry(store, configured, work_dir).await? {
+        Some(loaded) => Some(loaded),
+        None => match env::var("KASGRAPH_SUBGRAPH_DIR").ok() {
+            Some(dir) => {
+                let loaded = mapping_host::LoadedMapping::load(configured.clone(), &dir)
+                    .with_context(|| format!("loading subgraph mapping from {dir}"))?;
+                info!(
+                    subgraph = configured.schema_name(),
+                    source = "dir",
+                    dir,
+                    wasm = %loaded.descriptor.wasm,
+                    "loaded subgraph mapping; committed hits will be dispatched"
+                );
+                Some(loaded)
+            }
+            None => {
+                info!(
+                    "no deployed mapping in the registry and KASGRAPH_SUBGRAPH_DIR not set; \
+                     skipping WASM mapping dispatch"
+                );
+                None
+            }
+        },
+    };
+    runtimes.push(make_subgraph_runtime(store, configured.clone(), mapping).await?);
+    Ok(runtimes)
+}
+
+/// Apply one chain notification to every subgraph runtime. The block-DAG
+/// transition is identical across runtimes (they observe the same chain), so
+/// the first runtime's [`NotificationOutcome`] is returned as representative for
+/// the loop's recovery decision; each runtime independently persists into its
+/// own schema + advances its own POI chain. Errors propagate (a persistence
+/// failure for any subgraph stops the loop).
+async fn fan_out_notification(
+    store: &Store,
+    runtimes: &mut [SubgraphRuntime],
+    notification: ChainNotification,
+    stream: Option<&StreamHub>,
+) -> Result<NotificationOutcome> {
+    let mut representative: Option<NotificationOutcome> = None;
+    for rt in runtimes.iter_mut() {
+        let outcome = apply_and_persist_notification(
+            store,
+            &rt.subgraph,
+            &mut rt.ingestion,
+            notification.clone(),
+            stream,
+            rt.mapping.as_ref(),
+        )
+        .await?;
+        if representative.is_none() {
+            representative = Some(outcome);
+        }
+    }
+    representative
+        .ok_or_else(|| anyhow::anyhow!("fan_out_notification: no subgraph runtimes configured"))
 }
 
 /// Assign a covenant id to a detector hit via KIP-20 lineage rules.
@@ -3003,6 +3086,88 @@ mod integration_pg_persist {
             kasgraph_poi::verify_poi_chain(&checkpoints).unwrap(),
             kasgraph_poi::PoiVerification::Valid { .. }
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn fan_out_dispatches_a_block_to_every_subgraph_runtime(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg_a = SubgraphId::new("itest_fanout_a").unwrap();
+        let sg_b = SubgraphId::new("itest_fanout_b").unwrap();
+        store.ensure_subgraph_schema(&sg_a).await.unwrap();
+        store.ensure_subgraph_schema(&sg_b).await.unwrap();
+
+        // Two runtimes load the same emitting mapping; one shared notification
+        // must dispatch + persist into BOTH per-subgraph schemas independently.
+        let dir = write_fixture();
+        let mut runtimes = vec![
+            SubgraphRuntime {
+                subgraph: sg_a.clone(),
+                ingestion: IngestionState::default(),
+                mapping: Some(mapping_host::LoadedMapping::load(sg_a.clone(), &dir).unwrap()),
+            },
+            SubgraphRuntime {
+                subgraph: sg_b.clone(),
+                ingestion: IngestionState::default(),
+                mapping: Some(mapping_host::LoadedMapping::load(sg_b.clone(), &dir).unwrap()),
+            },
+        ];
+
+        let owner_entry = registry::all()
+            .iter()
+            .find(|e| e.kind == DetectorKind::OpenSilverOwnable)
+            .expect("OpenSilverOwnable registered");
+        let kasgraph_detectors::PatternMatcher::Exact(fp) = &owner_entry.matcher else {
+            panic!("OpenSilverOwnable is an exact fingerprint");
+        };
+        let ingested = IngestedBlock {
+            hash: "blk-1".into(),
+            daa_score: 100,
+            blue_score: 100,
+            is_finalized: true,
+            served_by: "primary".into(),
+            outputs: vec![IngestedTransactionOutput {
+                tx_hash: "tx-a".into(),
+                output_index: 0,
+                script_public_key: fp.bytes.clone(),
+                value: 1,
+            }],
+            inputs: Vec::new(),
+            payloads: Vec::new(),
+        };
+
+        let outcome = fan_out_notification(
+            &store,
+            &mut runtimes,
+            ChainNotification::BlockAdded(ingested),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.committed_count, 1,
+            "representative outcome from runtime 0"
+        );
+
+        // Each subgraph independently dispatched the mapping + advanced its own
+        // POI chain, into its own schema.
+        for sg in [&sg_a, &sg_b] {
+            assert_eq!(
+                store.latest_entity(sg, "Bond", "b1").await.unwrap(),
+                Some(serde_json::json!({ "n": 7 })),
+                "subgraph {} must have persisted the dispatched entity",
+                sg.schema_name()
+            );
+            assert!(
+                store.latest_poi_for_subgraph(sg).await.unwrap().is_some(),
+                "subgraph {} must have a POI checkpoint",
+                sg.schema_name()
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
