@@ -18,7 +18,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { Client, Pool } from 'pg';
 
 import { createKasGraphServer, type KasGraphServer } from './server.js';
-import { handleDeployRequest } from './deploy-endpoint.js';
+import { handleDeployRequest, type DeployAuthOptions } from './deploy-endpoint.js';
 import type { PgPoolLike } from './pg-resolvers.js';
 import { PgListenSource, type PgListenClient } from './pg-listen.js';
 
@@ -88,8 +88,20 @@ export type HealthCheck = () => Promise<HealthzResponse>;
  * and writes the JSON response. This is the server side of
  * `kasgraph deploy --node <url>`.
  */
-export function nodeDeployHandler(pool: PgPoolLike): NodeHttpHandler {
+export function nodeDeployHandler(pool: PgPoolLike, auth: DeployAuthOptions = {}): NodeHttpHandler {
   return (req, res) => {
+    const authorization = req.headers.authorization;
+    if (
+      auth.bearerToken !== undefined &&
+      auth.bearerToken.length > 0 &&
+      (req.method === 'POST' || req.method === 'DELETE') &&
+      authorization !== `Bearer ${auth.bearerToken}`
+    ) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
@@ -105,7 +117,16 @@ export function nodeDeployHandler(pool: PgPoolLike): NodeHttpHandler {
         }
       }
       const pathname = (req.url ?? '/').split('?')[0] ?? '/';
-      handleDeployRequest({ method: req.method ?? 'GET', path: pathname, body }, pool)
+      handleDeployRequest(
+        {
+          method: req.method ?? 'GET',
+          path: pathname,
+          body,
+          ...(authorization !== undefined && { authorization }),
+        },
+        pool,
+        auth,
+      )
         .then(({ status, body: out }) => {
           res.writeHead(status, { 'content-type': 'application/json' });
           res.end(JSON.stringify(out));
@@ -197,6 +218,8 @@ export interface RunServerOptions {
    * (or a different role with NOTIFY privileges) override this.
    */
   listenDatabaseUrl: string;
+  /** Bearer token required for hosted deploy/remove writes. */
+  deployToken?: string;
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {
@@ -220,6 +243,7 @@ export function readOptionsFromEnv(): RunServerOptions {
     );
   }
   const listenDatabaseUrl = process.env.LISTEN_DATABASE_URL ?? databaseUrl;
+  const deployToken = process.env.KASGRAPH_DEPLOY_TOKEN;
   return {
     databaseUrl,
     host: process.env.HOST ?? '0.0.0.0',
@@ -228,6 +252,7 @@ export function readOptionsFromEnv(): RunServerOptions {
     graphiql: envBoolean('GRAPHIQL', true),
     subscriptionsEnabled: envBoolean('KASGRAPH_SUBSCRIPTIONS_ENABLED', true),
     listenDatabaseUrl,
+    ...(deployToken !== undefined && deployToken.length > 0 && { deployToken }),
   };
 }
 
@@ -276,7 +301,10 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
   const handler = createKasGraphHttpHandler(
     yoga,
     () => healthzResponse(pool),
-    nodeDeployHandler(pool),
+    nodeDeployHandler(
+      pool,
+      options.deployToken !== undefined ? { bearerToken: options.deployToken } : {},
+    ),
   );
   const server = http.createServer(handler);
 
@@ -297,6 +325,7 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
     graphqlEndpoint: options.graphqlEndpoint,
     graphiql: options.graphiql,
     subscriptionsEnabled: options.subscriptionsEnabled,
+    deployAuthEnabled: options.deployToken !== undefined,
   });
 
   return {

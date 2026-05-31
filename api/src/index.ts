@@ -62,6 +62,7 @@ export {
   removeSubgraph,
   type DeployRequest,
   type DeployResponse,
+  type DeployAuthOptions,
   type DeploySubgraphInput,
 } from './deploy-endpoint.js';
 
@@ -524,6 +525,9 @@ export async function executeGraphQLQuery(
     poiCheckpoints: (args: PoiCheckpointsArgs) => resolvers.poiCheckpoints(args),
     detectedPatterns: (args: DetectedPatternsArgs) => resolvers.detectedPatterns(args),
     covenantLineage: (args: CovenantLineageArgs) => resolvers.covenantLineage(args),
+    entity: (args: EntityArgs) => resolvers.entity(args),
+    entities: (args: EntitiesArgs) => resolvers.entities(args),
+    covenantSpends: (args: CovenantSpendsArgs) => resolvers.covenantSpends(args),
   };
 
   const executeOptions: Parameters<typeof execute>[0] = {

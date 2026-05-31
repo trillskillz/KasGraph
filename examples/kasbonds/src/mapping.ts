@@ -23,12 +23,12 @@ import {
 
 // Fires the first time a covenant matching `OpenSilverVault` or
 // `OpenSilverEscrowMilestone` enters the chain. Creates the Bond entity plus
-// the initial Holding row. The bond is keyed on the block hash of its first
-// appearance (the lock-time state payload carries no covenant id of its own).
+// the initial Holding row. The bond is keyed by the stable KIP-20 covenant id
+// so later spends in different blocks can load the same Bond.
 export function handleBondIssued(ptr: i32, len: i32): void {
   const ev = decodeEvent(ptr, len);
   const p = ev.payload;
-  const id = ev.blockHash;
+  const id = bondIdFromLockedPayload(p, ev.blockHash);
   const issuer = objStr(p, "owner_pubkey");
 
   const bond = new JSON.Obj();
@@ -58,7 +58,7 @@ export function handleBondTransition(ptr: i32, len: i32): void {
   const p = ev.payload;
   const spend = p != null ? p.getObj("spend") : null;
 
-  const bondId = ev.blockHash;
+  const bondId = bondIdFromSpend(spend, ev.blockHash);
   const bond = store.get("Bond", bondId);
   if (bond == null) return; // not one of ours
 
@@ -79,4 +79,21 @@ export function handleBondTransition(ptr: i32, len: i32): void {
     redeemed.set<bool>("redeemed", true);
     store.set("Bond", bondId, redeemed);
   }
+}
+
+function bondIdFromLockedPayload(payload: JSON.Obj | null, blockHash: string): string {
+  const covenantId = objStr(payload, "covenantId");
+  if (covenantId.length > 0) return covenantId;
+  // Fallback for legacy fixtures emitted before KasGraph copied covenantId
+  // into lock payloads. Real lineage mappings must not rely on block hashes:
+  // each transition can occur in a different block.
+  return blockHash;
+}
+
+function bondIdFromSpend(spend: JSON.Obj | null, blockHash: string): string {
+  const covenantId = objStr(spend, "covenantId");
+  if (covenantId.length > 0) return covenantId;
+  // Same legacy fallback as lock events; only used when older event payloads
+  // omit covenantId, in which case cross-block lineage lookup is impossible.
+  return blockHash;
 }

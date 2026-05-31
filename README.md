@@ -49,7 +49,7 @@ All four interfaces ship together. MCP is a first-class surface, not a future ad
 
 ## Status
 
-The indexer is **feature-complete**: `build -> deploy -> index -> query` is multi-tenant, hot-reloadable, and verified end-to-end against a real Postgres. The remaining work is operational (log streaming + auth for the hosted service). See [`STATUS.md`](STATUS.md) for the live per-phase block.
+The indexer is **feature-complete core infrastructure**: `build -> deploy -> index -> query` is multi-tenant, hot-reloadable, and verified end-to-end against a real Postgres. Hosted deploy writes now support bearer-token auth; remaining pre-public work is operational validation: live testnet indexing, published benchmarks, hosted deployment status, and log streaming. See [`STATUS.md`](STATUS.md) for the live per-phase block.
 
 ## Quick start
 
@@ -137,8 +137,9 @@ The indexer node is configured by environment variable. The most common:
 | `KASGRAPH_WORK_DIR` | Where deployed mappings are materialized from the registry |
 | `KASGRAPH_SUBGRAPH` | Single-subgraph fallback id when the registry is empty (dev) |
 | `KASGRAPH_SUBGRAPH_DIR` | Single-subgraph fallback: load a locally-built dir instead of the registry (dev) |
+| `KASGRAPH_DEPLOY_TOKEN` | Bearer token required for hosted `POST /subgraphs` and `DELETE /subgraphs/:id`; leave unset only for local/dev |
 
-The gateway / CLI deploy target accepts `--database-url` (direct) or `--node <url>` / `KASGRAPH_NODE_URL` (hosted HTTP endpoint). The continuous driver exposes additional `KASGRAPH_CONTINUOUS_*` backoff/channel knobs; see `crates/kasgraph-node` for the full set.
+The gateway / CLI deploy target accepts `--database-url` (direct) or `--node <url>` / `KASGRAPH_NODE_URL` (hosted HTTP endpoint). Public hosted nodes must set `KASGRAPH_DEPLOY_TOKEN`; clients send `Authorization: Bearer <token>` for deploy/remove writes. The continuous driver exposes additional `KASGRAPH_CONTINUOUS_*` backoff/channel knobs; see `crates/kasgraph-node` for the full set.
 
 ## Repo map
 

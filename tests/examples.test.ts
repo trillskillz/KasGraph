@@ -126,6 +126,8 @@ describe('examples — kasgraph codegen', () => {
         // Handlers in the manifest → event interfaces in generated/events.ts.
         expect(events).toContain('export interface CovenantLockedEvent');
         expect(events).toContain('export interface CovenantSpentEvent');
+        expect(events).toContain('covenantId?: string;');
+        expect(events).toContain('covenantId: string;');
       }
       if (name === 'opensilver-patterns') {
         expect(entities).toContain('export interface PatternInstance');

@@ -12,6 +12,11 @@
 //   POST   /subgraphs        body = deploy bundle           -> 200 { subgraphId } | 400
 //   GET    /subgraphs/:id                                   -> 200 { … } | 404
 //   DELETE /subgraphs/:id                                   -> 200 { removed: true } | 404
+//
+// Auth:
+//   Configure `KASGRAPH_DEPLOY_TOKEN` on public nodes. When set, POST and
+//   DELETE require `Authorization: Bearer <token>`. GET stays public so
+//   clients can inspect deployment status.
 
 import { createHash } from 'node:crypto';
 
@@ -121,6 +126,8 @@ export interface DeployRequest {
   path: string;
   /** Parsed JSON body (POST), or `undefined`. */
   body?: unknown;
+  /** Raw Authorization header, if the transport supplied one. */
+  authorization?: string;
 }
 
 export interface DeployResponse {
@@ -128,17 +135,27 @@ export interface DeployResponse {
   body: unknown;
 }
 
+export interface DeployAuthOptions {
+  /** Bearer token required for POST/DELETE. Empty/undefined disables auth. */
+  bearerToken?: string;
+}
+
 /** Pure deploy-endpoint handler. No socket, no framework — maps a parsed
  * request to a status + JSON body against the registry. */
 export async function handleDeployRequest(
   req: DeployRequest,
   pool: PgPoolLike,
+  auth: DeployAuthOptions = {},
 ): Promise<DeployResponse> {
   const segments = req.path.replace(/^\/+|\/+$/g, '').split('/');
   if (segments[0] !== 'subgraphs') {
     return { status: 404, body: { error: 'not found' } };
   }
   const id = segments[1];
+
+  if (requiresAuth(req.method) && !isAuthorized(req.authorization, auth.bearerToken)) {
+    return { status: 401, body: { error: 'unauthorized' } };
+  }
 
   if (req.method === 'POST' && id === undefined) {
     const { input, error } = parseDeployBundle(req.body);
@@ -178,8 +195,14 @@ export async function handleDeployRequest(
  * `/subgraphs*` to (e.g. before delegating other paths to the Yoga handler). */
 export function createDeployFetchHandler(
   pool: PgPoolLike,
+  auth: DeployAuthOptions = {},
 ): (request: Request) => Promise<Response> {
   return async (request: Request): Promise<Response> => {
+    const authorization = request.headers.get('authorization') ?? undefined;
+    if (requiresAuth(request.method) && !isAuthorized(authorization, auth.bearerToken)) {
+      return jsonResponse(401, { error: 'unauthorized' });
+    }
+
     let body: unknown;
     if (request.method === 'POST') {
       try {
@@ -189,9 +212,27 @@ export function createDeployFetchHandler(
       }
     }
     const { pathname } = new URL(request.url);
-    const res = await handleDeployRequest({ method: request.method, path: pathname, body }, pool);
+    const res = await handleDeployRequest(
+      {
+        method: request.method,
+        path: pathname,
+        body,
+        ...(authorization !== undefined && { authorization }),
+      },
+      pool,
+      auth,
+    );
     return jsonResponse(res.status, res.body);
   };
+}
+
+function requiresAuth(method: string): boolean {
+  return method === 'POST' || method === 'DELETE';
+}
+
+function isAuthorized(authorization: string | undefined, token: string | undefined): boolean {
+  if (token === undefined || token.length === 0) return true;
+  return authorization === `Bearer ${token}`;
 }
 
 function jsonResponse(status: number, body: unknown): Response {

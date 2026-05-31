@@ -399,7 +399,7 @@ kasgraph mcp-config               # generate MCP config for Claude/Cursor/OpenCl
 
 ---
 
-## PHASE 5 — HOSTED SERVICE (KASGRAPH.IO)
+## PHASE 5 — HOSTED SERVICE (KASGRAPH.COM)
 
 **Task 5.1 — Multi-tenant infrastructure**
 - KasGraph Node + GraphQL + MCP + KasStream deployed to production

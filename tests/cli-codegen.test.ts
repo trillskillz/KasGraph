@@ -240,6 +240,7 @@ dataSources:
     // One State interface per referenced pattern, hex fields as strings.
     expect(out).toContain('export interface OpenSilverVaultState');
     expect(out).toContain('detectorKind: "OpenSilverVault";');
+    expect(out).toContain('covenantId?: string;');
     expect(out).toContain('  owner_pubkey: string;');
     expect(out).toContain('export interface OpenSilverMultisigState');
     expect(out).toContain('  threshold: string;');
@@ -285,6 +286,7 @@ dataSources:
     // A covenant_id spend still carries the protocol-level spend
     // envelope, with `state: unknown` because the pattern is unregistered.
     expect(out).toContain('export interface CovenantSpend');
+    expect(out).toContain('covenantId: string;');
     expect(out).toContain('payload: { spend: CovenantSpend; state: unknown };');
     // The utxo firehose carries no covenant semantics → plain `unknown`.
     expect(out).toContain('payload: unknown;');
@@ -315,6 +317,7 @@ dataSources:
     const out = await readFile(path.join(root, 'src/generated/events.ts'), 'utf8');
     // Shared envelope emitted once with the protocol-level fields.
     expect(out).toContain('export interface CovenantSpend');
+    expect(out).toContain('covenantId: string;');
     expect(out).toContain('operation: string;');
     expect(out).toContain('spentValueSompi: string;');
     expect(out).toContain('successorCovenantId: string | null;');

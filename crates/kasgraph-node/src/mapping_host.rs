@@ -25,7 +25,9 @@ use tracing::warn;
 use crate::subgraph_manifest::{BuildDescriptor, ManifestError, EVENT_COVENANT_LOCKED};
 
 /// Build the mapping event for a lock-time detector hit. The detector's
-/// extracted fields become the event payload; the handler must match an
+/// extracted fields become the event payload, with `covenantId` copied from
+/// the top-level detector hit when available so mappings can key entities by a
+/// stable lineage id instead of block-local context. The handler must match an
 /// exported function on the subgraph's compiled wasm.
 pub fn locked_mapping_event(
     hit: &DetectedPattern,
@@ -33,10 +35,24 @@ pub fn locked_mapping_event(
     block_hash: &str,
     handler: impl Into<String>,
 ) -> MappingEvent {
+    let mut payload = hit.payload.clone();
+    if let Some(covenant_id) = &hit.covenant_id {
+        match &mut payload {
+            serde_json::Value::Object(obj) => {
+                obj.insert(
+                    "covenantId".to_string(),
+                    serde_json::Value::String(covenant_id.clone()),
+                );
+            }
+            _ => {
+                payload = serde_json::json!({ "covenantId": covenant_id });
+            }
+        }
+    }
     MappingEvent {
         block_daa_score,
         block_hash: block_hash.to_string(),
-        payload: hit.payload.clone(),
+        payload,
         handler: handler.into(),
     }
 }
@@ -113,6 +129,9 @@ pub fn dispatch_locked_hit(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CovenantSpend {
+    /// The stable covenant/lineage id being spent. This is the entity key a
+    /// lineage-scoped mapping should use across blocks.
+    pub covenant_id: String,
     /// The covenant operation the spend performed (protocol-defined).
     pub operation: String,
     /// Value moved by the spend, in sompi, as a decimal string (matches
@@ -333,7 +352,10 @@ mod tests {
         assert_eq!(ev.block_daa_score, 99);
         assert_eq!(ev.block_hash, "block-h");
         assert_eq!(ev.handler, "handleLock");
-        assert_eq!(ev.payload, serde_json::json!({ "owner": "abcd" }));
+        assert_eq!(
+            ev.payload,
+            serde_json::json!({ "owner": "abcd", "covenantId": "cov-1" })
+        );
     }
 
     #[test]
@@ -501,6 +523,7 @@ mod tests {
 
     fn spend() -> CovenantSpend {
         CovenantSpend {
+            covenant_id: "cov-1".into(),
             operation: "transfer".into(),
             spent_value_sompi: "100000000".into(),
             successor_covenant_id: Some("cov-2".into()),
@@ -525,6 +548,7 @@ mod tests {
             ev.payload,
             serde_json::json!({
                 "spend": {
+                    "covenantId": "cov-1",
                     "operation": "transfer",
                     "spentValueSompi": "100000000",
                     "successorCovenantId": "cov-2"
@@ -537,6 +561,7 @@ mod tests {
     #[test]
     fn spend_mapping_event_emits_null_successor_when_lineage_terminates() {
         let terminal = CovenantSpend {
+            covenant_id: "cov-1".into(),
             operation: "burn".into(),
             spent_value_sompi: "0".into(),
             successor_covenant_id: None,

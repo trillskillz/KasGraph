@@ -6,10 +6,15 @@ import {
   type CommittedBlock,
   type CommittedBlockArgs,
   type CommittedBlocksArgs,
+  type CovenantSpend,
+  type CovenantSpendsArgs,
   type CovenantLineage,
   type CovenantLineageArgs,
   type DetectedPattern,
   type DetectedPatternsArgs,
+  type Entity,
+  type EntityArgs,
+  type EntitiesArgs,
   type GatewayResolvers,
   type PoiCheckpoint,
   type PoiCheckpointsArgs,
@@ -94,6 +99,34 @@ class InMemoryResolvers implements GatewayResolvers {
     },
   };
 
+  private readonly entityStore: Entity[] = [
+    {
+      entityType: 'Bond',
+      entityId: 'bond-1',
+      data: { covenantId: '0xabc', redeemed: false },
+      blockDaaScore: '100',
+    },
+    {
+      entityType: 'Bond',
+      entityId: 'bond-2',
+      data: { covenantId: '0xdef', redeemed: true },
+      blockDaaScore: '101',
+    },
+  ];
+
+  private readonly spendStore: CovenantSpend[] = [
+    {
+      spendingTxHash: 'spend-1',
+      previousTxHash: 'prev-1',
+      previousOutputIndex: 0,
+      blockDaaScore: '102',
+      detectorKind: 'OpenSilverVault',
+      covenantId: '0xabc',
+      spentValueSompi: '1000',
+      successorCovenantId: '0xabc',
+    },
+  ];
+
   async committedBlock(args: CommittedBlockArgs): Promise<CommittedBlock | null> {
     this.calls.push({ field: 'committedBlock', args });
     return (
@@ -129,6 +162,29 @@ class InMemoryResolvers implements GatewayResolvers {
     this.calls.push({ field: 'covenantLineage', args });
     return this.lineageStore[args.covenantId] ?? null;
   }
+
+  async entity(args: EntityArgs): Promise<Entity | null> {
+    this.calls.push({ field: 'entity', args });
+    return (
+      this.entityStore.find(
+        (e) => e.entityType === args.entityType && e.entityId === args.id,
+      ) ?? null
+    );
+  }
+
+  async entities(args: EntitiesArgs): Promise<Entity[]> {
+    this.calls.push({ field: 'entities', args });
+    const matched = this.entityStore.filter((e) => e.entityType === args.entityType);
+    return matched.slice(0, args.first ?? matched.length);
+  }
+
+  async covenantSpends(args: CovenantSpendsArgs): Promise<CovenantSpend[]> {
+    this.calls.push({ field: 'covenantSpends', args });
+    const matched = this.spendStore.filter(
+      (s) => args.covenantId === undefined || s.covenantId === args.covenantId,
+    );
+    return matched.slice(0, args.first ?? matched.length);
+  }
 }
 
 describe('@kasgraph/api — schema surface', () => {
@@ -158,6 +214,9 @@ describe('@kasgraph/api — schema surface', () => {
         'poiCheckpoints',
         'detectedPatterns',
         'covenantLineage',
+        'entity',
+        'entities',
+        'covenantSpends',
       ]),
     );
   });
@@ -330,6 +389,66 @@ describe('@kasgraph/api — executeGraphQLQuery', () => {
     expect(
       (res.data as { covenantLineage: unknown }).covenantLineage,
     ).toBeNull();
+  });
+
+  it('entity resolves through the advertised base schema field', async () => {
+    const resolvers = new InMemoryResolvers();
+    const res = await executeGraphQLQuery(
+      {
+        query: `{ entity(subgraph: "kasbonds", entityType: "Bond", id: "bond-1") {
+          entityType entityId blockDaaScore data
+        } }`,
+      },
+      resolvers,
+    );
+    expect(res.errors).toBeUndefined();
+    expect((res.data as { entity: { entityId: string; data: unknown } }).entity).toMatchObject({
+      entityId: 'bond-1',
+      data: { covenantId: '0xabc', redeemed: false },
+    });
+    expect(resolvers.calls.at(-1)).toMatchObject({
+      field: 'entity',
+      args: { subgraph: 'kasbonds', entityType: 'Bond', id: 'bond-1' },
+    });
+  });
+
+  it('entities resolves through the advertised base schema field', async () => {
+    const resolvers = new InMemoryResolvers();
+    const res = await executeGraphQLQuery(
+      {
+        query: `{ entities(subgraph: "kasbonds", entityType: "Bond", first: 1) {
+          entityId data
+        } }`,
+      },
+      resolvers,
+    );
+    expect(res.errors).toBeUndefined();
+    const entities = (res.data as { entities: Array<{ entityId: string }> }).entities;
+    expect(entities).toEqual([{ entityId: 'bond-1', data: { covenantId: '0xabc', redeemed: false } }]);
+  });
+
+  it('covenantSpends resolves through the advertised base schema field', async () => {
+    const resolvers = new InMemoryResolvers();
+    const res = await executeGraphQLQuery(
+      {
+        query: `{ covenantSpends(subgraph: "kasbonds", covenantId: "0xabc") {
+          spendingTxHash covenantId spentValueSompi successorCovenantId
+        } }`,
+      },
+      resolvers,
+    );
+    expect(res.errors).toBeUndefined();
+    const spends = (
+      res.data as { covenantSpends: Array<{ spendingTxHash: string; spentValueSompi: string }> }
+    ).covenantSpends;
+    expect(spends).toEqual([
+      {
+        spendingTxHash: 'spend-1',
+        covenantId: '0xabc',
+        spentValueSompi: '1000',
+        successorCovenantId: '0xabc',
+      },
+    ]);
   });
 
   it('BigInt scalar serialises DAA scores as decimal strings', async () => {

@@ -205,6 +205,41 @@ describe('createKasGraphHttpHandler routing', () => {
     }
   });
 
+  it('passes Authorization through the deploy route when bearer auth is configured', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: 'ok' }),
+      nodeDeployHandler(new StubPool(), { bearerToken: 'secret' }),
+    );
+    const srv = await listen(handler);
+    try {
+      const unauthorized = await fetch(`${srv.base}/subgraphs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{not-json',
+      });
+      expect(unauthorized.status).toBe(401);
+
+      const authorized = await fetch(`${srv.base}/subgraphs`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer secret',
+        },
+        body: JSON.stringify({
+          subgraphId: 'kasbonds',
+          schemaSdl: 'type Bond @entity { id: ID! }',
+          manifestJson: { name: 'kasbonds' },
+        }),
+      });
+      expect(authorized.status).toBe(200);
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
   it('falls through to Yoga when no deploy handler is wired', async () => {
     const yoga = newRecordingYoga();
     const handler = createKasGraphHttpHandler(yoga.handler, newCheck({ status: 200, body: 'ok' }));
@@ -230,6 +265,7 @@ describe('readOptionsFromEnv', () => {
     delete process.env.GRAPHIQL;
     delete process.env.KASGRAPH_SUBSCRIPTIONS_ENABLED;
     delete process.env.LISTEN_DATABASE_URL;
+    delete process.env.KASGRAPH_DEPLOY_TOKEN;
   });
 
   afterEach(() => {
@@ -255,6 +291,7 @@ describe('readOptionsFromEnv', () => {
     expect(opts.graphiql).toBe(true);
     expect(opts.subscriptionsEnabled).toBe(true);
     expect(opts.listenDatabaseUrl).toBe('postgres://x');
+    expect(opts.deployToken).toBeUndefined();
   });
 
   it('honors PORT/HOST/GRAPHQL_ENDPOINT/GRAPHIQL overrides', () => {
@@ -302,6 +339,12 @@ describe('readOptionsFromEnv', () => {
     const opts = readOptionsFromEnv();
     expect(opts.databaseUrl).toBe('postgres://primary');
     expect(opts.listenDatabaseUrl).toBe('postgres://replica');
+  });
+
+  it('reads KASGRAPH_DEPLOY_TOKEN for hosted deploy bearer auth', () => {
+    process.env.DATABASE_URL = 'postgres://x';
+    process.env.KASGRAPH_DEPLOY_TOKEN = 'secret';
+    expect(readOptionsFromEnv().deployToken).toBe('secret');
   });
 });
 

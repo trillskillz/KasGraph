@@ -1190,12 +1190,13 @@ async fn apply_and_persist_notification(
                         // and the mapping binds a handler for this covenant kind.
                         // Each consumed covenant UTXO is one spend event; the
                         // operation is the tx-level action it was part of.
-                        if let Some(op) = &operation {
+                        if let (Some(op), Some(covenant_id)) = (&operation, &spent.covenant_id) {
                             if let Some(handler) = mapping
                                 .descriptor
                                 .resolve_handler(&spent.detector_kind, EVENT_COVENANT_SPENT)
                             {
                                 let spend = mapping_host::CovenantSpend {
+                                    covenant_id: covenant_id.clone(),
                                     operation: op.clone(),
                                     spent_value_sompi: spent.value_sompi.to_string(),
                                     successor_covenant_id: successor_covenant_id.clone(),

@@ -1,13 +1,13 @@
 # KasGraph — Status
 
 ```
-PROJECT_STATUS: Indexer FEATURE-COMPLETE — build → deploy → index → query is multi-tenant, hot-reloadable, and verified end-to-end against real Postgres. Remaining work is operational only (logs streaming + auth for the hosted service).
+PROJECT_STATUS: Core indexer FEATURE-COMPLETE — build → deploy → index → query is multi-tenant, hot-reloadable, and verified end-to-end against real Postgres. Hosted deploy/remove writes have bearer-token auth. Remaining public-launch work is operational validation: live testnet indexing soak, published benchmarks, hosted deployment status, and logs streaming.
 PHASE_0_STATUS: SKIPPED (ecosystem outreach deferred to a separate track)
 PHASE_1_STATUS: COMPLETE (reference docs under docs/references/: KIP-20, Kaspa RPC, The Graph compatibility, BlockDAG reorg semantics, KRC20/KRC721 deep dives)
 PHASE_2_STATUS: COMPLETE (2.1 workspace; 2.2 multi-RPC failover client + audit; 2.3 continuous wRPC subscription with capability probe, backoff reconnect, gap-aware + anchor-based recovery, health-probe loop; 2.4 store schema (9 migrations) + KIP-20 covenant-id lineage with fork-edge (parent_utxo) model + reorg-safe unwind; 2.5 detector registry = 17/17 REAL silverc-captured fingerprints (12 OpenSilver core exact + KCC20 asset & 4 controllers anchored) + KRC20/KRC721 inscription parsers & ledgers; 2.6 wasmtime mapping runtime with entity reads (store_get); 2.7 KCC20 operation decoder → live CovenantSpent dispatch; 2.8 POI computed over dispatched entity state + third-party verify)
 PHASE_3_STATUS: SUBSTANTIALLY COMPLETE (GraphQL gateway: committedBlock(s) / poiCheckpoints / detectedPatterns / covenantLineage [+ first-class utxo/parentUtxo/childUtxos DAG] / entity / entities / covenantSpends, PLUS typed per-subgraph schemas generated from each subgraph's schema.graphql with relation + @derivedFrom resolution; MCP delegates execute_query/get_schema to the same gateway and is registry-aware; KasStream in-process hub + GraphQL subscriptions over Postgres LISTEN/NOTIFY)
 PHASE_4_STATUS: COMPLETE (init / codegen / build / deploy / status / remove / mcp-config; only `logs` stubbed pending the hosted log stream)
-PHASE_5_STATUS: IN_PROGRESS (deploy pipeline FEATURE-COMPLETE: kasgraph_subgraph registry, HTTP deploy endpoint + `kasgraph deploy --node <url>`, wasm-bytes data plane, node consumes the registry at startup, multi-subgraph fan-out, dynamic registry reload; REMAINING: logs streaming + auth — both need a hosted-service topology/identity decision)
+PHASE_5_STATUS: IN_PROGRESS (deploy pipeline FEATURE-COMPLETE: kasgraph_subgraph registry, HTTP deploy endpoint + `kasgraph deploy --node <url>`, bearer-token auth for deploy/remove writes via KASGRAPH_DEPLOY_TOKEN, wasm-bytes data plane, node consumes the registry at startup, multi-subgraph fan-out, dynamic registry reload; REMAINING: logs streaming, hosted topology, live testnet soak, benchmarks, kasgraph.com deployment confirmation)
 PHASE_6_STATUS: COMPLETE (six reference subgraphs under examples/: kasbonds, opensilver-patterns, krc20, krc721, network-stats, zk-proofs — each ships subgraph.yaml + schema.graphql + src/mapping.ts (AssemblyScript) + README, exercised by tests/)
 PHASE_7_STATUS: NOT_STARTED (integrations)
 PHASE_8_STATUS: NOT_STARTED (Toccata-window mainnet launch)
@@ -17,8 +17,8 @@ TESTNET_INDEXED_BLOCKS: 0 (pipeline verified against local Postgres + captured l
 SUBGRAPHS_DEPLOYED: 0 live (deploy pipeline complete + e2e-tested: build → deploy → index → query → reload against real Postgres)
 QUERY_LATENCY_P95: N/A (not yet benchmarked under load)
 MCP_TOOLS_LIVE: 5 of 8 (list_subgraphs, get_schema, execute_query, search_by_pattern, get_covenant_lineage; get_address_activity + find_subgraphs_for_address need an address-indexed view, query_natural_language needs an LLM hook)
-BLOCKERS: NONE for core logic — the indexer is feature-complete. Remaining Phase 5 (logs streaming + auth) needs hosted-service topology + identity decisions.
-NEXT_PHASE: Phase 5 operational surface (logs streaming + auth), then a live testnet indexing run (Phase 7 integrations / Phase 8 mainnet launch).
+BLOCKERS: NONE for core logic — the indexer is feature-complete core infrastructure. Do not claim production-readiness until live testnet indexing and benchmark numbers exist.
+NEXT_PHASE: Phase 5 operational surface (logs streaming + hosted deployment), live testnet indexing soak, benchmark publication, then Phase 7 integrations / Phase 8 mainnet launch.
 ```
 
 ## What's done

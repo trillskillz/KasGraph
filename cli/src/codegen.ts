@@ -24,16 +24,18 @@
 //                 is typed per detector pattern: each `pattern:`
 //                 selector that maps to a registered detector emits a
 //                 `<Kind>State` interface (covenant-state fields, all
-//                 hex `string`, discriminated on `detectorKind`), and
-//                 an event's payload is the union of its data source's
-//                 detector states. Pattern-less sources (krc721
+//                 hex `string`, discriminated on `detectorKind`, with
+//                 optional `covenantId` for the stable KIP-20 lineage
+//                 id), and an event's payload is the union of its data
+//                 source's detector states. Pattern-less sources (krc721
 //                 `collection`, utxo `addresses`) and unregistered
 //                 selectors leave the state `unknown`. A `CovenantSpent`
 //                 event on a `covenant_id` source additionally wraps its
 //                 payload in `{ spend: CovenantSpend; state: … }`, where
 //                 `CovenantSpend` is the protocol-level spend envelope
-//                 (operation, consumed value, lineage successor). The
-//                 detector schema is sourced from `./detector-schema.ts`.
+//                 (covenant id, operation, consumed value, lineage
+//                 successor). The detector schema is sourced from
+//                 `./detector-schema.ts`.
 
 import { parse, Kind, type DocumentNode, type TypeNode } from 'graphql';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -281,6 +283,8 @@ ${payloadDoc}
 // coupon payout, …) are derived by the mapping from these primitives.
 function renderCovenantSpendInterface(): string {
   return `export interface CovenantSpend {
+  /** Stable KIP-20 covenant/lineage id being spent. */
+  covenantId: string;
   /**
    * The covenant operation (spend path / method) this spend invoked,
    * observable from the revealed spend branch.
@@ -320,6 +324,8 @@ function renderStateInterface(kind: string): string {
   return `export interface ${kind}State {
   /** Discriminator — names the matched detector pattern. */
   detectorKind: ${JSON.stringify(kind)};
+  /** Stable KIP-20 covenant/lineage id when available. */
+  covenantId?: string;
 ${fields}
 }`;
 }

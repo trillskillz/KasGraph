@@ -69,6 +69,44 @@ describe('handleDeployRequest', () => {
     ]);
   });
 
+  it('POST requires bearer auth when a deploy token is configured', async () => {
+    const unauthorized = new MockPool();
+    const missing = await handleDeployRequest(
+      { method: 'POST', path: '/subgraphs', body: BUNDLE },
+      unauthorized,
+      { bearerToken: 'secret' },
+    );
+    expect(missing.status).toBe(401);
+    expect(unauthorized.calls).toHaveLength(0);
+
+    const bad = await handleDeployRequest(
+      {
+        method: 'POST',
+        path: '/subgraphs',
+        body: BUNDLE,
+        authorization: 'Bearer wrong',
+      },
+      unauthorized,
+      { bearerToken: 'secret' },
+    );
+    expect(bad.status).toBe(401);
+    expect(unauthorized.calls).toHaveLength(0);
+
+    const authorized = new MockPool();
+    const ok = await handleDeployRequest(
+      {
+        method: 'POST',
+        path: '/subgraphs',
+        body: BUNDLE,
+        authorization: 'Bearer secret',
+      },
+      authorized,
+      { bearerToken: 'secret' },
+    );
+    expect(ok.status).toBe(200);
+    expect(authorized.calls[0]!.sql).toMatch(/INSERT INTO kasgraph_subgraph/);
+  });
+
   it('POST persists wasm bytes (base64 → BYTEA Buffer) when present', async () => {
     const pool = new MockPool();
     const res = await handleDeployRequest(
@@ -117,6 +155,46 @@ describe('handleDeployRequest', () => {
     const none = new MockPool([[]]);
     const missRes = await handleDeployRequest({ method: 'DELETE', path: '/subgraphs/ghost' }, none);
     expect(missRes.status).toBe(404);
+  });
+
+  it('DELETE requires bearer auth when configured, while GET remains public', async () => {
+    const found = new MockPool([
+      [{ schema_sdl: 's', manifest_json: {}, wasm_sha256: 'h' }],
+    ]);
+    const getRes = await handleDeployRequest(
+      { method: 'GET', path: '/subgraphs/kasbonds' },
+      found,
+      { bearerToken: 'secret' },
+    );
+    expect(getRes.status).toBe(200);
+
+    const blocked = new MockPool([[{ subgraph: 'kasbonds' }]]);
+    const deleteRes = await handleDeployRequest(
+      { method: 'DELETE', path: '/subgraphs/kasbonds' },
+      blocked,
+      { bearerToken: 'secret' },
+    );
+    expect(deleteRes.status).toBe(401);
+    expect(blocked.calls).toHaveLength(0);
+
+    const allowed = new MockPool([[{ subgraph: 'kasbonds' }]]);
+    const ok = await handleDeployRequest(
+      {
+        method: 'DELETE',
+        path: '/subgraphs/kasbonds',
+        authorization: 'Bearer secret',
+      },
+      allowed,
+      { bearerToken: 'secret' },
+    );
+    expect(ok.status).toBe(200);
+  });
+
+  it('leaves deploy auth disabled for local/dev mode when no token is configured', async () => {
+    const pool = new MockPool();
+    const res = await handleDeployRequest({ method: 'POST', path: '/subgraphs', body: BUNDLE }, pool);
+    expect(res.status).toBe(200);
+    expect(pool.calls).toHaveLength(1);
   });
 
   it('404s an unknown path and 400s a bad id', async () => {
