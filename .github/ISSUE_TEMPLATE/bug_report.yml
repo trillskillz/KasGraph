@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in KasGraph is not working as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for filing a report. Please include enough detail to reproduce.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the bug, including what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands, manifest/schema, and inputs needed to reproduce.
+      placeholder: |
+        1. kasgraph build
+        2. kasgraph deploy --database-url ...
+        3. query ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - indexer node (kasgraph-node)
+        - RPC / ingestion (kasgraph-rpc)
+        - store / Postgres (kasgraph-store)
+        - detectors (kasgraph-detectors)
+        - mapping runtime (kasgraph-mapping)
+        - GraphQL API (@kasgraph/api)
+        - MCP (@kasgraph/mcp)
+        - CLI (@kasgraph/cli)
+        - other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Rust/Node versions, Postgres version, Kaspa node endpoint if relevant.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      render: shell
