@@ -479,6 +479,7 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
                 config,
                 rpc_client.as_ref(),
                 Some(&stream_hub),
+                &work_dir,
             )
             .await?;
             info!(
@@ -519,10 +520,11 @@ fn validate_continuous_config(config: &NodeConfig) -> Result<()> {
 ///     channel from the sender side.
 async fn run_continuous_ingestion(
     store: &Store,
-    runtimes: &mut [SubgraphRuntime],
+    runtimes: &mut Vec<SubgraphRuntime>,
     config: &NodeConfig,
     rpc_client: Option<&MultiRpcClient>,
     stream: Option<&StreamHub>,
+    work_dir: &std::path::Path,
 ) -> Result<()> {
     validate_continuous_config(config)?;
     let continuous = &config.continuous;
@@ -597,10 +599,39 @@ async fn run_continuous_ingestion(
         "continuous wRPC ingestion started"
     );
 
+    // Dynamic reload: periodically re-read the deployed-subgraph registry so a
+    // `kasgraph deploy` (or `remove`) is picked up without a node restart.
+    // `KASGRAPH_RELOAD_INTERVAL_SECS=0` (default) disables it.
+    let reload_secs: u64 = env::var("KASGRAPH_RELOAD_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut reload_interval = tokio::time::interval(Duration::from_secs(reload_secs.max(1)));
+    reload_interval.tick().await; // consume the immediate first tick
+    if reload_secs > 0 {
+        info!(reload_secs, "subgraph registry reload enabled");
+    }
+
     let mut processed: usize = 0;
     loop {
         let maybe_notification = tokio::select! {
             biased;
+            _ = reload_interval.tick(), if reload_secs > 0 => {
+                match reconcile_subgraph_runtimes(store, runtimes, work_dir).await {
+                    Ok(delta) if delta.added > 0 || delta.removed > 0 => info!(
+                        added = delta.added,
+                        removed = delta.removed,
+                        subgraphs = runtimes.len(),
+                        "reloaded subgraph set from the registry"
+                    ),
+                    Ok(_) => {}
+                    Err(err) => warn!(
+                        error = %err,
+                        "subgraph registry reload failed; keeping the current set"
+                    ),
+                }
+                continue;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("received Ctrl-C; shutting down continuous ingestion");
                 break;
@@ -613,7 +644,8 @@ async fn run_continuous_ingestion(
             break;
         };
 
-        let outcome = fan_out_notification(store, runtimes, notification, stream).await?;
+        let outcome =
+            fan_out_notification(store, runtimes.as_mut_slice(), notification, stream).await?;
         processed = processed.saturating_add(1);
 
         // Active gap recovery: when the driver-synthesized
@@ -663,9 +695,13 @@ async fn run_continuous_ingestion(
 
             match recovery_result {
                 Ok(recovery_notification) => {
-                    let recovered =
-                        fan_out_notification(store, runtimes, recovery_notification, stream)
-                            .await?;
+                    let recovered = fan_out_notification(
+                        store,
+                        runtimes.as_mut_slice(),
+                        recovery_notification,
+                        stream,
+                    )
+                    .await?;
                     info!(
                         from_daa,
                         to_daa,
@@ -1399,21 +1435,8 @@ async fn build_subgraph_runtimes(
 
     if !deployments.is_empty() {
         for dep in deployments {
-            let sg = dep.subgraph.clone();
-            let mapping = if dep.wasm_bytes.is_some() {
-                let dir =
-                    mapping_host::materialize_subgraph_dir(&dep, work_dir).with_context(|| {
-                        format!("materializing deployed subgraph {}", sg.schema_name())
-                    })?;
-                Some(
-                    mapping_host::LoadedMapping::load(sg.clone(), &dir).with_context(|| {
-                        format!("loading deployed mapping for {}", sg.schema_name())
-                    })?,
-                )
-            } else {
-                None
-            };
-            runtimes.push(make_subgraph_runtime(store, sg, mapping).await?);
+            let mapping = load_deployment_mapping(&dep, work_dir)?;
+            runtimes.push(make_subgraph_runtime(store, dep.subgraph.clone(), mapping).await?);
         }
         info!(
             subgraphs = runtimes.len(),
@@ -1450,6 +1473,93 @@ async fn build_subgraph_runtimes(
     };
     runtimes.push(make_subgraph_runtime(store, configured.clone(), mapping).await?);
     Ok(runtimes)
+}
+
+/// Materialize + load a deployment's mapping, or `None` for a metadata-only
+/// registration (no `wasm_bytes`). The fallible work (materialize + compile)
+/// is isolated here so [`reconcile_subgraph_runtimes`] can do it before
+/// mutating the live runtime set.
+fn load_deployment_mapping(
+    dep: &kasgraph_store::SubgraphDeployment,
+    work_dir: &std::path::Path,
+) -> Result<Option<mapping_host::LoadedMapping>> {
+    if dep.wasm_bytes.is_none() {
+        return Ok(None);
+    }
+    let dir = mapping_host::materialize_subgraph_dir(dep, work_dir).with_context(|| {
+        format!(
+            "materializing deployed subgraph {}",
+            dep.subgraph.schema_name()
+        )
+    })?;
+    let loaded =
+        mapping_host::LoadedMapping::load(dep.subgraph.clone(), &dir).with_context(|| {
+            format!(
+                "loading deployed mapping for {}",
+                dep.subgraph.schema_name()
+            )
+        })?;
+    Ok(Some(loaded))
+}
+
+/// What a registry reconcile changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReloadDelta {
+    added: usize,
+    removed: usize,
+}
+
+/// Reconcile the live runtime set against the registry, in place: build and add
+/// a runtime for each newly-deployed subgraph (a survivor keeps its in-flight
+/// ingestion and POI state), and drop runtimes whose subgraph was removed. A
+/// transiently-empty registry read is a no-op (never tears the set down — this
+/// also leaves the single-configured fallback runtime untouched). The fallible
+/// loads happen before any mutation, so on error the current set is intact.
+async fn reconcile_subgraph_runtimes(
+    store: &Store,
+    runtimes: &mut Vec<SubgraphRuntime>,
+    work_dir: &std::path::Path,
+) -> Result<ReloadDelta> {
+    let deployments = store
+        .list_subgraph_deployments()
+        .await
+        .context("listing deployed subgraphs for reload")?;
+    if deployments.is_empty() {
+        return Ok(ReloadDelta::default());
+    }
+
+    let existing: std::collections::HashSet<String> = runtimes
+        .iter()
+        .map(|r| r.subgraph.schema_name().to_owned())
+        .collect();
+    let desired: std::collections::HashSet<String> = deployments
+        .iter()
+        .map(|d| d.subgraph.schema_name().to_owned())
+        .collect();
+
+    // Build runtimes for newly-deployed subgraphs first (fallible) — if any
+    // load fails we return Err with the live set unchanged.
+    let mut added = Vec::new();
+    for dep in &deployments {
+        if existing.contains(dep.subgraph.schema_name()) {
+            continue;
+        }
+        let mapping = load_deployment_mapping(dep, work_dir)?;
+        added.push(make_subgraph_runtime(store, dep.subgraph.clone(), mapping).await?);
+    }
+
+    // Now mutate: drop removed subgraphs, keep survivors (with their state),
+    // append the new ones. These steps cannot fail.
+    let before = runtimes.len();
+    runtimes.retain(|r| desired.contains(r.subgraph.schema_name()));
+    let removed = before - runtimes.len();
+    let added_count = added.len();
+    runtimes.extend(added);
+
+    Ok(ReloadDelta {
+        added: added_count,
+        removed,
+    })
 }
 
 /// Apply one chain notification to every subgraph runtime. The block-DAG
@@ -3170,6 +3280,104 @@ mod integration_pg_persist {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../kasgraph-store/migrations")]
+    async fn reconcile_adds_new_drops_removed_and_preserves_survivor_state(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let sg_a = SubgraphId::new("itest_reload_a").unwrap();
+        let sg_b = SubgraphId::new("itest_reload_b").unwrap();
+
+        let deploy = |sg: &SubgraphId| kasgraph_store::SubgraphDeployment {
+            subgraph: sg.clone(),
+            schema_sdl: "type Bond @entity { id: ID! }".into(),
+            manifest_json: serde_json::json!({
+                "name": "itest", "wasm": "mapping.wasm", "dataSources": [
+                    { "name": "d", "kind": "covenant_id", "patterns": ["OpenSilverOwnable"],
+                      "collection": null, "addresses": [],
+                      "handlers": [{ "event": "CovenantLocked", "handler": "handleLock" }] }
+                ]
+            }),
+            wasm_sha256: None,
+            wasm_bytes: Some(EMIT_WAT.as_bytes().to_vec()),
+        };
+        store
+            .upsert_subgraph_deployment(&deploy(&sg_a))
+            .await
+            .unwrap();
+        store
+            .upsert_subgraph_deployment(&deploy(&sg_b))
+            .await
+            .unwrap();
+
+        let work_dir = std::env::temp_dir().join(format!(
+            "kasgraph_reload_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Start with only sg_a live, carrying a distinctive in-flight POI.
+        let mut a_rt = make_subgraph_runtime(&store, sg_a.clone(), None)
+            .await
+            .unwrap();
+        a_rt.ingestion.reseed_prior_poi([9u8; 32]);
+        let mut runtimes = vec![a_rt];
+
+        // Reconcile against the registry → sg_b is added, sg_a is kept with its
+        // POI state intact.
+        let delta = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            delta,
+            ReloadDelta {
+                added: 1,
+                removed: 0
+            }
+        );
+        assert_eq!(runtimes.len(), 2);
+        let a = runtimes
+            .iter()
+            .find(|r| r.subgraph == sg_a)
+            .expect("sg_a survives");
+        assert_eq!(
+            a.ingestion.prior_poi, [9u8; 32],
+            "survivor POI state preserved"
+        );
+        assert!(
+            runtimes.iter().any(|r| r.subgraph == sg_b),
+            "sg_b was added from the registry"
+        );
+
+        // A second reconcile with no registry change is a no-op.
+        let delta2 = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir)
+            .await
+            .unwrap();
+        assert_eq!(delta2, ReloadDelta::default());
+        assert_eq!(runtimes.len(), 2);
+
+        // Remove sg_b → reconcile drops it.
+        assert!(store.set_subgraph_removed(&sg_b).await.unwrap());
+        let delta3 = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            delta3,
+            ReloadDelta {
+                added: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].subgraph, sg_a);
+
+        std::fs::remove_dir_all(&work_dir).ok();
         Ok(())
     }
 
