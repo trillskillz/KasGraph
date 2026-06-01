@@ -18,6 +18,8 @@ Do not set these values to mock endpoints.
 - `GRAPHQL_ENDPOINT`, default `/graphql`
 - `GRAPHIQL`, default enabled
 - `KASGRAPH_SUBSCRIPTIONS_ENABLED`, default enabled
+- `KASGRAPH_CORS_ORIGINS`, comma-separated allowed browser origins
+- `KASGRAPH_RATE_LIMIT_PER_MINUTE`, simple per-IP HTTP request cap; `0` disables
 
 ## Public Read Endpoints
 
@@ -43,3 +45,5 @@ Before advertising a hosted endpoint, configure CORS for:
 - local development origins used by maintainers
 
 Add query timeouts, query-depth or complexity limits, and rate limiting before production claims.
+
+The Node API wrapper includes configurable CORS and a simple per-IP rate limit. GraphQL query depth/complexity limits are still a mainnet-readiness gate and must be configured before production claims.

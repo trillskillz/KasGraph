@@ -65,6 +65,14 @@ export function BenchmarksTable() {
           </table>
         </div>
       </div>
+      <div className="mt-6 flex flex-wrap gap-3">
+        <a className="rounded-md bg-[#49EACB] px-4 py-2 text-sm font-semibold text-[#021110]" href="https://github.com/trillskillz/KasGraph/blob/main/docs/benchmarks.md">
+          Benchmark Methodology
+        </a>
+        <a className="rounded-md border border-[#49EACB]/35 px-4 py-2 text-sm font-semibold text-[#dffcf6]" href="https://github.com/trillskillz/KasGraph/tree/main/scripts/bench">
+          Benchmark Scripts
+        </a>
+      </div>
     </section>
   );
 }

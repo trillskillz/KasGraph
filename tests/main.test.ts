@@ -257,6 +257,50 @@ describe('createKasGraphHttpHandler routing', () => {
     }
   });
 
+  it('applies configured CORS and handles preflight', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: '{"status":"ok"}' }),
+      undefined,
+      undefined,
+      undefined,
+      { corsAllowedOrigins: ['https://www.kasgraph.com'] },
+    );
+    const srv = await listen(handler);
+    try {
+      const res = await fetch(`${srv.base}/health`, {
+        method: 'OPTIONS',
+        headers: { origin: 'https://www.kasgraph.com' },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get('access-control-allow-origin')).toBe('https://www.kasgraph.com');
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('rate limits when configured', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: '{"status":"ok"}' }),
+      undefined,
+      undefined,
+      undefined,
+      { rateLimitPerMinute: 1 },
+    );
+    const srv = await listen(handler);
+    try {
+      expect((await fetch(`${srv.base}/health`)).status).toBe(200);
+      expect((await fetch(`${srv.base}/health`)).status).toBe(429);
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
   it('routes /healthz?with=qs the same way', async () => {
     const yoga = newRecordingYoga();
     const handler = createKasGraphHttpHandler(
@@ -414,6 +458,8 @@ describe('readOptionsFromEnv', () => {
     delete process.env.KASGRAPH_ENVIRONMENT;
     delete process.env.KASGRAPH_NETWORK;
     delete process.env.KASGRAPH_API_VERSION;
+    delete process.env.KASGRAPH_CORS_ORIGINS;
+    delete process.env.KASGRAPH_RATE_LIMIT_PER_MINUTE;
   });
 
   afterEach(() => {
@@ -443,6 +489,8 @@ describe('readOptionsFromEnv', () => {
     expect(opts.environment).toBe('local');
     expect(opts.network).toBeUndefined();
     expect(opts.version).toBe('0.1.0');
+    expect(opts.corsAllowedOrigins).toContain('https://www.kasgraph.com');
+    expect(opts.rateLimitPerMinute).toBe(0);
   });
 
   it('honors PORT/HOST/GRAPHQL_ENDPOINT/GRAPHIQL overrides', () => {
@@ -503,10 +551,17 @@ describe('readOptionsFromEnv', () => {
     process.env.KASGRAPH_ENVIRONMENT = 'testnet';
     process.env.KASGRAPH_NETWORK = 'kaspa-testnet-10';
     process.env.KASGRAPH_API_VERSION = '0.2.0';
+    process.env.KASGRAPH_CORS_ORIGINS = 'https://www.kasgraph.com,http://localhost:3000';
+    process.env.KASGRAPH_RATE_LIMIT_PER_MINUTE = '120';
     const opts = readOptionsFromEnv();
     expect(opts.environment).toBe('testnet');
     expect(opts.network).toBe('kaspa-testnet-10');
     expect(opts.version).toBe('0.2.0');
+    expect(opts.corsAllowedOrigins).toEqual([
+      'https://www.kasgraph.com',
+      'http://localhost:3000',
+    ]);
+    expect(opts.rateLimitPerMinute).toBe(120);
   });
 });
 

@@ -52,6 +52,11 @@ describe('parseCommand', () => {
       'deploy',
       'status',
       'logs',
+      'health',
+      'index',
+      'poi',
+      'db',
+      'rpc',
       'remove',
       'mcp-config',
       'help',
@@ -75,14 +80,14 @@ describe('runCommand dispatch', () => {
     expect(io.stdoutBuf).toBe(HELP_TEXT);
   });
 
-  it('returns 64 for the still-stubbed `logs` command', async () => {
+  it('returns 64 for the still-pending `logs tail` command', async () => {
     // `codegen`/`build` (tests/cli-codegen|build.test.ts) and now
     // `deploy`/`status`/`remove` (tests/cli-deploy.test.ts) are live;
     // only `logs` waits on the Phase 5 hosted-node log stream.
     const io = new CapturedIo(await newScratch());
-    const code = await runCommand(['logs'], io);
+    const code = await runCommand(['logs', 'tail'], io);
     expect(code).toBe(64);
-    expect(io.stderrBuf).toContain('not implemented yet');
+    expect(io.stderrBuf).toContain('pending');
   });
 });
 

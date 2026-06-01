@@ -22,6 +22,10 @@ Values that are not available must stay `null`, `0`, or `"unavailable"` rather t
 - `kasgraph_subgraphs_deployed`
 - `kasgraph_process_memory_rss_bytes`
 
+## Deployment Path
+
+For a persistent host, scrape `/metrics` with Prometheus-compatible tooling or a managed equivalent, configure uptime checks against `/healthz`, and keep detailed API/indexer logs behind authenticated provider access. The public website should consume only high-level `/status` output or reviewed artifacts.
+
 ## Required Alerts Before Production Claims
 
 - API down.

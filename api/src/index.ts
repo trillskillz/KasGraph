@@ -109,6 +109,7 @@ export {
   runKasGraphServer,
   type HealthzResponse,
   type HealthCheck,
+  type HttpHandlerOptions,
   type NodeHttpHandler,
   type OperationalStatusOptions,
   type RunServerOptions,

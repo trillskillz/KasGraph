@@ -252,6 +252,13 @@ export async function metricsResponse(pool: PgPoolLike): Promise<HealthzResponse
 export type NodeHttpHandler = (req: IncomingMessage, res: ServerResponse) => void;
 export type HealthCheck = () => Promise<HealthzResponse>;
 
+export interface HttpHandlerOptions {
+  corsAllowedOrigins?: readonly string[];
+  rateLimitPerMinute?: number;
+}
+
+type RateLimitBucket = { minute: number; count: number };
+
 function pathMatches(url: string, path: string): boolean {
   return url === path || url.startsWith(`${path}?`);
 }
@@ -351,9 +358,22 @@ export function createKasGraphHttpHandler(
   deployHandler?: NodeHttpHandler,
   statusCheck?: HealthCheck,
   metricsCheck?: HealthCheck,
+  options: HttpHandlerOptions = {},
 ): NodeHttpHandler {
+  const buckets = new Map<string, RateLimitBucket>();
   return (req, res) => {
     const url = req.url ?? '/';
+    applyCors(req, res, options.corsAllowedOrigins ?? []);
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (!allowRequest(req, options.rateLimitPerMinute ?? 0, buckets)) {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rate limit exceeded' }));
+      return;
+    }
     if (
       deployHandler !== undefined &&
       (url === '/subgraphs' || url.startsWith('/subgraphs/') || url.startsWith('/subgraphs?'))
@@ -381,6 +401,37 @@ export function createKasGraphHttpHandler(
     // listener directly.
     (yoga as unknown as NodeHttpHandler)(req, res);
   };
+}
+
+function applyCors(
+  req: IncomingMessage,
+  res: ServerResponse,
+  allowedOrigins: readonly string[],
+): void {
+  const origin = req.headers.origin;
+  if (typeof origin === 'string' && allowedOrigins.includes(origin)) {
+    res.setHeader('access-control-allow-origin', origin);
+    res.setHeader('vary', 'origin');
+    res.setHeader('access-control-allow-methods', 'GET, HEAD, POST, OPTIONS, DELETE');
+    res.setHeader('access-control-allow-headers', 'content-type, authorization');
+  }
+}
+
+function allowRequest(
+  req: IncomingMessage,
+  rateLimitPerMinute: number,
+  buckets: Map<string, RateLimitBucket>,
+): boolean {
+  if (rateLimitPerMinute <= 0) return true;
+  const key = req.socket.remoteAddress ?? 'unknown';
+  const minute = Math.floor(Date.now() / 60_000);
+  const bucket = buckets.get(key);
+  if (bucket === undefined || bucket.minute !== minute) {
+    buckets.set(key, { minute, count: 1 });
+    return true;
+  }
+  bucket.count += 1;
+  return bucket.count <= rateLimitPerMinute;
 }
 
 // ---------------------------------------------------------------
@@ -416,6 +467,10 @@ export interface RunServerOptions {
   network?: string;
   /** API version shown on `/status`. */
   version: string;
+  /** Allowed browser origins for public read endpoints. */
+  corsAllowedOrigins: string[];
+  /** Simple per-IP HTTP request cap. 0 disables it. */
+  rateLimitPerMinute: number;
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {
@@ -451,6 +506,12 @@ export function readOptionsFromEnv(): RunServerOptions {
     listenDatabaseUrl,
     environment: process.env.KASGRAPH_ENVIRONMENT ?? 'local',
     version: process.env.KASGRAPH_API_VERSION ?? '0.1.0',
+    corsAllowedOrigins: (process.env.KASGRAPH_CORS_ORIGINS ??
+      'https://www.kasgraph.com,https://kasgraph.com,http://localhost:3000,http://127.0.0.1:3000')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+    rateLimitPerMinute: envInt('KASGRAPH_RATE_LIMIT_PER_MINUTE', 0),
     ...(deployToken !== undefined && deployToken.length > 0 && { deployToken }),
     ...(network !== undefined && network.length > 0 && { network }),
   };
@@ -512,6 +573,10 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
         version: options.version,
       }),
     () => metricsResponse(pool),
+    {
+      corsAllowedOrigins: options.corsAllowedOrigins,
+      rateLimitPerMinute: options.rateLimitPerMinute,
+    },
   );
   const server = http.createServer(handler);
 

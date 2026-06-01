@@ -67,6 +67,7 @@ while [[ "$(date +%s)" -lt "${end_epoch}" ]]; do
   bash scripts/soak/capture-db-stats.sh "${SOAK_ARTIFACT_DIR}" || true
   bash scripts/soak/capture-poi.sh "${SOAK_ARTIFACT_DIR}" || true
   bash scripts/soak/capture-graphql-status.sh "${SOAK_ARTIFACT_DIR}" || true
+  bash scripts/soak/capture-resource-metrics.sh "${SOAK_ARTIFACT_DIR}" || true
   sleep "${SOAK_INTERVAL_SECONDS}"
 done
 

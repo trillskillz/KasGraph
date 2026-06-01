@@ -56,13 +56,17 @@ const readiness = [
 
 const operatorDocs: Array<[string, string]> = [
   ['Hosted endpoint docs', `${site.github}/blob/main/docs/hosted-api.md`],
-  ['Benchmark methodology', '/benchmarks'],
+  ['Benchmark methodology', `${site.github}/blob/main/docs/benchmarks.md`],
+  ['Benchmarks page', '/benchmarks'],
   ['Testnet soak page', '/testnet-soak'],
+  ['Sustained-run page', '/sustained-run'],
   ['Testnet soak plan', `${site.github}/blob/main/docs/testnet-soak-plan.md`],
   ['Testnet soak report template', `${site.github}/blob/main/docs/testnet-soak-report.md`],
   ['Mainnet readiness checklist', `${site.github}/blob/main/docs/mainnet-readiness.md`],
+  ['Mainnet readiness page', '/mainnet-readiness'],
   ['Operator runbook', `${site.github}/blob/main/docs/runbook.md`],
   ['Monitoring docs', `${site.github}/blob/main/docs/monitoring.md`],
+  ['Monitoring page', '/monitoring'],
 ];
 
 function statusClass(status: string): string {

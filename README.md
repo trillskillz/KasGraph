@@ -141,10 +141,24 @@ The indexer node is configured by environment variable. The most common:
 | `KASGRAPH_ENVIRONMENT` | Operational label returned from `/status`, for example `local` or `testnet` |
 | `KASGRAPH_NETWORK` | Kaspa network label returned from `/status`, for example `kaspa-testnet-10` |
 | `KASGRAPH_API_VERSION` | Optional API version override returned from `/status` |
+| `KASGRAPH_CORS_ORIGINS` | Comma-separated browser origins allowed by the API wrapper |
+| `KASGRAPH_RATE_LIMIT_PER_MINUTE` | Simple per-IP HTTP request cap for hosted API deployments (`0` disables) |
 
 The gateway / CLI deploy target accepts `--database-url` (direct) or `--node <url>` / `KASGRAPH_NODE_URL` (hosted HTTP endpoint). Public hosted nodes must set `KASGRAPH_DEPLOY_TOKEN`; clients send `Authorization: Bearer <token>` for deploy/remove writes. The continuous driver exposes additional `KASGRAPH_CONTINUOUS_*` backoff/channel knobs; see `crates/kasgraph-node` for the full set.
 
 Hosted API operators should expose only intended read routes publicly and keep write routes protected. Endpoint docs and production gates live in [`docs/hosted-api.md`](docs/hosted-api.md), [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md), [`docs/runbook.md`](docs/runbook.md), and [`docs/monitoring.md`](docs/monitoring.md).
+
+Operational inspection commands:
+
+```bash
+npx kasgraph health --node http://localhost:4000
+npx kasgraph index status --node http://localhost:4000 --json
+npx kasgraph poi latest --database-url "$DATABASE_URL"
+npx kasgraph db stats --database-url "$DATABASE_URL" --json
+npx kasgraph rpc status --node http://localhost:4000
+```
+
+`kasgraph logs tail`, `kasgraph poi verify`, `kasgraph poi compare`, and detailed `kasgraph index inspect` remain pending until protected hosted log and checkpoint-range backends exist.
 
 ## Repo map
 

@@ -43,6 +43,8 @@ const operatorGuides: Array<[string, string, string]> = [
   [`${site.github}/blob/main/docs/runbook.md`, 'Operator runbook', 'Deploy, rollback, restart, database health, secret rotation, and incident procedures.'],
   [`${site.github}/blob/main/docs/monitoring.md`, 'Monitoring', 'Health, status, metrics, alerts, and log access policy.'],
   [`${site.github}/blob/main/docs/testnet-soak-plan.md`, 'Testnet soak plan', 'Minimum and preferred validation run requirements before public claims.'],
+  [`${site.github}/blob/main/docs/sustained-run-report.md`, 'Sustained-run report', 'Publication template for real long-running proof-of-life artifacts.'],
+  [`${site.github}/blob/main/docs/benchmarks.md`, 'Benchmarks methodology', 'Benchmark categories, required metadata, and current pending result table.'],
 ];
 
 export default function DocsPage() {

@@ -10,6 +10,11 @@
 //   kasgraph logs <subgraph>          tail mapping logs
 //   kasgraph remove <subgraph>        remove a deployed subgraph
 //   kasgraph mcp-config               generate MCP config for Claude/Cursor/OpenClaw
+//   kasgraph health --node <url>      inspect API health/status
+//   kasgraph index status --node <url>
+//   kasgraph poi latest --database-url <url>
+//   kasgraph db stats --database-url <url>
+//   kasgraph rpc status --node <url>
 //
 // This module exports a typed dispatch surface and the
 // `runCommand` entry that tests + the bin both use. Per-command
@@ -24,6 +29,16 @@ import { runCodegen } from './codegen.js';
 import { runDeploy, runRemove, runStatus } from './deploy.js';
 import { runInit } from './init.js';
 import { runMcpConfig } from './mcp-config.js';
+import {
+  runDbStats,
+  runHealth,
+  runIndexInspect,
+  runIndexStatus,
+  runLogsTail,
+  runPoiLatest,
+  runPoiPending,
+  runRpcStatus,
+} from './ops.js';
 
 // Re-export per-command helpers so tests can exercise them
 // without spelunking subpaths.
@@ -51,6 +66,16 @@ export {
   runMcpConfig,
   type McpConfigOptions,
 } from './mcp-config.js';
+export {
+  runDbStats,
+  runHealth,
+  runIndexInspect,
+  runIndexStatus,
+  runLogsTail,
+  runPoiLatest,
+  runPoiPending,
+  runRpcStatus,
+} from './ops.js';
 
 export type Command =
   | 'init'
@@ -59,6 +84,11 @@ export type Command =
   | 'deploy'
   | 'status'
   | 'logs'
+  | 'health'
+  | 'index'
+  | 'poi'
+  | 'db'
+  | 'rpc'
   | 'remove'
   | 'mcp-config'
   | 'help';
@@ -72,6 +102,11 @@ export function parseCommand(argv: string[]): Command {
     case 'deploy':
     case 'status':
     case 'logs':
+    case 'health':
+    case 'index':
+    case 'poi':
+    case 'db':
+    case 'rpc':
     case 'remove':
     case 'mcp-config':
     case 'help':
@@ -106,6 +141,11 @@ export const HELP_TEXT = [
   '  kasgraph logs <subgraph>        Tail mapping logs',
   '  kasgraph remove <subgraph>      Remove a deployed subgraph',
   '  kasgraph mcp-config             Generate MCP config for Claude/Cursor/OpenClaw',
+  '  kasgraph health --node <url>    Inspect hosted API health/status',
+  '  kasgraph index status --node <url>  Inspect indexed DAA/checkpoint status',
+  '  kasgraph poi latest --database-url <url>  Inspect latest POI checkpoint',
+  '  kasgraph db stats --database-url <url>    Inspect database counts/stats',
+  '  kasgraph rpc status --node <url>  Inspect public RPC status if exposed',
   '',
 ].join('\n');
 
@@ -133,9 +173,31 @@ export async function runCommand(argv: string[], io: CliIo): Promise<number> {
       return runStatus(rest, io);
     case 'remove':
       return runRemove(rest, io);
+    case 'health':
+      return runHealth(rest, io);
+    case 'index':
+      if (rest[0] === 'status') return runIndexStatus(rest.slice(1), io);
+      if (rest[0] === 'inspect') return runIndexInspect(rest.slice(1), io);
+      io.stderr.write('kasgraph index: usage: kasgraph index <status|inspect>\n');
+      return 64;
+    case 'poi':
+      if (rest[0] === 'latest') return runPoiLatest(rest.slice(1), io);
+      if (rest[0] === 'verify') return runPoiPending('verify', rest.slice(1), io);
+      if (rest[0] === 'compare') return runPoiPending('compare', rest.slice(1), io);
+      io.stderr.write('kasgraph poi: usage: kasgraph poi <latest|verify|compare>\n');
+      return 64;
+    case 'db':
+      if (rest[0] === 'stats') return runDbStats(rest.slice(1), io);
+      io.stderr.write('kasgraph db: usage: kasgraph db stats\n');
+      return 64;
+    case 'rpc':
+      if (rest[0] === 'status') return runRpcStatus(rest.slice(1), io);
+      io.stderr.write('kasgraph rpc: usage: kasgraph rpc status\n');
+      return 64;
     case 'logs':
+      if (rest[0] === 'tail') return runLogsTail(rest.slice(1), io);
       io.stderr.write(
-        'kasgraph: `logs` is not implemented yet (needs the hosted-node log stream — Phase 5)\n',
+        'kasgraph: `logs` needs a subcommand; try `kasgraph logs tail` (pending hosted log stream)\n',
       );
       return 64; // EX_USAGE-ish — recognized but not actionable.
     case 'help':

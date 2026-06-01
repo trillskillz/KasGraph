@@ -5,8 +5,8 @@ import { CodeBlock } from '@/components/CodeBlock';
 
 const starterQueries = [
   {
-    label: 'Latest checkpoints',
-    query: `query LatestCheckpoints {
+    label: 'Latest POI checkpoints',
+    query: `query LatestPoiCheckpoints {
   poiCheckpoints(subgraph: "network-stats", first: 5) {
     subgraph
     blockDaaScore
@@ -15,12 +15,24 @@ const starterQueries = [
 }`,
   },
   {
-    label: 'Indexer status',
-    query: `query IndexerStatus {
+    label: 'Latest indexed DAA',
+    query: `query LatestIndexedDaa {
   committedBlocks(first: 5, orderBy: daaScore, orderDirection: desc) {
     subgraph
     daaScore
     blockHash
+    committedAt
+  }
+}`,
+  },
+  {
+    label: 'Committed blocks',
+    query: `query CommittedBlocks {
+  committedBlocks(first: 10, orderBy: daaScore, orderDirection: desc) {
+    subgraph
+    blockHash
+    daaScore
+    servedBy
     committedAt
   }
 }`,
@@ -44,6 +56,36 @@ const starterQueries = [
     covenantId
     lineageCount
     currentUtxo
+  }
+}`,
+  },
+  {
+    label: 'KRC-20 entities',
+    query: `query Krc20Tokens {
+  entities(subgraph: "krc20", entity: "Token", first: 10) {
+    id
+    data
+    blockDaaScore
+  }
+}`,
+  },
+  {
+    label: 'KRC-721 entities',
+    query: `query Krc721Collections {
+  entities(subgraph: "krc721", entity: "Collection", first: 10) {
+    id
+    data
+    blockDaaScore
+  }
+}`,
+  },
+  {
+    label: 'Generic entity query',
+    query: `query GenericEntities($subgraph: String!, $entity: String!) {
+  entities(subgraph: $subgraph, entity: $entity, first: 10) {
+    id
+    data
+    blockDaaScore
   }
 }`,
   },

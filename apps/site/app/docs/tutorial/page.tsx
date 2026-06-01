@@ -71,8 +71,10 @@ const query = `query {
 }`;
 
 const poi = `# POI inspection is implemented in the core verifier/checkpoint path.
-# A dedicated public CLI command for checkpoint inspection is still pending.
-npx kasgraph status krc20-tracker`;
+# Latest checkpoint inspection is available against Postgres.
+npx kasgraph poi latest --database-url "$DATABASE_URL"
+npx kasgraph db stats --database-url "$DATABASE_URL" --json
+npx kasgraph health --node http://localhost:4000`;
 
 const steps: Array<[string, string, string]> = [
   ['Step 1 - Install repo dependencies', 'The CLI package is in this monorepo. Until npm publishing is confirmed, use the repo-local toolchain.', install],
@@ -83,7 +85,7 @@ const steps: Array<[string, string, string]> = [
   ['Step 6 - Deploy locally', 'Direct database deployment is implemented. Hosted-node deployment also exists behind --node once a node is available.', deploy],
   ['Step 7 - Run the indexer node', 'There is no implemented kasgraph index CLI command yet; run the Rust node with the documented environment variables.', indexer],
   ['Step 8 - Query with GraphQL', 'Run the API/gateway against the same Postgres-backed registry, then query the generated schema.', query],
-  ['Step 9 - Verify indexing checkpoint', 'Dedicated public CLI ergonomics for POI inspection still need confirmation.', poi],
+  ['Step 9 - Inspect status and checkpoints', 'Use the operational CLI for public API status, latest POI checkpoint, and database counts. Range verification remains pending.', poi],
 ];
 
 export default function TutorialPage() {
