@@ -4,7 +4,9 @@ import {
   createKasGraphHttpHandler,
   createKasGraphServer,
   healthzResponse,
+  metricsResponse,
   nodeDeployHandler,
+  operationalStatusResponse,
   readOptionsFromEnv,
   type HealthCheck,
   type PgPoolLike,
@@ -21,6 +23,38 @@ class StubPool implements PgPoolLike {
   ): Promise<QueryResult<TRow>> {
     if (this.throws !== undefined) {
       throw this.throws;
+    }
+    return { rows: [] as TRow[] };
+  }
+}
+
+class OperationalStubPool implements PgPoolLike {
+  async query<TRow extends QueryResultRow = QueryResultRow>(
+    text: string,
+    _values?: ReadonlyArray<unknown>,
+  ): Promise<QueryResult<TRow>> {
+    if (text.includes('MAX(daa_score)')) {
+      return {
+        rows: [
+          {
+            indexed_daa_score: '467579632',
+            indexed_blocks: '1204',
+          },
+        ] as TRow[],
+      };
+    }
+    if (text.includes('latest_poi_checkpoint')) {
+      return {
+        rows: [
+          {
+            latest_poi_checkpoint: Buffer.from('8fa4b210', 'hex'),
+            poi_checkpoints_total: '7',
+          },
+        ] as TRow[],
+      };
+    }
+    if (text.includes('subgraphs_deployed')) {
+      return { rows: [{ subgraphs_deployed: '2' }] as TRow[] };
     }
     return { rows: [] as TRow[] };
   }
@@ -43,6 +77,70 @@ describe('healthzResponse', () => {
     const body = JSON.parse(res.body) as { status: string; error: string };
     expect(body.status).toBe('unhealthy');
     expect(body.error).toContain('connection refused on 5432');
+  });
+});
+
+describe('operational status and metrics responses', () => {
+  it('returns real DB-derived status fields and unavailable RPC state', async () => {
+    const res = await operationalStatusResponse(new OperationalStubPool(), {
+      environment: 'testnet',
+      network: 'kaspa-testnet-10',
+      version: '0.1.0',
+    });
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body) as {
+      status: string;
+      environment: string;
+      network: string;
+      indexedDaaScore: string;
+      indexedBlocks: number;
+      rpcConnected: string;
+      postgresConnected: boolean;
+      latestPoiCheckpoint: string;
+      poiCheckpointsTotal: number;
+      subgraphsDeployed: number;
+    };
+    expect(body.status).toBe('ok');
+    expect(body.environment).toBe('testnet');
+    expect(body.network).toBe('kaspa-testnet-10');
+    expect(body.indexedDaaScore).toBe('467579632');
+    expect(body.indexedBlocks).toBe(1204);
+    expect(body.rpcConnected).toBe('unavailable');
+    expect(body.postgresConnected).toBe(true);
+    expect(body.latestPoiCheckpoint).toBe('0x8fa4b210');
+    expect(body.poiCheckpointsTotal).toBe(7);
+    expect(body.subgraphsDeployed).toBe(2);
+  });
+
+  it('keeps unavailable DB-backed values neutral when Postgres is down', async () => {
+    const res = await operationalStatusResponse(new StubPool(new Error('db down')), {
+      environment: 'local',
+      version: '0.1.0',
+    });
+    expect(res.status).toBe(503);
+    const body = JSON.parse(res.body) as {
+      status: string;
+      indexedDaaScore: string | null;
+      indexedBlocks: number;
+      postgresConnected: boolean;
+      latestPoiCheckpoint: string | null;
+    };
+    expect(body.status).toBe('degraded');
+    expect(body.indexedDaaScore).toBeNull();
+    expect(body.indexedBlocks).toBe(0);
+    expect(body.postgresConnected).toBe(false);
+    expect(body.latestPoiCheckpoint).toBeNull();
+  });
+
+  it('emits scrapeable process and database metrics', async () => {
+    const res = await metricsResponse(new OperationalStubPool());
+    expect(res.status).toBe(200);
+    expect(res.contentType).toContain('text/plain');
+    expect(res.body).toContain('kasgraph_postgres_connected 1');
+    expect(res.body).toContain('kasgraph_indexed_blocks_total 1204');
+    expect(res.body).toContain('kasgraph_indexed_daa_score 467579632');
+    expect(res.body).toContain('kasgraph_poi_checkpoints_total 7');
+    expect(res.body).toContain('kasgraph_subgraphs_deployed 2');
   });
 });
 
@@ -106,6 +204,53 @@ describe('createKasGraphHttpHandler routing', () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { status: string };
       expect(body.status).toBe('ok');
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('routes GET /health to the same supplied health check', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: '{"status":"ok"}' }),
+    );
+    const srv = await listen(handler);
+    try {
+      const res = await fetch(`${srv.base}/health`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { status: string };
+      expect(body.status).toBe('ok');
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('routes optional /status and /metrics handlers before Yoga', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: '{"status":"ok"}' }),
+      undefined,
+      newCheck({ status: 200, body: '{"status":"ok","environment":"testnet"}' }),
+      () =>
+        Promise.resolve({
+          status: 200,
+          contentType: 'text/plain',
+          body: 'kasgraph_postgres_connected 1\n',
+        }),
+    );
+    const srv = await listen(handler);
+    try {
+      const status = await fetch(`${srv.base}/status`);
+      expect(status.status).toBe(200);
+      expect(await status.json()).toEqual({ status: 'ok', environment: 'testnet' });
+
+      const metrics = await fetch(`${srv.base}/metrics`);
+      expect(metrics.status).toBe(200);
+      expect(await metrics.text()).toBe('kasgraph_postgres_connected 1\n');
       expect(yoga.calls).toBe(0);
     } finally {
       await srv.close();
@@ -266,6 +411,9 @@ describe('readOptionsFromEnv', () => {
     delete process.env.KASGRAPH_SUBSCRIPTIONS_ENABLED;
     delete process.env.LISTEN_DATABASE_URL;
     delete process.env.KASGRAPH_DEPLOY_TOKEN;
+    delete process.env.KASGRAPH_ENVIRONMENT;
+    delete process.env.KASGRAPH_NETWORK;
+    delete process.env.KASGRAPH_API_VERSION;
   });
 
   afterEach(() => {
@@ -292,6 +440,9 @@ describe('readOptionsFromEnv', () => {
     expect(opts.subscriptionsEnabled).toBe(true);
     expect(opts.listenDatabaseUrl).toBe('postgres://x');
     expect(opts.deployToken).toBeUndefined();
+    expect(opts.environment).toBe('local');
+    expect(opts.network).toBeUndefined();
+    expect(opts.version).toBe('0.1.0');
   });
 
   it('honors PORT/HOST/GRAPHQL_ENDPOINT/GRAPHIQL overrides', () => {
@@ -345,6 +496,17 @@ describe('readOptionsFromEnv', () => {
     process.env.DATABASE_URL = 'postgres://x';
     process.env.KASGRAPH_DEPLOY_TOKEN = 'secret';
     expect(readOptionsFromEnv().deployToken).toBe('secret');
+  });
+
+  it('reads operational deployment labels for /status', () => {
+    process.env.DATABASE_URL = 'postgres://x';
+    process.env.KASGRAPH_ENVIRONMENT = 'testnet';
+    process.env.KASGRAPH_NETWORK = 'kaspa-testnet-10';
+    process.env.KASGRAPH_API_VERSION = '0.2.0';
+    const opts = readOptionsFromEnv();
+    expect(opts.environment).toBe('testnet');
+    expect(opts.network).toBe('kaspa-testnet-10');
+    expect(opts.version).toBe('0.2.0');
   });
 });
 

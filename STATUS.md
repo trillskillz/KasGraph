@@ -1,24 +1,33 @@
 # KasGraph — Status
 
 ```
-PROJECT_STATUS: Core indexer FEATURE-COMPLETE — build → deploy → index → query is multi-tenant, hot-reloadable, and verified end-to-end against real Postgres. Hosted deploy/remove writes have bearer-token auth. Remaining public-launch work is operational validation: live testnet indexing soak, published benchmarks, hosted deployment status, and logs streaming.
+PROJECT_STATUS: Core indexer FEATURE-COMPLETE — build → deploy → index → query is multi-tenant, hot-reloadable, and verified end-to-end against real Postgres. Hosted deploy/remove writes have bearer-token auth. API operator endpoints now include /healthz, /health, /status, and /metrics. Remaining public-launch work is operational validation: live hosted testnet indexing soak, published benchmarks, and protected logs streaming.
 PHASE_0_STATUS: SKIPPED (ecosystem outreach deferred to a separate track)
 PHASE_1_STATUS: COMPLETE (reference docs under docs/references/: KIP-20, Kaspa RPC, The Graph compatibility, BlockDAG reorg semantics, KRC20/KRC721 deep dives)
 PHASE_2_STATUS: COMPLETE (2.1 workspace; 2.2 multi-RPC failover client + audit; 2.3 continuous wRPC subscription with capability probe, backoff reconnect, gap-aware + anchor-based recovery, health-probe loop; 2.4 store schema (9 migrations) + KIP-20 covenant-id lineage with fork-edge (parent_utxo) model + reorg-safe unwind; 2.5 detector registry = 17/17 REAL silverc-captured fingerprints (12 OpenSilver core exact + KCC20 asset & 4 controllers anchored) + KRC20/KRC721 inscription parsers & ledgers; 2.6 wasmtime mapping runtime with entity reads (store_get); 2.7 KCC20 operation decoder → live CovenantSpent dispatch; 2.8 POI computed over dispatched entity state + third-party verify)
 PHASE_3_STATUS: SUBSTANTIALLY COMPLETE (GraphQL gateway: committedBlock(s) / poiCheckpoints / detectedPatterns / covenantLineage [+ first-class utxo/parentUtxo/childUtxos DAG] / entity / entities / covenantSpends, PLUS typed per-subgraph schemas generated from each subgraph's schema.graphql with relation + @derivedFrom resolution; MCP delegates execute_query/get_schema to the same gateway and is registry-aware; KasStream in-process hub + GraphQL subscriptions over Postgres LISTEN/NOTIFY)
 PHASE_4_STATUS: COMPLETE (init / codegen / build / deploy / status / remove / mcp-config; only `logs` stubbed pending the hosted log stream)
-PHASE_5_STATUS: IN_PROGRESS (deploy pipeline FEATURE-COMPLETE: kasgraph_subgraph registry, HTTP deploy endpoint + `kasgraph deploy --node <url>`, bearer-token auth for deploy/remove writes via KASGRAPH_DEPLOY_TOKEN, wasm-bytes data plane, node consumes the registry at startup, multi-subgraph fan-out, dynamic registry reload; REMAINING: logs streaming, hosted topology, live testnet soak, benchmarks, kasgraph.com deployment confirmation)
+PHASE_5_STATUS: IN_PROGRESS (deploy pipeline FEATURE-COMPLETE: kasgraph_subgraph registry, HTTP deploy endpoint + `kasgraph deploy --node <url>`, bearer-token auth for deploy/remove writes via KASGRAPH_DEPLOY_TOKEN, wasm-bytes data plane, node consumes the registry at startup, multi-subgraph fan-out, dynamic registry reload, operator endpoints /healthz + /health + /status + /metrics; REMAINING: protected logs streaming, hosted API topology, live testnet soak, benchmarks)
 PHASE_6_STATUS: COMPLETE (six reference subgraphs under examples/: kasbonds, opensilver-patterns, krc20, krc721, network-stats, zk-proofs — each ships subgraph.yaml + schema.graphql + src/mapping.ts (AssemblyScript) + README, exercised by tests/)
 PHASE_7_STATUS: NOT_STARTED (integrations)
 PHASE_8_STATUS: NOT_STARTED (Toccata-window mainnet launch)
 PHASE_9_STATUS: DEFERRED (post-launch roadmap; documented, not executed)
 COMPONENTS_LIVE: full build→deploy→index→query pipeline — kasgraph-rpc (failover + continuous wRPC subscription + recovery); kasgraph-store (9 migrations incl. deployed-subgraph registry with wasm bytes; per-subgraph schemas; reorg-safe unwind); kasgraph-detectors (17 REAL fingerprints + KRC20/721 ledgers); kasgraph-mapping (wasmtime runtime, store_get); kasgraph-poi (chain + verify); kasgraph-node (ingest → detect → dispatch → persist → POI, multi-subgraph fan-out + registry hot-reload); @kasgraph/api (GraphQL gateway + typed per-subgraph queries + deploy HTTP endpoint); @kasgraph/mcp (5/8 tools live, registry-aware); @kasgraph/cli (init/codegen/build/deploy/status/remove). Verified end-to-end against real Postgres (tests/e2e-deploy-query.test.ts + Rust integration-pg suites).
 TESTNET_INDEXED_BLOCKS: 0 (pipeline verified against local Postgres + captured live wRPC soak; a live testnet indexing run is the next operational step)
+TESTNET_SOAK_STATUS: NOT_RUN
+TESTNET_SOAK_DURATION: N/A
+TESTNET_SOAK_DATE: N/A
+TESTNET_DAA_START: N/A
+TESTNET_DAA_END: N/A
+TESTNET_POI_CHECKPOINTS: N/A
+TESTNET_RESTART_RECOVERY: Not measured
+TESTNET_PUBLIC_LOGS: Not published
 SUBGRAPHS_DEPLOYED: 0 live (deploy pipeline complete + e2e-tested: build → deploy → index → query → reload against real Postgres)
 QUERY_LATENCY_P95: N/A (not yet benchmarked under load)
+KNOWN_SOAK_ISSUES: No sustained 24h testnet indexing run, no sanitized public logs, no restart/recovery artifact, no benchmark measurements.
 MCP_TOOLS_LIVE: 5 of 8 (list_subgraphs, get_schema, execute_query, search_by_pattern, get_covenant_lineage; get_address_activity + find_subgraphs_for_address need an address-indexed view, query_natural_language needs an LLM hook)
 BLOCKERS: NONE for core logic — the indexer is feature-complete core infrastructure. Do not claim production-readiness until live testnet indexing and benchmark numbers exist.
-NEXT_PHASE: Phase 5 operational surface (logs streaming + hosted deployment), live testnet indexing soak, benchmark publication, then Phase 7 integrations / Phase 8 mainnet launch.
+NEXT_PHASE: Phase 5 operational surface (protected logs streaming + hosted API deployment), live testnet indexing soak, benchmark publication, then Phase 7 integrations / Phase 8 mainnet launch.
 ```
 
 ## What's done
@@ -72,9 +81,7 @@ NEXT_PHASE: Phase 5 operational surface (logs streaming + hosted deployment), li
 ## What's blocked on the user
 
 - **Phase 0 ecosystem coordination.** User explicitly skipped this for now. Outreach to Kaspa Foundation, Kasplex, kas.fyi, krc721.stream maintainers, Michael Sutton, Hans Moog, wallet teams remains a launch-day prerequisite per PLAN.md, but does not block implementation.
-- **Hosted infrastructure decisions** (Phase 5): cloud provider, k8s vs systemd, Postgres deploy shape.
-- **kasgraph.com domain registration** and TLS infra.
-- **GitHub remote setup** — repo not yet pushed.
+- **Hosted API infrastructure decisions** (Phase 5): cloud provider, k8s vs systemd, managed Postgres deploy shape, monitoring provider, and protected log source.
 
 ## What can be done autonomously next
 

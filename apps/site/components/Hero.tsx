@@ -27,6 +27,8 @@ const credibility = [
 ];
 
 export function Hero() {
+  const hasPlaygroundEndpoint = (process.env.NEXT_PUBLIC_KASGRAPH_GRAPHQL_URL ?? '').length > 0;
+
   return (
     <section className="section grid gap-10 pb-16 pt-14 lg:grid-cols-[1.02fr_0.98fr] lg:items-center lg:pb-24 lg:pt-20">
       <div>
@@ -46,7 +48,7 @@ export function Hero() {
             Read Docs
           </Link>
           <Link className="rounded-md border border-[#49EACB]/35 px-5 py-3 text-sm font-semibold text-[#dffcf6]" href="/playground">
-            Playground Coming Soon
+            {hasPlaygroundEndpoint ? 'Open Playground' : 'Playground Coming Soon'}
           </Link>
           <Link className="rounded-md border border-white/15 px-5 py-3 text-sm font-semibold text-[#dffcf6]" href="/status">
             Check Status

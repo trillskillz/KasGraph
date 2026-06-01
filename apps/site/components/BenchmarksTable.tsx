@@ -6,7 +6,7 @@ const rows: Array<[string, string, string, string, string]> = [
   ['WebSocket/KasStream event latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires live streaming deployment.'],
   ['MCP tool response latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires hosted MCP/gateway path.'],
   ['Proof-of-Indexing checkpoint cost', 'Pending', 'TBD ms/checkpoint', 'Pending measurement', 'Depends on entity update volume.'],
-  ['Testnet soak duration', 'Pending', 'TBD days', 'Pending validation', 'No production claims until soak data is published.'],
+  ['Testnet soak duration', 'Not run', '24h minimum / 72h preferred', 'Pending validation', 'Harness added; no sustained testnet artifact has been published.'],
   ['Mainnet readiness', 'Not validated', 'Defined checklist', 'Not production-ready', 'Requires testnet soak, monitoring, benchmarks, and runbooks.'],
 ];
 
@@ -18,7 +18,7 @@ const cards: Array<[string, string]> = [
   ['WebSocket/KasStream event latency', 'Pending measurement'],
   ['MCP tool response latency', 'Pending measurement'],
   ['POI checkpoint cost', 'Pending measurement'],
-  ['Testnet soak duration', 'Pending validation'],
+  ['Testnet soak duration', 'Not run'],
   ['Mainnet readiness', 'Not production-ready'],
 ];
 
@@ -29,8 +29,8 @@ export function BenchmarksTable() {
         <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">benchmarks</p>
         <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">Benchmarks.</h2>
         <p className="mt-4 text-lg leading-8 text-[#b7c9c5]">
-          This is the public placeholder for performance data. Results remain pending until
-          sustained testnet/mainnet validation produces repeatable measurements.
+          This is the public placeholder for performance data. The soak harness exists, but results
+          remain pending until sustained testnet/mainnet validation produces repeatable measurements.
         </p>
       </div>
       <div className="mb-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

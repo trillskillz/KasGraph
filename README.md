@@ -49,7 +49,7 @@ All four interfaces ship together. MCP is a first-class surface, not a future ad
 
 ## Status
 
-The indexer is **feature-complete core infrastructure**: `build -> deploy -> index -> query` is multi-tenant, hot-reloadable, and verified end-to-end against a real Postgres. Hosted deploy writes now support bearer-token auth; remaining pre-public work is operational validation: live testnet indexing, published benchmarks, hosted deployment status, and log streaming. See [`STATUS.md`](STATUS.md) for the live per-phase block.
+The indexer is **feature-complete core infrastructure**: `build -> deploy -> index -> query` is multi-tenant, hot-reloadable, and verified end-to-end against a real Postgres. Hosted deploy writes support bearer-token auth, and the API exposes `/healthz`, `/health`, `/status`, and `/metrics` for operators. Remaining pre-public work is operational validation: live hosted testnet indexing, published benchmarks, sustained soak evidence, and protected log streaming. See [`STATUS.md`](STATUS.md) for the live per-phase block.
 
 ## Quick start
 
@@ -138,8 +138,13 @@ The indexer node is configured by environment variable. The most common:
 | `KASGRAPH_SUBGRAPH` | Single-subgraph fallback id when the registry is empty (dev) |
 | `KASGRAPH_SUBGRAPH_DIR` | Single-subgraph fallback: load a locally-built dir instead of the registry (dev) |
 | `KASGRAPH_DEPLOY_TOKEN` | Bearer token required for hosted `POST /subgraphs` and `DELETE /subgraphs/:id`; leave unset only for local/dev |
+| `KASGRAPH_ENVIRONMENT` | Operational label returned from `/status`, for example `local` or `testnet` |
+| `KASGRAPH_NETWORK` | Kaspa network label returned from `/status`, for example `kaspa-testnet-10` |
+| `KASGRAPH_API_VERSION` | Optional API version override returned from `/status` |
 
 The gateway / CLI deploy target accepts `--database-url` (direct) or `--node <url>` / `KASGRAPH_NODE_URL` (hosted HTTP endpoint). Public hosted nodes must set `KASGRAPH_DEPLOY_TOKEN`; clients send `Authorization: Bearer <token>` for deploy/remove writes. The continuous driver exposes additional `KASGRAPH_CONTINUOUS_*` backoff/channel knobs; see `crates/kasgraph-node` for the full set.
+
+Hosted API operators should expose only intended read routes publicly and keep write routes protected. Endpoint docs and production gates live in [`docs/hosted-api.md`](docs/hosted-api.md), [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md), [`docs/runbook.md`](docs/runbook.md), and [`docs/monitoring.md`](docs/monitoring.md).
 
 ## Repo map
 

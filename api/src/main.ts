@@ -5,12 +5,16 @@
 // via Node's built-in `http` module. Adds a `/healthz` endpoint
 // that runs a cheap `SELECT 1` against the pool so load
 // balancers and orchestrators can detect database outages.
+// Adds `/health`, `/status`, and `/metrics` for hosted
+// deployments without claiming any value the API cannot observe.
 //
 // Splits cleanly so the routing + healthz logic is unit-testable
 // without binding sockets:
 //
-//   - healthzResponse(pool)               → {status, body, contentType}
-//   - createKasGraphHttpHandler(yoga, hc) → (req, res) => void
+//   - healthzResponse(pool)                → {status, body, contentType}
+//   - operationalStatusResponse(pool, ctx) → {status, body, contentType}
+//   - metricsResponse(pool)                → {status, body, contentType}
+//   - createKasGraphHttpHandler(...)       → (req, res) => void
 //   - runKasGraphServerFromEnv()          → ties everything together
 //   - main()                              → CLI entry point
 
@@ -52,6 +56,26 @@ export interface HealthzResponse {
   contentType: string;
 }
 
+export interface OperationalStatusOptions {
+  environment: string;
+  network?: string;
+  version: string;
+}
+
+interface CommittedBlockStatsRow {
+  indexed_daa_score: string | null;
+  indexed_blocks: string;
+}
+
+interface PoiStatsRow {
+  latest_poi_checkpoint: Buffer | string | null;
+  poi_checkpoints_total: string;
+}
+
+interface SubgraphStatsRow {
+  subgraphs_deployed: string;
+}
+
 /**
  * Returns an OK response when `pool` accepts a trivial query,
  * 503 otherwise. Pool errors are surfaced in the body so
@@ -75,12 +99,187 @@ export async function healthzResponse(pool: PgPoolLike): Promise<HealthzResponse
   }
 }
 
+function asNumber(value: string | null | undefined): number | null {
+  if (value === undefined || value === null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function hexValue(value: Buffer | string | null | undefined): string | null {
+  if (value === undefined || value === null) return null;
+  if (Buffer.isBuffer(value)) return `0x${value.toString('hex')}`;
+  if (value.startsWith('0x')) return value;
+  return value;
+}
+
+async function postgresConnected(pool: PgPoolLike): Promise<boolean> {
+  try {
+    await pool.query('SELECT 1');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function optionalQueryFirst<TRow extends object>(
+  pool: PgPoolLike,
+  sql: string,
+): Promise<TRow | undefined> {
+  try {
+    const res = await pool.query(sql);
+    return res.rows[0] as TRow | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function committedBlockStats(pool: PgPoolLike): Promise<CommittedBlockStatsRow> {
+  const row = await optionalQueryFirst<CommittedBlockStatsRow>(
+    pool,
+    `SELECT
+       MAX(daa_score)::text AS indexed_daa_score,
+       COUNT(*)::text AS indexed_blocks
+     FROM kasgraph_committed_block`,
+  );
+  return row ?? { indexed_daa_score: null, indexed_blocks: '0' };
+}
+
+async function poiStats(pool: PgPoolLike): Promise<PoiStatsRow> {
+  const row = await optionalQueryFirst<PoiStatsRow>(
+    pool,
+    `SELECT
+       (SELECT poi_hash FROM kasgraph_poi ORDER BY block_daa_score DESC LIMIT 1) AS latest_poi_checkpoint,
+       COUNT(*)::text AS poi_checkpoints_total
+     FROM kasgraph_poi`,
+  );
+  return row ?? { latest_poi_checkpoint: null, poi_checkpoints_total: '0' };
+}
+
+async function subgraphStats(pool: PgPoolLike): Promise<SubgraphStatsRow> {
+  const row = await optionalQueryFirst<SubgraphStatsRow>(
+    pool,
+    `SELECT COUNT(*)::text AS subgraphs_deployed
+     FROM kasgraph_subgraph
+     WHERE status <> 'removed'`,
+  );
+  return row ?? { subgraphs_deployed: '0' };
+}
+
+/**
+ * Hosted-node status assembled only from values the API can observe.
+ * RPC/indexer liveness is reported as unavailable here because the
+ * GraphQL gateway process does not own the Kaspa RPC connection.
+ */
+export async function operationalStatusResponse(
+  pool: PgPoolLike,
+  options: OperationalStatusOptions,
+): Promise<HealthzResponse> {
+  const connected = await postgresConnected(pool);
+  const [blocks, poi, subgraphs] = connected
+    ? await Promise.all([committedBlockStats(pool), poiStats(pool), subgraphStats(pool)])
+    : [
+        { indexed_daa_score: null, indexed_blocks: '0' },
+        { latest_poi_checkpoint: null, poi_checkpoints_total: '0' },
+        { subgraphs_deployed: '0' },
+      ];
+
+  return {
+    status: connected ? 200 : 503,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      status: connected ? 'ok' : 'degraded',
+      environment: options.environment,
+      network: options.network ?? null,
+      indexedDaaScore: blocks.indexed_daa_score,
+      indexedBlocks: asNumber(blocks.indexed_blocks),
+      rpcConnected: 'unavailable',
+      postgresConnected: connected,
+      latestPoiCheckpoint: hexValue(poi.latest_poi_checkpoint),
+      poiCheckpointsTotal: asNumber(poi.poi_checkpoints_total),
+      subgraphsDeployed: asNumber(subgraphs.subgraphs_deployed),
+      version: options.version,
+      updatedAt: new Date().toISOString(),
+    }),
+  };
+}
+
+/**
+ * Prometheus-compatible text metrics for the API process and the
+ * Postgres-backed registry tables. Missing tables stay at zero so a
+ * fresh deployment can be scraped before migrations/indexing are live.
+ */
+export async function metricsResponse(pool: PgPoolLike): Promise<HealthzResponse> {
+  const connected = await postgresConnected(pool);
+  const [blocks, poi, subgraphs] = connected
+    ? await Promise.all([committedBlockStats(pool), poiStats(pool), subgraphStats(pool)])
+    : [
+        { indexed_daa_score: null, indexed_blocks: '0' },
+        { latest_poi_checkpoint: null, poi_checkpoints_total: '0' },
+        { subgraphs_deployed: '0' },
+      ];
+  const memory = process.memoryUsage();
+  const lines = [
+    '# HELP kasgraph_postgres_connected 1 when Postgres accepts SELECT 1, else 0.',
+    '# TYPE kasgraph_postgres_connected gauge',
+    `kasgraph_postgres_connected ${connected ? 1 : 0}`,
+    '# HELP kasgraph_indexed_blocks_total Committed block rows visible to the API.',
+    '# TYPE kasgraph_indexed_blocks_total gauge',
+    `kasgraph_indexed_blocks_total ${asNumber(blocks.indexed_blocks) ?? 0}`,
+    '# HELP kasgraph_indexed_daa_score Highest committed DAA score visible to the API.',
+    '# TYPE kasgraph_indexed_daa_score gauge',
+    `kasgraph_indexed_daa_score ${asNumber(blocks.indexed_daa_score) ?? 0}`,
+    '# HELP kasgraph_poi_checkpoints_total POI checkpoint rows visible to the API.',
+    '# TYPE kasgraph_poi_checkpoints_total gauge',
+    `kasgraph_poi_checkpoints_total ${asNumber(poi.poi_checkpoints_total) ?? 0}`,
+    '# HELP kasgraph_subgraphs_deployed Active subgraphs visible to the API.',
+    '# TYPE kasgraph_subgraphs_deployed gauge',
+    `kasgraph_subgraphs_deployed ${asNumber(subgraphs.subgraphs_deployed) ?? 0}`,
+    '# HELP kasgraph_process_memory_rss_bytes Resident set size of the API process.',
+    '# TYPE kasgraph_process_memory_rss_bytes gauge',
+    `kasgraph_process_memory_rss_bytes ${memory.rss}`,
+  ];
+  return {
+    status: connected ? 200 : 503,
+    contentType: 'text/plain; version=0.0.4',
+    body: `${lines.join('\n')}\n`,
+  };
+}
+
 // ---------------------------------------------------------------
 // HTTP routing
 // ---------------------------------------------------------------
 
 export type NodeHttpHandler = (req: IncomingMessage, res: ServerResponse) => void;
 export type HealthCheck = () => Promise<HealthzResponse>;
+
+function pathMatches(url: string, path: string): boolean {
+  return url === path || url.startsWith(`${path}?`);
+}
+
+function writeOperationalResponse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  check: HealthCheck,
+): void {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { allow: 'GET, HEAD' });
+    res.end();
+    return;
+  }
+  check()
+    .then(({ status, body, contentType }) => {
+      res.writeHead(status, { 'content-type': contentType });
+      if (req.method === 'HEAD') {
+        res.end();
+      } else {
+        res.end(body);
+      }
+    })
+    .catch((err: unknown) => {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end(String(err));
+    });
+}
 
 /**
  * A Node-http handler for the hosted-node deploy endpoint (`/subgraphs*`):
@@ -150,6 +349,8 @@ export function createKasGraphHttpHandler(
   yoga: KasGraphServer,
   healthCheck: HealthCheck,
   deployHandler?: NodeHttpHandler,
+  statusCheck?: HealthCheck,
+  metricsCheck?: HealthCheck,
 ): NodeHttpHandler {
   return (req, res) => {
     const url = req.url ?? '/';
@@ -160,30 +361,19 @@ export function createKasGraphHttpHandler(
       deployHandler(req, res);
       return;
     }
-    if (url === '/healthz' || url.startsWith('/healthz?')) {
+    if (pathMatches(url, '/healthz') || pathMatches(url, '/health')) {
       // Always allow GET + HEAD on healthz; anything else is
       // 405 so operators don't accidentally POST to the wrong
       // path and get confusing GraphQL errors back.
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.writeHead(405, { allow: 'GET, HEAD' });
-        res.end();
-        return;
-      }
-      healthCheck()
-        .then(({ status, body, contentType }) => {
-          res.writeHead(status, { 'content-type': contentType });
-          if (req.method === 'HEAD') {
-            res.end();
-          } else {
-            res.end(body);
-          }
-        })
-        .catch((err: unknown) => {
-          // healthzResponse already swallows errors; this is for
-          // bugs in the wrapper itself.
-          res.writeHead(500, { 'content-type': 'text/plain' });
-          res.end(String(err));
-        });
+      writeOperationalResponse(req, res, healthCheck);
+      return;
+    }
+    if (statusCheck !== undefined && pathMatches(url, '/status')) {
+      writeOperationalResponse(req, res, statusCheck);
+      return;
+    }
+    if (metricsCheck !== undefined && pathMatches(url, '/metrics')) {
+      writeOperationalResponse(req, res, metricsCheck);
       return;
     }
 
@@ -220,6 +410,12 @@ export interface RunServerOptions {
   listenDatabaseUrl: string;
   /** Bearer token required for hosted deploy/remove writes. */
   deployToken?: string;
+  /** Human-readable deployment environment label, e.g. local/testnet/mainnet. */
+  environment: string;
+  /** Kaspa network served by this deployment when known. */
+  network?: string;
+  /** API version shown on `/status`. */
+  version: string;
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {
@@ -244,6 +440,7 @@ export function readOptionsFromEnv(): RunServerOptions {
   }
   const listenDatabaseUrl = process.env.LISTEN_DATABASE_URL ?? databaseUrl;
   const deployToken = process.env.KASGRAPH_DEPLOY_TOKEN;
+  const network = process.env.KASGRAPH_NETWORK;
   return {
     databaseUrl,
     host: process.env.HOST ?? '0.0.0.0',
@@ -252,7 +449,10 @@ export function readOptionsFromEnv(): RunServerOptions {
     graphiql: envBoolean('GRAPHIQL', true),
     subscriptionsEnabled: envBoolean('KASGRAPH_SUBSCRIPTIONS_ENABLED', true),
     listenDatabaseUrl,
+    environment: process.env.KASGRAPH_ENVIRONMENT ?? 'local',
+    version: process.env.KASGRAPH_API_VERSION ?? '0.1.0',
     ...(deployToken !== undefined && deployToken.length > 0 && { deployToken }),
+    ...(network !== undefined && network.length > 0 && { network }),
   };
 }
 
@@ -305,6 +505,13 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
       pool,
       options.deployToken !== undefined ? { bearerToken: options.deployToken } : {},
     ),
+    () =>
+      operationalStatusResponse(pool, {
+        environment: options.environment,
+        ...(options.network !== undefined && { network: options.network }),
+        version: options.version,
+      }),
+    () => metricsResponse(pool),
   );
   const server = http.createServer(handler);
 

@@ -1,43 +1,39 @@
+import Link from 'next/link';
 import { CodeBlock } from '@/components/CodeBlock';
 
 const panels: Array<[string, string]> = [
   [
-    'CLI workflow - example output',
-    `kasgraph init my-subgraph
-cd my-subgraph
-kasgraph build
-kasgraph deploy
-# planned hosted command:
-kasgraph index --network testnet-10`,
+    'Soak command - prepared, not run',
+    `SOAK_DURATION_SECONDS=86400 \\
+KASGRAPH_ENVIRONMENT=testnet \\
+KASGRAPH_NETWORK=kaspa-testnet-10 \\
+bash scripts/soak/run-testnet-soak.sh`,
   ],
   [
-    'Indexer log - preview output',
-    `Indexer: running
-Network: kaspa-testnet-10
-RPC: connected
-DAA score: 467579632
-Indexed blocks: 1,204,882
-Reorg handler: active
-POI checkpoint: 0x8fa4b21...`,
-  ],
-  [
-    'MCP tool call - example output',
+    'API health artifact - pending',
     `{
-  "tool": "get_covenant_lineage",
-  "arguments": {
-    "covenantId": "cov_8fa4b21..."
-  }
+  "ts": "N/A",
+  "status": null,
+  "healthz": null,
+  "note": "No sustained testnet run has published health snapshots yet."
 }`,
   ],
   [
-    'GraphQL response - preview output',
+    'POI checkpoint artifact - pending',
     `{
-  "data": {
-    "network": "kaspa-testnet-10",
-    "indexedDaaScore": 467579632,
-    "poiCheckpoint": "0x8fa4b21..."
-  }
+  "ts": "N/A",
+  "checkpoint": null,
+  "note": "No public POI checkpoint sample has been captured from a 24h soak yet."
 }`,
+  ],
+  [
+    'Restart recovery - required note shape',
+    `Pre-restart DAA: N/A
+Pre-restart POI: N/A
+Post-restart DAA: N/A
+Post-restart POI: N/A
+Recovery duration: Not measured
+Verdict: Incomplete until controlled restart is executed`,
   ],
 ];
 
@@ -48,9 +44,17 @@ export function ProofOfLife() {
         <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">proof of life</p>
         <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">Proof of life.</h2>
         <p className="mt-4 text-lg leading-8 text-[#b7c9c5]">
-          These panels show the current developer surfaces and expected local/hosted output shape.
-          They are labeled as example or preview output until real public captures are published.
+          Real sustained-run captures are not published yet. These panels now show the prepared
+          soak harness and the exact artifact slots that must be filled by a real testnet run.
         </p>
+        <div className="mt-6 flex flex-wrap gap-3">
+          <Link className="rounded-md bg-[#49EACB] px-4 py-2 text-sm font-semibold text-[#021110]" href="/testnet-soak">
+            View Testnet Soak Status
+          </Link>
+          <a className="rounded-md border border-[#49EACB]/35 px-4 py-2 text-sm font-semibold text-[#dffcf6]" href="https://github.com/trillskillz/KasGraph/blob/main/docs/testnet-soak-report.md">
+            Read Soak Report
+          </a>
+        </div>
       </div>
       <div className="grid gap-5 lg:grid-cols-2">
         {panels.map(([title, code]) => (

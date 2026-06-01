@@ -17,6 +17,7 @@ export const navItems = [
   { href: '/docs', label: 'Docs' },
   { href: '/docs/tutorial', label: 'Tutorial' },
   { href: '/benchmarks', label: 'Benchmarks' },
+  { href: '/testnet-soak', label: 'Testnet Soak' },
   { href: '/status', label: 'Status' },
 ];
 
