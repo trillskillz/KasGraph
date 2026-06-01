@@ -3,6 +3,7 @@ import './globals.css';
 import { Footer } from '@/components/Footer';
 import { Header } from '@/components/Header';
 import { site } from '@/lib/site';
+import { Analytics } from '@vercel/analytics/next';
 
 export const metadata: Metadata = {
   metadataBase: new URL(site.url),
@@ -40,6 +41,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           {children}
           <Footer />
         </div>
+        <Analytics />
       </body>
     </html>
   );
