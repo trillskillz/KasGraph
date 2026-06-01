@@ -12,31 +12,28 @@ npx kasgraph deploy --database-url "$DATABASE_URL"
 npx kasgraph status my-subgraph`;
 
 const interfaces: Array<[string, string]> = [
-  ['GraphQL', 'Typed subgraph queries over committed blocks, POI checkpoints, detected patterns, lineage, and deployed entity schemas.'],
-  ['MCP', 'Agent-facing tools for listing subgraphs, fetching schemas, executing queries, searching patterns, and reading covenant lineage.'],
-  ['KasStream', 'A streaming primitive for block-by-block event delivery and low-latency data products.'],
-  ['WebSocket', 'Push subscriptions over the same gateway data plane for detected-pattern updates.'],
+  ['GraphQL', 'Typed queries over indexed entities, covenant lineage, asset state, checkpoints, and subgraph schemas.'],
+  ['MCP', 'Agent tools for listing subgraphs, reading schemas, executing queries, searching patterns, and inspecting lineage.'],
+  ['WebSockets', 'Push updates for explorers, dashboards, wallets, and operational views that need fresh indexed state.'],
+  ['KasStream', 'A low-latency stream of detected Kaspa activity for event-driven products and downstream pipelines.'],
 ];
 
 const primitives: Array<[string, string]> = [
-  ['KIP-20 Covenant IDs', 'Stable lineage identifiers turn covenant state history into primary-key lookups instead of recursive UTXO walking.'],
-  ['KRC-20 / KRC-721', 'Legacy inscription parsing and native covenant-era token models are treated as first-class indexing targets.'],
-  ['BlockDAG reorgs', 'Committed and probabilistic block handling is designed around Kaspa virtual-chain changes and unwind semantics.'],
-  ['Proof of Indexing', 'A blake2b-256 hash chain over indexed entity state enables third-party verification of indexer output.'],
-  ['Multi-RPC failover', 'The RPC layer probes multiple sources and records fetch provenance for operational visibility.'],
-  ['Postgres entities', 'Per-subgraph schemas, registry rows, lineage, checkpoints, and typed entity versions live in PostgreSQL.'],
+  ['UTXO-first indexing', 'Model application state from inputs, outputs, spends, and lineage instead of forcing an account-based event-log shape.'],
+  ['KIP-20 Covenant IDs', 'Use stable consensus-tracked identifiers to query covenant history without recursive UTXO walking in every app.'],
+  ['KRC-20 / KRC-721 assets', 'Index legacy inscription activity and native covenant-era assets as first-class query targets.'],
+  ['BlockDAG reorg handling', 'Track committed and probabilistic block state with unwind semantics designed for Kaspa virtual-chain changes.'],
+  ['Postgres-backed entities', 'Store deployed subgraphs, schemas, checkpoints, lineage, and versioned entities in a durable relational model.'],
+  ['Proof of Indexing', 'Maintain a blake2b-256 hash chain over indexed entity state so output can be independently verified.'],
 ];
 
 const useCases = [
-  'Wallets',
-  'Explorers',
-  'KRC-20/KRC-721 dashboards',
-  'Covenant apps',
-  'KasBonds',
-  'OpenSilver',
-  'AI agents',
-  'Analytics platforms',
-  'POI verification',
+  ['Wallets', 'Show balances, activity, covenant positions, and asset history without bespoke block parsers.'],
+  ['Explorers', 'Serve structured transaction, asset, contract, and lineage views from indexed state.'],
+  ['KRC tools', 'Track KRC-20/KRC-721 transfers, ownership, supply, and dashboards across legacy and native models.'],
+  ['Covenant apps', 'Query state transitions by Covenant ID and expose app-specific entities through GraphQL.'],
+  ['Analytics platforms', 'Build time-series and ecosystem views on top of normalized Kaspa application data.'],
+  ['AI agents', 'Use MCP tools to inspect schemas, search patterns, and answer questions without raw RPC handling.'],
 ];
 
 export default function Home() {
@@ -47,16 +44,31 @@ export default function Home() {
       <section className="section border-y hairline py-16">
         <div className="grid gap-10 lg:grid-cols-[0.82fr_1.18fr] lg:items-start">
           <div>
-            <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">why it exists</p>
+            <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">what it solves</p>
             <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-              Raw RPC is not enough for Kaspa applications.
+              Kaspa apps need indexed state, not another raw RPC wrapper.
             </h2>
           </div>
           <p className="text-lg leading-8 text-[#b7c9c5]">
-            Wallets, explorers, dApps, analytics systems, covenant apps, native-asset dashboards,
-            and AI agents need structured state. KasGraph turns Kaspa block and covenant activity
-            into queryable entities, streams, agent tools, and verifiable indexing checkpoints.
+            KasGraph gives developers a shared indexing layer for blocks, UTXOs, Covenant IDs,
+            KRC assets, reorg-aware history, and application-specific entities. Wallets, explorers,
+            dashboards, covenant apps, analytics systems, and AI agents can query the same data plane
+            instead of each rebuilding parsers, storage, reconciliation, and RPC failover.
           </p>
+        </div>
+      </section>
+
+      <section className="section py-16">
+        <div className="mb-8 max-w-3xl">
+          <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">who it is for</p>
+          <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
+            Infrastructure for teams building on Kaspa state.
+          </h2>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {useCases.map(([title, description]) => (
+            <FeatureCard description={description} key={title} title={title} />
+          ))}
         </div>
       </section>
 
@@ -65,7 +77,7 @@ export default function Home() {
           <div>
             <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">one data plane</p>
             <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-              Four interfaces ship together.
+              Query, stream, and automate through one indexed data plane.
             </h2>
           </div>
           <Link className="text-sm font-medium text-[#49EACB]" href="/architecture">
@@ -83,7 +95,7 @@ export default function Home() {
         <div>
           <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">architecture</p>
           <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-            Kaspa-native indexing from RPC to agents.
+            Purpose-built around Kaspa primitives.
           </h2>
           <p className="mt-5 text-lg leading-8 text-[#b7c9c5]">
             The node ingests Kaspa RPC and wRPC streams, applies detectors and WASM mappings,
@@ -98,7 +110,7 @@ export default function Home() {
         <div>
           <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">developer workflow</p>
           <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-            Subgraph-style authoring for Kaspa.
+            Define the data you want. KasGraph handles the indexing path.
           </h2>
           <p className="mt-5 text-lg leading-8 text-[#b7c9c5]">
             Scaffold a subgraph, generate TypeScript types from GraphQL SDL, compile the
@@ -111,8 +123,12 @@ export default function Home() {
       <section className="section py-16">
         <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">kaspa primitives</p>
         <h2 className="mt-4 max-w-3xl text-3xl font-semibold tracking-tight text-[#f3fffc]">
-          Built for UTXO, Covenant ID, native assets, and BlockDAG state.
+          Not an Ethereum-shaped indexer pointed at Kaspa.
         </h2>
+        <p className="mt-5 max-w-4xl text-lg leading-8 text-[#b7c9c5]">
+          KasGraph is designed around UTXO state transitions, Covenant ID lineage, BlockDAG
+          finality, KRC assets, and verifiable indexing output.
+        </p>
         <div className="mt-9 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {primitives.map(([title, description]) => (
             <FeatureCard description={description} key={title} title={title} />
@@ -124,11 +140,12 @@ export default function Home() {
         <div>
           <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">ai-native</p>
           <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-            Agents should not need to hand-write GraphQL to understand Kaspa state.
+            AI agents get tools, not scraped explorer pages.
           </h2>
           <p className="mt-5 text-lg leading-8 text-[#b7c9c5]">
-            MCP is a first-class surface, backed by the same registry and gateway path as the
-            developer API.
+            MCP is a first-class interface over the same indexed registry and gateway used by
+            applications. Agents can discover schemas, execute queries, inspect Covenant ID lineage,
+            and search detected Kaspa patterns with structured tool calls.
           </p>
         </div>
         <div className="panel rounded-lg p-6">
@@ -147,7 +164,7 @@ export default function Home() {
         <div className="panel rounded-lg p-7 sm:p-9">
           <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">status</p>
           <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-            Core infrastructure feature-complete. Public hosted validation is next.
+            Open-source core infrastructure, moving toward hosted validation.
           </h2>
           <p className="mt-5 max-w-4xl text-lg leading-8 text-[#b7c9c5]">
             The build {'->'} deploy {'->'} index {'->'} query pipeline is multi-tenant, hot-reloadable,
@@ -157,17 +174,6 @@ export default function Home() {
           <Link className="mt-7 inline-flex text-sm font-medium text-[#49EACB]" href="/status">
             Read the full status
           </Link>
-        </div>
-      </section>
-
-      <section className="section py-16">
-        <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">use cases</p>
-        <div className="mt-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {useCases.map((item) => (
-            <div className="rounded-lg border border-[#70C7BA]/18 bg-black/20 p-4 text-sm font-medium text-[#dffcf6]" key={item}>
-              {item}
-            </div>
-          ))}
         </div>
       </section>
     </main>

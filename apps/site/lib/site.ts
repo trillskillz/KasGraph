@@ -1,9 +1,9 @@
 export const site = {
   name: 'KasGraph',
-  title: 'KasGraph - The Graph for Kaspa',
+  title: 'KasGraph - Structured indexing for Kaspa applications',
   url: 'https://www.kasgraph.com',
   description:
-    'AI-native subgraph indexing for Kaspa UTXO, Covenant ID, KRC-20/KRC-721, and BlockDAG applications.',
+    'KasGraph turns Kaspa blocks, UTXOs, Covenant IDs, KRC assets, and BlockDAG activity into queryable data for applications and AI agents.',
   github: 'https://github.com/trillskillz/KasGraph',
   docs: 'https://github.com/trillskillz/KasGraph#readme',
   license: 'MIT',
