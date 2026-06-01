@@ -1,0 +1,11 @@
+.git
+.vercel
+node_modules
+target
+**/.next
+**/.vercel
+**/node_modules
+**/out
+**/tsconfig.tsbuildinfo
+.env*
+**/.env*

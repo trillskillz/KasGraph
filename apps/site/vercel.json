@@ -1,10 +1,38 @@
 {
-  "cleanUrls": true,
-  "redirects": [
+  "version": 2,
+  "builds": [
     {
-      "source": "/github",
-      "destination": "https://github.com/trillskillz/KasGraph",
-      "permanent": false
+      "src": "package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "out"
+      }
+    }
+  ],
+  "cleanUrls": true,
+  "routes": [
+    {
+      "src": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "kasgraph.com"
+        }
+      ],
+      "headers": {
+        "Location": "https://www.kasgraph.com/$1"
+      },
+      "status": 308
+    },
+    {
+      "src": "/github",
+      "headers": {
+        "Location": "https://github.com/trillskillz/KasGraph"
+      },
+      "status": 307
+    },
+    {
+      "handle": "filesystem"
     }
   ]
 }
