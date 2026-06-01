@@ -6,6 +6,7 @@
   "description": "KasGraph monorepo. Subgraph-style indexing for Kaspa with GraphQL + MCP + KasStream.",
   "packageManager": "npm@10.9.2",
   "workspaces": [
+    "apps/site",
     "sdk",
     "cli",
     "api",
@@ -16,6 +17,9 @@
     "build": "tsc -b sdk cli api mcp",
     "build:rust": "cargo build --workspace",
     "clean": "rm -rf sdk/dist cli/dist api/dist mcp/dist target",
+    "site:dev": "npm --workspace @kasgraph/site run dev",
+    "site:build": "npm --workspace @kasgraph/site run build",
+    "site:start": "npm --workspace @kasgraph/site run start",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:rust": "cargo test --workspace",

@@ -4,6 +4,7 @@ build/
 target/
 coverage/
 .cache/
+.next/
 .DS_Store
 .env
 .env.local
@@ -15,3 +16,5 @@ coverage/
 # schema.graphql + subgraph.yaml. Keeps committed examples
 # focused on the source of truth.
 examples/**/src/generated/
+.vercel
+.env*

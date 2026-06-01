@@ -1,0 +1,10 @@
+{
+  "cleanUrls": true,
+  "redirects": [
+    {
+      "source": "/github",
+      "destination": "https://github.com/trillskillz/KasGraph",
+      "permanent": false
+    }
+  ]
+}
