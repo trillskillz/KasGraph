@@ -8,8 +8,8 @@ export function Footer() {
         <div>
           <div className="text-sm font-semibold text-[#e7fbf7]">KasGraph</div>
           <p className="mt-3 max-w-md text-sm leading-6 text-[#8aa29d]">
-            The Graph for Kaspa: GraphQL, MCP, KasStream, WebSocket subscriptions, Postgres
-            storage, and Proof of Indexing over one data plane.
+            Kaspa-native indexing infrastructure for GraphQL, MCP, KasStream, WebSocket
+            subscriptions, Postgres entities, and Proof of Indexing.
           </p>
         </div>
         <div className="grid grid-cols-2 gap-x-12 gap-y-3 text-sm text-[#a9bbb7] sm:grid-cols-3">
@@ -18,9 +18,6 @@ export function Footer() {
               {item.label}
             </Link>
           ))}
-          <Link className="transition hover:text-[#49EACB]" href="/playground">
-            Playground
-          </Link>
           <Link className="transition hover:text-[#49EACB]" href={site.github}>
             GitHub
           </Link>

@@ -10,7 +10,7 @@ export function Header() {
         </span>
         <span className="text-sm font-semibold tracking-wide text-[#e7fbf7]">KasGraph</span>
       </Link>
-      <nav className="hidden items-center gap-7 text-sm text-[#a9bbb7] md:flex">
+      <nav className="hidden items-center gap-4 text-sm text-[#a9bbb7] lg:flex">
         {navItems.map((item) => (
           <Link className="transition hover:text-[#49EACB]" href={item.href} key={item.href}>
             {item.label}

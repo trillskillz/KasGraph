@@ -10,9 +10,13 @@ export const site = {
 };
 
 export const navItems = [
-  { href: '/docs', label: 'Docs' },
+  { href: '/', label: 'Overview' },
   { href: '/architecture', label: 'Architecture' },
-  { href: '/quickstart', label: 'Quickstart' },
+  { href: '/demo', label: 'Demo' },
+  { href: '/use-cases', label: 'Use Cases' },
+  { href: '/docs', label: 'Docs' },
+  { href: '/docs/tutorial', label: 'Tutorial' },
+  { href: '/benchmarks', label: 'Benchmarks' },
   { href: '/status', label: 'Status' },
 ];
 

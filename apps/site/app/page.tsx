@@ -1,8 +1,13 @@
 import Link from 'next/link';
 import { ArchitectureDiagram } from '@/components/ArchitectureDiagram';
+import { BenchmarksTable } from '@/components/BenchmarksTable';
 import { CodeBlock } from '@/components/CodeBlock';
+import { ContributeSection } from '@/components/ContributeSection';
+import { DemoPreview } from '@/components/DemoPreview';
 import { FeatureCard } from '@/components/FeatureCard';
 import { Hero } from '@/components/Hero';
+import { ProofOfLife } from '@/components/ProofOfLife';
+import { UseCaseGrid } from '@/components/UseCaseGrid';
 
 const workflow = `npx kasgraph init my-subgraph
 cd my-subgraph
@@ -27,15 +32,6 @@ const primitives: Array<[string, string]> = [
   ['Proof of Indexing', 'Maintain a blake2b-256 hash chain over indexed entity state so output can be independently verified.'],
 ];
 
-const useCases = [
-  ['Wallets', 'Show balances, activity, covenant positions, and asset history without bespoke block parsers.'],
-  ['Explorers', 'Serve structured transaction, asset, contract, and lineage views from indexed state.'],
-  ['KRC tools', 'Track KRC-20/KRC-721 transfers, ownership, supply, and dashboards across legacy and native models.'],
-  ['Covenant apps', 'Query state transitions by Covenant ID and expose app-specific entities through GraphQL.'],
-  ['Analytics platforms', 'Build time-series and ecosystem views on top of normalized Kaspa application data.'],
-  ['AI agents', 'Use MCP tools to inspect schemas, search patterns, and answer questions without raw RPC handling.'],
-];
-
 export default function Home() {
   return (
     <main>
@@ -58,19 +54,11 @@ export default function Home() {
         </div>
       </section>
 
-      <section className="section py-16">
-        <div className="mb-8 max-w-3xl">
-          <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">who it is for</p>
-          <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">
-            Infrastructure for teams building on Kaspa state.
-          </h2>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {useCases.map(([title, description]) => (
-            <FeatureCard description={description} key={title} title={title} />
-          ))}
-        </div>
-      </section>
+      <DemoPreview />
+
+      <ProofOfLife />
+
+      <UseCaseGrid />
 
       <section className="section py-20">
         <div className="mb-9 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -176,6 +164,10 @@ export default function Home() {
           </Link>
         </div>
       </section>
+
+      <BenchmarksTable />
+
+      <ContributeSection />
     </main>
   );
 }

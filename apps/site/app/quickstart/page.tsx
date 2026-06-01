@@ -1,6 +1,7 @@
 import { CodeBlock } from '@/components/CodeBlock';
 import { PageHero } from '@/components/PageHero';
 import { hostedEnvVars } from '@/lib/site';
+import Link from 'next/link';
 
 const verify = `git clone https://github.com/trillskillz/KasGraph
 cd KasGraph
@@ -33,6 +34,19 @@ export default function QuickstartPage() {
         <CodeBlock code={verify} title="install and verify" />
         <CodeBlock code={subgraph} title="build and deploy a subgraph" />
         <CodeBlock code={node} title="run the indexer node" />
+      </section>
+      <section className="section py-12">
+        <div className="flex flex-wrap gap-3">
+          <Link className="rounded-md bg-[#49EACB] px-4 py-2 text-sm font-semibold text-[#021110]" href="/docs/tutorial">
+            Read the tutorial
+          </Link>
+          <Link className="rounded-md border border-[#49EACB]/35 px-4 py-2 text-sm font-semibold text-[#dffcf6]" href="/demo">
+            View demo preview
+          </Link>
+          <Link className="rounded-md border border-white/15 px-4 py-2 text-sm font-semibold text-[#dffcf6]" href="/status">
+            Check project status
+          </Link>
+        </div>
       </section>
       <section className="section py-16">
         <div className="panel rounded-lg p-7">

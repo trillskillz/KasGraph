@@ -1,6 +1,7 @@
 import { CodeBlock } from '@/components/CodeBlock';
 import { FeatureCard } from '@/components/FeatureCard';
 import { PageHero } from '@/components/PageHero';
+import Link from 'next/link';
 
 const repoMap: Array<[string, string]> = [
   ['crates/kasgraph-node', 'Indexer binary: ingest, detect, map, persist, POI, fan-out, registry reload.'],
@@ -27,6 +28,13 @@ npx kasgraph status my-subgraph
 npx kasgraph remove my-subgraph
 npx kasgraph mcp-config`;
 
+const guides: Array<[string, string, string]> = [
+  ['/docs/tutorial', 'Build your first KasGraph subgraph', 'Local-first tutorial for defining entities, compiling mappings, deploying to a registry, and querying GraphQL.'],
+  ['/quickstart', 'Run locally', 'Clone the monorepo, verify packages, build a subgraph, and run the Rust indexer node.'],
+  ['/demo', 'Demo preview', 'Static preview of the GraphQL query and response shape until a public hosted endpoint is validated.'],
+  ['/benchmarks', 'Benchmarks', 'Placeholder structure for throughput, latency, storage, streaming, MCP, POI, and soak measurements.'],
+];
+
 export default function DocsPage() {
   return (
     <main>
@@ -38,6 +46,17 @@ export default function DocsPage() {
       <section className="section grid gap-6 lg:grid-cols-2">
         <CodeBlock code={install} title="clone and verify" />
         <CodeBlock code={cli} title="cli commands" />
+      </section>
+      <section className="section py-16">
+        <h2 className="text-3xl font-semibold tracking-tight text-[#f3fffc]">Developer path</h2>
+        <div className="mt-8 grid gap-4 md:grid-cols-2">
+          {guides.map(([href, title, description]) => (
+            <Link className="panel rounded-lg p-5 transition hover:border-[#49EACB]/45" href={href} key={href}>
+              <h3 className="text-lg font-semibold text-[#eefefa]">{title}</h3>
+              <p className="mt-3 text-sm leading-6 text-[#a9bbb7]">{description}</p>
+            </Link>
+          ))}
+        </div>
       </section>
       <section className="section py-16">
         <h2 className="text-3xl font-semibold tracking-tight text-[#f3fffc]">Repo map</h2>

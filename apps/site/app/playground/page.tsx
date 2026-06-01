@@ -1,3 +1,4 @@
+import { DemoPreview } from '@/components/DemoPreview';
 import { PageHero } from '@/components/PageHero';
 
 export default function PlaygroundPage() {
@@ -16,6 +17,7 @@ export default function PlaygroundPage() {
           </p>
         </div>
       </section>
+      <DemoPreview />
     </main>
   );
 }
