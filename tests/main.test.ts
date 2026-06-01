@@ -6,6 +6,7 @@ import {
   healthzResponse,
   metricsResponse,
   nodeDeployHandler,
+  nodeSoakHandler,
   operationalStatusResponse,
   readOptionsFromEnv,
   type HealthCheck,
@@ -257,6 +258,35 @@ describe('createKasGraphHttpHandler routing', () => {
     }
   });
 
+  it('routes /soak/status to the soak handler', async () => {
+    const yoga = newRecordingYoga();
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: '{"status":"ok"}' }),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      nodeSoakHandler(new OperationalStubPool(), {
+        environment: 'testnet',
+        network: 'kaspa-testnet-10',
+        version: '0.1.0',
+        artifactDir: '/tmp/no-such-kasgraph-soak',
+      }),
+    );
+    const srv = await listen(handler);
+    try {
+      const res = await fetch(`${srv.base}/soak/status`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { status: string; indexedDaaScore: string };
+      expect(body.status).toBe('pending');
+      expect(body.indexedDaaScore).toBe('467579632');
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
   it('applies configured CORS and handles preflight', async () => {
     const yoga = newRecordingYoga();
     const handler = createKasGraphHttpHandler(
@@ -460,6 +490,7 @@ describe('readOptionsFromEnv', () => {
     delete process.env.KASGRAPH_API_VERSION;
     delete process.env.KASGRAPH_CORS_ORIGINS;
     delete process.env.KASGRAPH_RATE_LIMIT_PER_MINUTE;
+    delete process.env.KASGRAPH_SOAK_ARTIFACT_DIR;
   });
 
   afterEach(() => {
@@ -491,6 +522,7 @@ describe('readOptionsFromEnv', () => {
     expect(opts.version).toBe('0.1.0');
     expect(opts.corsAllowedOrigins).toContain('https://www.kasgraph.com');
     expect(opts.rateLimitPerMinute).toBe(0);
+    expect(opts.soakArtifactDir).toContain('docs/artifacts/sustained-run/live');
   });
 
   it('honors PORT/HOST/GRAPHQL_ENDPOINT/GRAPHIQL overrides', () => {
@@ -553,6 +585,7 @@ describe('readOptionsFromEnv', () => {
     process.env.KASGRAPH_API_VERSION = '0.2.0';
     process.env.KASGRAPH_CORS_ORIGINS = 'https://www.kasgraph.com,http://localhost:3000';
     process.env.KASGRAPH_RATE_LIMIT_PER_MINUTE = '120';
+    process.env.KASGRAPH_SOAK_ARTIFACT_DIR = '/var/lib/kasgraph/live';
     const opts = readOptionsFromEnv();
     expect(opts.environment).toBe('testnet');
     expect(opts.network).toBe('kaspa-testnet-10');
@@ -562,6 +595,7 @@ describe('readOptionsFromEnv', () => {
       'http://localhost:3000',
     ]);
     expect(opts.rateLimitPerMinute).toBe(120);
+    expect(opts.soakArtifactDir).toBe('/var/lib/kasgraph/live');
   });
 });
 

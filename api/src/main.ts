@@ -19,12 +19,15 @@
 //   - main()                              → CLI entry point
 
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { Client, Pool } from 'pg';
 
 import { createKasGraphServer, type KasGraphServer } from './server.js';
 import { handleDeployRequest, type DeployAuthOptions } from './deploy-endpoint.js';
 import type { PgPoolLike } from './pg-resolvers.js';
 import { PgListenSource, type PgListenClient } from './pg-listen.js';
+import { sanitizeLogLine } from './log-sanitize.js';
 
 // ---------------------------------------------------------------
 // Structured logging — JSON lines to stdout, errors to stderr.
@@ -246,6 +249,235 @@ export async function metricsResponse(pool: PgPoolLike): Promise<HealthzResponse
 }
 
 // ---------------------------------------------------------------
+// Live soak monitoring
+// ---------------------------------------------------------------
+
+export interface SoakMonitorOptions extends OperationalStatusOptions {
+  artifactDir: string;
+}
+
+type SoakStatusValue = 'pending' | 'running' | 'degraded' | 'completed' | 'failed' | 'offline';
+
+interface SoakSummaryFile {
+  status?: SoakStatusValue;
+  environment?: string;
+  network?: string;
+  startedAt?: string;
+  updatedAt?: string;
+  durationSeconds?: number;
+  commit?: string;
+  version?: string;
+  daaStart?: string | number | null;
+  transactionsIndexed?: number | null;
+  entitiesWritten?: number | null;
+  rpcConnected?: boolean | null;
+  graphqlHealthy?: boolean | null;
+  mcpHealthy?: boolean | null;
+  websocketHealthy?: boolean | null;
+  knownIssues?: string[];
+  restartRecovery?: string | null;
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+  try {
+    if (!existsSync(filePath)) return null;
+    return JSON.parse(readFileSync(filePath, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function readLines(filePath: string, tail: number): string[] {
+  try {
+    if (!existsSync(filePath)) return [];
+    const lines = readFileSync(filePath, 'utf8')
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0);
+    return lines.slice(Math.max(0, lines.length - tail));
+  } catch {
+    return [];
+  }
+}
+
+function delta(start: string | number | null | undefined, current: string | null): string | null {
+  if (start === undefined || start === null || current === null) return null;
+  try {
+    const s = BigInt(String(start));
+    const c = BigInt(current);
+    return String(c - s);
+  } catch {
+    return null;
+  }
+}
+
+async function soakStatusBody(
+  pool: PgPoolLike,
+  options: SoakMonitorOptions,
+): Promise<Record<string, unknown>> {
+  const summary = readJsonFile<SoakSummaryFile>(path.join(options.artifactDir, 'summary.json'));
+  const connected = await postgresConnected(pool);
+  const [blocks, poi] = connected
+    ? await Promise.all([committedBlockStats(pool), poiStats(pool)])
+    : [
+        { indexed_daa_score: null, indexed_blocks: '0' },
+        { latest_poi_checkpoint: null, poi_checkpoints_total: '0' },
+      ];
+  const updatedAt = new Date().toISOString();
+  const startedAt = summary?.startedAt ?? null;
+  const durationSeconds =
+    summary?.durationSeconds ??
+    (startedAt === null ? null : Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000)));
+  const status: SoakStatusValue = summary?.status ?? 'pending';
+
+  return {
+    status,
+    environment: summary?.environment ?? options.environment,
+    network: summary?.network ?? options.network ?? null,
+    startedAt,
+    updatedAt: summary?.updatedAt ?? updatedAt,
+    durationSeconds,
+    commit: summary?.commit ?? null,
+    version: summary?.version ?? options.version,
+    indexedDaaScore: blocks.indexed_daa_score,
+    daaStart: summary?.daaStart ?? null,
+    daaDelta: delta(summary?.daaStart, blocks.indexed_daa_score),
+    indexedBlocks: asNumber(blocks.indexed_blocks),
+    transactionsIndexed: summary?.transactionsIndexed ?? null,
+    entitiesWritten: summary?.entitiesWritten ?? null,
+    latestPoiCheckpoint: hexValue(poi.latest_poi_checkpoint),
+    poiCheckpointsTotal: asNumber(poi.poi_checkpoints_total),
+    rpcConnected: summary?.rpcConnected ?? null,
+    postgresConnected: connected,
+    graphqlHealthy: summary?.graphqlHealthy ?? null,
+    mcpHealthy: summary?.mcpHealthy ?? null,
+    websocketHealthy: summary?.websocketHealthy ?? null,
+    restartRecovery: summary?.restartRecovery ?? null,
+    knownIssues: summary?.knownIssues ?? [],
+  };
+}
+
+export async function soakStatusResponse(
+  pool: PgPoolLike,
+  options: SoakMonitorOptions,
+): Promise<HealthzResponse> {
+  return {
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(await soakStatusBody(pool, options)),
+  };
+}
+
+export async function soakMetricsResponse(
+  pool: PgPoolLike,
+  options: SoakMonitorOptions,
+): Promise<HealthzResponse> {
+  const status = await soakStatusBody(pool, options);
+  const resourceLines = readLines(path.join(options.artifactDir, 'public-resource-metrics.jsonl'), 1);
+  const dbLines = readLines(path.join(options.artifactDir, 'public-db-stats.jsonl'), 1);
+  return {
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      status,
+      resource: resourceLines[0] === undefined ? null : JSON.parse(resourceLines[0]),
+      db: dbLines[0] === undefined ? null : JSON.parse(dbLines[0]),
+    }),
+  };
+}
+
+export async function soakSummaryResponse(
+  pool: PgPoolLike,
+  options: SoakMonitorOptions,
+): Promise<HealthzResponse> {
+  return soakStatusResponse(pool, options);
+}
+
+export function soakLogsResponse(req: IncomingMessage, options: SoakMonitorOptions): HealthzResponse {
+  const url = new URL(req.url ?? '/soak/logs', 'http://localhost');
+  const tail = Math.min(Math.max(Number.parseInt(url.searchParams.get('tail') ?? '100', 10), 1), 500);
+  const level = url.searchParams.get('level');
+  const format = url.searchParams.get('format') ?? 'json';
+  const lines = readLines(path.join(options.artifactDir, 'public-log-tail.jsonl'), tail)
+    .map((line) => sanitizeLogLine(line))
+    .filter((line) => {
+      if (level === null) return true;
+      try {
+        const parsed = JSON.parse(line) as { level?: unknown };
+        return parsed.level === level;
+      } catch {
+        return line.includes(`"level":"${level}"`) || line.includes(`level=${level}`);
+      }
+    });
+  return {
+    status: 200,
+    contentType: format === 'jsonl' ? 'application/x-ndjson' : 'application/json',
+    body: format === 'jsonl' ? `${lines.join('\n')}${lines.length > 0 ? '\n' : ''}` : JSON.stringify({ logs: lines }),
+  };
+}
+
+export function nodeSoakHandler(pool: PgPoolLike, options: SoakMonitorOptions): NodeHttpHandler {
+  return (req, res) => {
+    const pathname = (req.url ?? '/').split('?')[0] ?? '/';
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { allow: 'GET, HEAD' });
+      res.end();
+      return;
+    }
+    if (pathname === '/soak/events') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+      let closed = false;
+      req.on('close', () => {
+        closed = true;
+      });
+      const writeStatus = (): void => {
+        if (closed) return;
+        soakStatusBody(pool, options)
+          .then((body) => {
+            res.write(`event: soak_status\n`);
+            res.write(`data: ${JSON.stringify({ timestamp: new Date().toISOString(), ...body })}\n\n`);
+          })
+          .catch((err: unknown) => {
+            res.write(`event: error\n`);
+            res.write(`data: ${JSON.stringify({ timestamp: new Date().toISOString(), error: String(err) })}\n\n`);
+          });
+      };
+      writeStatus();
+      const timer = setInterval(writeStatus, 5000);
+      req.on('close', () => clearInterval(timer));
+      return;
+    }
+
+    const respond = (response: HealthzResponse): void => {
+      res.writeHead(response.status, { 'content-type': response.contentType });
+      res.end(req.method === 'HEAD' ? undefined : response.body);
+    };
+
+    if (pathname === '/soak/status') {
+      void soakStatusResponse(pool, options).then(respond);
+      return;
+    }
+    if (pathname === '/soak/metrics') {
+      void soakMetricsResponse(pool, options).then(respond);
+      return;
+    }
+    if (pathname === '/soak/summary') {
+      void soakSummaryResponse(pool, options).then(respond);
+      return;
+    }
+    if (pathname === '/soak/logs') {
+      respond(soakLogsResponse(req, options));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  };
+}
+
+// ---------------------------------------------------------------
 // HTTP routing
 // ---------------------------------------------------------------
 
@@ -359,6 +591,7 @@ export function createKasGraphHttpHandler(
   statusCheck?: HealthCheck,
   metricsCheck?: HealthCheck,
   options: HttpHandlerOptions = {},
+  soakHandler?: NodeHttpHandler,
 ): NodeHttpHandler {
   const buckets = new Map<string, RateLimitBucket>();
   return (req, res) => {
@@ -379,6 +612,10 @@ export function createKasGraphHttpHandler(
       (url === '/subgraphs' || url.startsWith('/subgraphs/') || url.startsWith('/subgraphs?'))
     ) {
       deployHandler(req, res);
+      return;
+    }
+    if (soakHandler !== undefined && (url === '/soak' || url.startsWith('/soak/'))) {
+      soakHandler(req, res);
       return;
     }
     if (pathMatches(url, '/healthz') || pathMatches(url, '/health')) {
@@ -471,6 +708,8 @@ export interface RunServerOptions {
   corsAllowedOrigins: string[];
   /** Simple per-IP HTTP request cap. 0 disables it. */
   rateLimitPerMinute: number;
+  /** Directory containing live public soak artifacts. */
+  soakArtifactDir: string;
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {
@@ -512,6 +751,9 @@ export function readOptionsFromEnv(): RunServerOptions {
       .map((s) => s.trim())
       .filter((s) => s.length > 0),
     rateLimitPerMinute: envInt('KASGRAPH_RATE_LIMIT_PER_MINUTE', 0),
+    soakArtifactDir:
+      process.env.KASGRAPH_SOAK_ARTIFACT_DIR ??
+      new URL('../../docs/artifacts/sustained-run/live', import.meta.url).pathname,
     ...(deployToken !== undefined && deployToken.length > 0 && { deployToken }),
     ...(network !== undefined && network.length > 0 && { network }),
   };
@@ -577,6 +819,12 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
       corsAllowedOrigins: options.corsAllowedOrigins,
       rateLimitPerMinute: options.rateLimitPerMinute,
     },
+    nodeSoakHandler(pool, {
+      environment: options.environment,
+      ...(options.network !== undefined && { network: options.network }),
+      version: options.version,
+      artifactDir: options.soakArtifactDir,
+    }),
   );
   const server = http.createServer(handler);
 

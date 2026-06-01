@@ -26,6 +26,8 @@ Values that are not available must stay `null`, `0`, or `"unavailable"` rather t
 
 For a persistent host, scrape `/metrics` with Prometheus-compatible tooling or a managed equivalent, configure uptime checks against `/healthz`, and keep detailed API/indexer logs behind authenticated provider access. The public website should consume only high-level `/status` output or reviewed artifacts.
 
+The live soak dashboard uses `/soak/status`, `/soak/events`, `/soak/logs`, `/soak/metrics`, and `/soak/summary`. See `docs/live-soak-dashboard.md` and `docs/sustained-run-operator-guide.md`.
+
 ## Required Alerts Before Production Claims
 
 - API down.

@@ -11,6 +11,7 @@ KASGRAPH_GRAPHQL_URL=http://127.0.0.1:4000/graphql \\
 bash scripts/soak/run-testnet-soak.sh`;
 
 const artifacts = [
+  ['Live dashboard', '/testnet-soak/live'],
   ['Soak plan', `${site.github}/blob/main/docs/testnet-soak-plan.md`],
   ['Soak report', `${site.github}/blob/main/docs/testnet-soak-report.md`],
   ['Artifact directory policy', `${site.github}/blob/main/docs/artifacts/testnet-soak/README.md`],

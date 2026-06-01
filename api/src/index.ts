@@ -81,6 +81,8 @@ export {
   type KasGraphServerOptions,
 } from './server.js';
 
+export { sanitizeLogLine, sanitizeLogText } from './log-sanitize.js';
+
 // Subscription source contract + in-memory impl.
 export {
   InMemorySubscriptionSource,
@@ -105,6 +107,11 @@ export {
   healthzResponse,
   operationalStatusResponse,
   metricsResponse,
+  nodeSoakHandler,
+  soakLogsResponse,
+  soakMetricsResponse,
+  soakStatusResponse,
+  soakSummaryResponse,
   readOptionsFromEnv,
   runKasGraphServer,
   type HealthzResponse,
@@ -112,6 +119,7 @@ export {
   type HttpHandlerOptions,
   type NodeHttpHandler,
   type OperationalStatusOptions,
+  type SoakMonitorOptions,
   type RunServerOptions,
   type RunningServer,
 } from './main.js';

@@ -148,6 +148,8 @@ The gateway / CLI deploy target accepts `--database-url` (direct) or `--node <ur
 
 Hosted API operators should expose only intended read routes publicly and keep write routes protected. Endpoint docs and production gates live in [`docs/hosted-api.md`](docs/hosted-api.md), [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md), [`docs/runbook.md`](docs/runbook.md), and [`docs/monitoring.md`](docs/monitoring.md).
 
+Live testnet soak monitoring is prepared through `/soak/status`, `/soak/metrics`, `/soak/events`, `/soak/logs`, and `/soak/summary`; see [`docs/live-soak-dashboard.md`](docs/live-soak-dashboard.md) and [`docs/sustained-run-operator-guide.md`](docs/sustained-run-operator-guide.md).
+
 Operational inspection commands:
 
 ```bash

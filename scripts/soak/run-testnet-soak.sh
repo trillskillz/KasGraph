@@ -68,6 +68,14 @@ while [[ "$(date +%s)" -lt "${end_epoch}" ]]; do
   bash scripts/soak/capture-poi.sh "${SOAK_ARTIFACT_DIR}" || true
   bash scripts/soak/capture-graphql-status.sh "${SOAK_ARTIFACT_DIR}" || true
   bash scripts/soak/capture-resource-metrics.sh "${SOAK_ARTIFACT_DIR}" || true
+  bash scripts/soak/capture-live-summary.sh || true
+  if [[ -f "${raw_indexer}" ]]; then
+    if command -v tsx >/dev/null 2>&1; then
+      tsx scripts/soak/sanitize-logs.ts "${raw_indexer}" "${SOAK_ARTIFACT_DIR}/public-log-tail.jsonl" || true
+    elif command -v npx >/dev/null 2>&1; then
+      npx --yes tsx scripts/soak/sanitize-logs.ts "${raw_indexer}" "${SOAK_ARTIFACT_DIR}/public-log-tail.jsonl" || true
+    fi
+  fi
   sleep "${SOAK_INTERVAL_SECONDS}"
 done
 

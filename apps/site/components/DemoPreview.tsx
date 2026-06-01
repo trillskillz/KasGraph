@@ -82,6 +82,9 @@ export function DemoPreview() {
           <Link className="rounded-md bg-[#49EACB] px-4 py-2 text-sm font-semibold text-[#021110]" href="/docs/tutorial">
             Run Locally
           </Link>
+          <Link className="rounded-md border border-[#49EACB]/35 px-4 py-2 text-sm font-semibold text-[#dffcf6]" href="/testnet-soak/live">
+            Live Soak
+          </Link>
         </div>
       </div>
       <div className="mb-5">

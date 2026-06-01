@@ -59,6 +59,7 @@ const operatorDocs: Array<[string, string]> = [
   ['Benchmark methodology', `${site.github}/blob/main/docs/benchmarks.md`],
   ['Benchmarks page', '/benchmarks'],
   ['Testnet soak page', '/testnet-soak'],
+  ['Live testnet soak', '/testnet-soak/live'],
   ['Sustained-run page', '/sustained-run'],
   ['Testnet soak plan', `${site.github}/blob/main/docs/testnet-soak-plan.md`],
   ['Testnet soak report template', `${site.github}/blob/main/docs/testnet-soak-report.md`],
