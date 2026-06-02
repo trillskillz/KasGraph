@@ -38,7 +38,7 @@ const groups: Array<[string, Array<[string, string, string]>]> = [
   [
     'Not production-ready yet',
     [
-      ['Testnet soak', 'Not production-ready', 'Sustained live testnet run is still required.'],
+      ['Testnet soak', 'Implemented', '24-hour live testnet soak completed with public logs and restart/recovery notes.'],
       ['Mainnet validation', 'Not production-ready', 'No mainnet readiness claim is made.'],
       ['Benchmarks', 'Pending measurement', 'Throughput, latency, storage, POI, streaming, and MCP metrics are pending.'],
     ],
