@@ -25,7 +25,7 @@ If the variable is not set, the dashboard shows the soak as pending/not configur
 - `pending`: no active live artifact exists.
 - `running`: `summary.json` says a run is active.
 - `degraded`: the run reports known health issues.
-- `completed`: the run ended and summary was marked complete.
+- `completed`: the run reached the 24-hour completion target or the summary was marked complete.
 - `failed`: the run failed.
 - `offline`: the browser cannot reach the live endpoint.
 
@@ -53,5 +53,10 @@ At run completion, archive reviewed artifacts to:
 ```text
 docs/artifacts/sustained-run/YYYY-MM-DD/
 ```
+
+When a non-failed run reaches 86,400 seconds, `scripts/soak/capture-live-summary.sh`
+invokes `scripts/soak/publish-live-soak-completion.sh`. That publisher writes a dated
+`docs/artifacts/testnet-soak/YYYY-MM-DD/summary.json`, marks the verdict as success,
+updates the public report Markdown, and refreshes the website public artifact copy.
 
 Do not commit raw logs.

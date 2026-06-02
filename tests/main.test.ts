@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   createKasGraphHttpHandler,
   createKasGraphServer,
@@ -9,6 +12,7 @@ import {
   nodeSoakHandler,
   operationalStatusResponse,
   readOptionsFromEnv,
+  soakStatusResponse,
   type HealthCheck,
   type PgPoolLike,
   type QueryResult,
@@ -142,6 +146,45 @@ describe('operational status and metrics responses', () => {
     expect(res.body).toContain('kasgraph_indexed_daa_score 467579632');
     expect(res.body).toContain('kasgraph_poi_checkpoints_total 7');
     expect(res.body).toContain('kasgraph_subgraphs_deployed 2');
+  });
+
+  it('marks a non-failed live soak complete after the 24-hour target', async () => {
+    const artifactDir = await mkdtemp(path.join(os.tmpdir(), 'kasgraph-soak-'));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-02T16:00:00Z'));
+    try {
+      await writeFile(
+        path.join(artifactDir, 'summary.json'),
+        JSON.stringify({
+          status: 'active',
+          startedAt: '2026-06-01T15:00:00Z',
+          daaStart: '1',
+        }),
+      );
+      const res = await soakStatusResponse(new OperationalStubPool(), {
+        environment: 'testnet',
+        network: 'kaspa-testnet-10',
+        version: '0.1.0',
+        artifactDir,
+      });
+      const body = JSON.parse(res.body) as {
+        status: string;
+        sourceStatus: string;
+        completionStatus: string;
+        targetReached: boolean;
+        targetDurationSeconds: number;
+        verdict: string;
+      };
+      expect(body.status).toBe('completed');
+      expect(body.sourceStatus).toBe('active');
+      expect(body.completionStatus).toBe('success');
+      expect(body.targetReached).toBe(true);
+      expect(body.targetDurationSeconds).toBe(86400);
+      expect(body.verdict).toContain('Success');
+    } finally {
+      vi.useRealTimers();
+      await rm(artifactDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -281,6 +324,37 @@ describe('createKasGraphHttpHandler routing', () => {
       const body = (await res.json()) as { status: string; indexedDaaScore: string };
       expect(body.status).toBe('pending');
       expect(body.indexedDaaScore).toBe('467579632');
+      expect(yoga.calls).toBe(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('serves the visual soak dashboard at / and /soak when soak monitoring is wired', async () => {
+    const yoga = newRecordingYoga();
+    const soakHandler = nodeSoakHandler(new OperationalStubPool(), {
+      environment: 'testnet',
+      network: 'kaspa-testnet-10',
+      version: '0.1.0',
+      artifactDir: '/tmp/no-such-kasgraph-soak',
+    });
+    const handler = createKasGraphHttpHandler(
+      yoga.handler,
+      newCheck({ status: 200, body: '{"status":"ok"}' }),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      soakHandler,
+    );
+    const srv = await listen(handler);
+    try {
+      for (const path of ['/', '/soak']) {
+        const res = await fetch(`${srv.base}${path}`);
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toContain('text/html');
+        expect(await res.text()).toContain('Testnet Soak Dashboard');
+      }
       expect(yoga.calls).toBe(0);
     } finally {
       await srv.close();

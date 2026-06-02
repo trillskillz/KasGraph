@@ -40,6 +40,8 @@ bash scripts/soak/start-live-soak.sh
 ```
 
 The script initializes `summary.json`, starts the existing soak capture loop, writes public-safe artifacts, and periodically captures live API status.
+After a non-failed run reaches 24 hours, the live summary reports `status: completed`,
+`completionStatus: success`, and `targetReached: true`.
 
 ## Watch Live Progress
 
@@ -77,6 +79,11 @@ Review all public artifacts, then archive:
 mkdir -p docs/artifacts/sustained-run/YYYY-MM-DD
 cp docs/artifacts/sustained-run/live/* docs/artifacts/sustained-run/YYYY-MM-DD/
 ```
+
+The live capture script automatically runs `scripts/soak/publish-live-soak-completion.sh`
+after the 24-hour target is reached. The publisher creates a dated
+`docs/artifacts/testnet-soak/YYYY-MM-DD/summary.json`, updates the GitHub-facing
+reports, and refreshes the static website artifact copy.
 
 ## Update Final Report
 

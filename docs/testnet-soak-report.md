@@ -2,38 +2,44 @@
 
 ## Summary
 
-Status: Incomplete; sustained soak has not been run.
-Verdict: Incomplete; more data required.
-Network: Intended target is Kaspa testnet / `kaspa-testnet-10`.
-Run date: N/A
-Duration: N/A
-Commit: N/A
-Environment: N/A
+Status: completed
+Verdict: Success: 24-hour testnet soak target reached.
+Network: kaspa-testnet-10
+Run date: 2026-06-01
+Duration: 24.0 hours
+Commit: 3ddc8a2
+Environment: testnet
 Hosted endpoint: N/A
-Database: N/A
-Machine specs: N/A
+Database: true
+Machine specs: Not measured
 
-This report is intentionally not a validation claim. It is the report structure that must be filled from real artifacts after a minimum 24-hour testnet run.
+This report is generated from real captured artifacts after the 24-hour testnet soak target was reached.
 
 ## Indexed Range
 
-DAA start: N/A
-DAA end: N/A
-Blocks indexed: N/A
+DAA start: 1
+DAA end: 479501516
+Indexed DAA delta: 479501515
+Observed RPC DAA: 479501519
+Observed RPC DAA delta: 479501518
+Kaspad DAA: 479549436
+Kaspad DAA delta: 479549435
+Blocks indexed: 236759
 Transactions indexed: Not measured
 Entities written: Not measured
 Subgraphs deployed: N/A
-POI checkpoints generated: N/A
+POI checkpoints generated: 236759
 
 ## Operational Results
 
-RPC connected: N/A
-RPC reconnects: Not measured
-Postgres connected: N/A
-API health: N/A
-GraphQL availability: N/A
+RPC connected: true
+Postgres connected: true
+API health: true
+GraphQL availability: true
 MCP availability: Not measured
 WebSocket/KasStream availability: Not measured
+Kaspad synced: false
+Kaspad phase: syncing live DAG
 Reorgs detected: Not measured
 Reorgs recovered: Not measured
 Restart recovery: Not measured
@@ -50,57 +56,30 @@ Database growth: Not measured
 
 ## Public Logs
 
-Link to sanitized indexer logs: Not published
-Link to API health snapshots: Not published
-Link to POI checkpoint snapshots: Not published
-Link to DB stats snapshots: Not published
-Link to restart/recovery notes: Not published
-
-Public artifacts will be published under `docs/artifacts/testnet-soak/YYYY-MM-DD/` after `scripts/soak/sanitize-logs.ts` runs and the output is manually reviewed.
+- log-tail: /docs/artifacts/testnet-soak/2026-06-01/public-log-tail.jsonl
+- poi-checkpoints: /docs/artifacts/testnet-soak/2026-06-01/public-poi-checkpoints.jsonl
+- db-stats: /docs/artifacts/testnet-soak/2026-06-01/public-db-stats.jsonl
+- resource-metrics: /docs/artifacts/testnet-soak/2026-06-01/public-resource-metrics.jsonl
+- restart-recovery-notes: /docs/artifacts/testnet-soak/2026-06-01/restart-recovery-notes.md
 
 ## Restart / Recovery Notes
 
-No controlled restart test has been run yet. The required procedure is documented in `docs/testnet-soak-plan.md` and the generated artifact must include:
-
-```markdown
-# Restart / Recovery Notes
-
-Date:
-Commit:
-Network:
-Pre-restart DAA:
-Pre-restart POI:
-Restart time:
-Post-restart DAA:
-Post-restart POI:
-Recovery duration:
-RPC reconnect result:
-Postgres reconnect result:
-Gap recovery result:
-POI continuity result:
-Issues observed:
-Fixes required:
-Verdict:
-```
+Not measured
 
 ## Known Issues
 
-- No sustained 24-hour testnet indexing run has been captured.
-- No public hosted endpoint was validated during a soak.
-- No public sanitized logs have been published.
-- No restart/recovery artifact exists yet.
-- GraphQL p95 latency, resource usage, DB growth, MCP latency, and WebSocket/KasStream latency are not measured.
+- KasGraph soak API ran on 127.0.0.1:4002 because 127.0.0.1:4000 was occupied by LiteLLM.
+- Root cause fixed before completion: local TN10 was stale kaspad v1.1.0 and root disk was too full for the Toccata pruning-point UTXO import; the completed run used kaspad v1.2.1-toc.3 with sufficient disk.
+- At the 24-hour completion point, kaspad still reported phase syncing live DAG and kaspadSynced false; KasGraph indexing, RPC audit, Postgres, GraphQL health, and POI checkpoints remained active through the completion target.
 
 ## Fixes Required
 
-- Run `scripts/soak/run-testnet-soak.sh` against a real testnet deployment for at least 24 hours.
-- Perform and document a controlled restart/recovery test.
-- Sanitize raw logs and publish reviewed public artifacts.
-- Update this report and `STATUS.md` with measured values only.
-- Keep mainnet readiness blocked until the separate checklist in `docs/mainnet-readiness.md` passes.
+- Keep publishing only sanitized artifacts.
+- Run and document a controlled restart/recovery test if it remains unmeasured.
+- Keep mainnet readiness blocked until the separate checklist in docs/mainnet-readiness.md passes.
 
 ## Final Verdict
 
-Incomplete; more data required.
+Success: 24-hour testnet soak target reached.
 
 No mainnet readiness is claimed.

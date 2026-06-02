@@ -63,6 +63,7 @@ const DEFAULT_SERVED_BY: &str = "bootstrap";
 const DEFAULT_PRIMARY_RPC_LABEL: &str = "primary";
 const DEFAULT_RPC_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_HEALTH_PROBE_INTERVAL_MS: u64 = 10_000;
+const DEFAULT_FINALITY_DEPTH: u64 = 86_400;
 
 // Eq is intentionally not derived: detector_hits.payload is a
 // serde_json::Value which only implements PartialEq.
@@ -125,6 +126,7 @@ struct NodeConfig {
     bootstrap_block: BootstrapBlock,
     ingest_mode: IngestMode,
     continuous: ContinuousConfig,
+    finality_depth: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +209,7 @@ struct IngestionState {
     committed: BTreeMap<i64, BootstrapBlock>,
     probabilistic: BTreeMap<i64, BootstrapBlock>,
     prior_poi: PoiHash,
+    finality_depth: Option<u64>,
 }
 
 impl IngestionState {
@@ -217,6 +220,13 @@ impl IngestionState {
     /// now-deleted block.
     fn reseed_prior_poi(&mut self, prior_poi: PoiHash) {
         self.prior_poi = prior_poi;
+    }
+
+    fn with_finality_depth(finality_depth: Option<u64>) -> Self {
+        Self {
+            finality_depth,
+            ..Self::default()
+        }
     }
 }
 
@@ -342,6 +352,7 @@ impl NodeConfig {
                     .map(|value| parse_csv_env(&value))
                     .unwrap_or_default(),
             },
+            finality_depth: parse_finality_depth(env::var("KASGRAPH_FINALITY_DEPTH").ok()),
             bootstrap_block: BootstrapBlock {
                 hash: env::var("KASGRAPH_BOOTSTRAP_BLOCK_HASH")
                     .unwrap_or_else(|_| DEFAULT_BLOCK_HASH.to_owned()),
@@ -440,7 +451,8 @@ async fn persist_bootstrap_state(database_url: &str, config: &NodeConfig) -> Res
     let work_dir = env::var("KASGRAPH_WORK_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("kasgraph-subgraphs"));
-    let mut runtimes = build_subgraph_runtimes(&store, &subgraph, &work_dir).await?;
+    let mut runtimes =
+        build_subgraph_runtimes(&store, &subgraph, &work_dir, config.finality_depth).await?;
 
     match config.ingest_mode {
         IngestMode::Bootstrap => {
@@ -617,7 +629,7 @@ async fn run_continuous_ingestion(
         let maybe_notification = tokio::select! {
             biased;
             _ = reload_interval.tick(), if reload_secs > 0 => {
-                match reconcile_subgraph_runtimes(store, runtimes, work_dir).await {
+                match reconcile_subgraph_runtimes(store, runtimes, work_dir, config.finality_depth).await {
                     Ok(delta) if delta.added > 0 || delta.removed > 0 => info!(
                         added = delta.added,
                         removed = delta.removed,
@@ -1396,8 +1408,9 @@ async fn make_subgraph_runtime(
     store: &Store,
     subgraph: SubgraphId,
     mapping: Option<mapping_host::LoadedMapping>,
+    finality_depth: Option<u64>,
 ) -> Result<SubgraphRuntime> {
-    let mut ingestion = IngestionState::default();
+    let mut ingestion = IngestionState::with_finality_depth(finality_depth);
     if let Some(checkpoint) = store
         .latest_poi_for_subgraph(&subgraph)
         .await
@@ -1426,6 +1439,7 @@ async fn build_subgraph_runtimes(
     store: &Store,
     configured: &SubgraphId,
     work_dir: &std::path::Path,
+    finality_depth: Option<u64>,
 ) -> Result<Vec<SubgraphRuntime>> {
     let deployments = store
         .list_subgraph_deployments()
@@ -1437,7 +1451,9 @@ async fn build_subgraph_runtimes(
     if !deployments.is_empty() {
         for dep in deployments {
             let mapping = load_deployment_mapping(&dep, work_dir)?;
-            runtimes.push(make_subgraph_runtime(store, dep.subgraph.clone(), mapping).await?);
+            runtimes.push(
+                make_subgraph_runtime(store, dep.subgraph.clone(), mapping, finality_depth).await?,
+            );
         }
         info!(
             subgraphs = runtimes.len(),
@@ -1472,7 +1488,7 @@ async fn build_subgraph_runtimes(
             }
         },
     };
-    runtimes.push(make_subgraph_runtime(store, configured.clone(), mapping).await?);
+    runtimes.push(make_subgraph_runtime(store, configured.clone(), mapping, finality_depth).await?);
     Ok(runtimes)
 }
 
@@ -1520,6 +1536,7 @@ async fn reconcile_subgraph_runtimes(
     store: &Store,
     runtimes: &mut Vec<SubgraphRuntime>,
     work_dir: &std::path::Path,
+    finality_depth: Option<u64>,
 ) -> Result<ReloadDelta> {
     let deployments = store
         .list_subgraph_deployments()
@@ -1546,7 +1563,9 @@ async fn reconcile_subgraph_runtimes(
             continue;
         }
         let mapping = load_deployment_mapping(dep, work_dir)?;
-        added.push(make_subgraph_runtime(store, dep.subgraph.clone(), mapping).await?);
+        added.push(
+            make_subgraph_runtime(store, dep.subgraph.clone(), mapping, finality_depth).await?,
+        );
     }
 
     // Now mutate: drop removed subgraphs, keep survivors (with their state),
@@ -1991,6 +2010,7 @@ impl IngestionState {
 
     fn apply_block(&mut self, block: BootstrapBlock) -> Result<IngestionTransition> {
         let mut rolled_back_probabilistic = Vec::new();
+        let finalized_cutoff = self.derived_finalized_cutoff(block.daa_score);
 
         if let Some(existing) = self.committed.get(&block.daa_score) {
             if existing.hash == block.hash {
@@ -2027,7 +2047,11 @@ impl IngestionState {
             }
         }
 
-        if !block.is_finalized {
+        let mut block = block;
+        if finalized_cutoff.is_some_and(|cutoff| block.daa_score <= cutoff) {
+            block.is_finalized = true;
+        }
+        if !block.is_finalized && finalized_cutoff.is_none() {
             self.probabilistic.insert(block.daa_score, block);
             return Ok(IngestionTransition {
                 committed_writes: Vec::new(),
@@ -2038,6 +2062,13 @@ impl IngestionState {
         }
 
         self.probabilistic.insert(block.daa_score, block);
+        if let Some(cutoff) = finalized_cutoff {
+            for probabilistic in self.probabilistic.values_mut() {
+                if probabilistic.daa_score <= cutoff {
+                    probabilistic.is_finalized = true;
+                }
+            }
+        }
 
         let promotable_scores: Vec<i64> = self
             .probabilistic
@@ -2116,6 +2147,11 @@ impl IngestionState {
             .filter_map(|(score, block)| block.is_finalized.then_some(*score))
             .max()
             .unwrap_or_default()
+    }
+
+    fn derived_finalized_cutoff(&self, observed_daa: i64) -> Option<i64> {
+        let finality_depth = i64::try_from(self.finality_depth?).ok()?;
+        Some(observed_daa.saturating_sub(finality_depth))
     }
 
     fn recovery_anchor_hash(&self, from_daa: u64) -> Option<String> {
@@ -2261,6 +2297,14 @@ fn parse_recovery_range(value: Option<&str>) -> Option<(u64, u64)> {
     Some((from.trim().parse().ok()?, to.trim().parse().ok()?))
 }
 
+fn parse_finality_depth(value: Option<String>) -> Option<u64> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Some(DEFAULT_FINALITY_DEPTH),
+        Some("off" | "none" | "disabled" | "false" | "0") => None,
+        Some(raw) => raw.parse().ok(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2380,6 +2424,21 @@ mod tests {
         assert_eq!(second.committed_writes.len(), 2);
         assert_eq!(state.committed.len(), 2);
         assert!(state.probabilistic.is_empty());
+    }
+
+    #[test]
+    fn configured_finality_depth_promotes_buffered_live_blocks() {
+        let mut state = IngestionState::with_finality_depth(Some(2));
+        let first = state.apply_block(block("a", 10, false)).unwrap();
+        let second = state.apply_block(block("b", 11, false)).unwrap();
+        let third = state.apply_block(block("c", 12, false)).unwrap();
+
+        assert!(first.committed_writes.is_empty());
+        assert!(second.committed_writes.is_empty());
+        assert_eq!(third.committed_writes.len(), 1);
+        assert_eq!(third.committed_writes[0].block.hash, "a");
+        assert_eq!(state.committed.len(), 1);
+        assert_eq!(state.probabilistic.len(), 2);
     }
 
     #[test]
@@ -2878,6 +2937,7 @@ mod tests {
             },
             ingest_mode: IngestMode::default(),
             continuous: ContinuousConfig::default(),
+            finality_depth: None,
         };
 
         assert_eq!(config.subgraph, "kasgraph_scaffold");
@@ -2990,6 +3050,7 @@ mod tests {
             bootstrap_block: block("bootstrap", 1, true),
             ingest_mode: IngestMode::Continuous,
             continuous: ContinuousConfig::default(),
+            finality_depth: None,
         };
         config.continuous.ws_url = None;
 
@@ -3017,6 +3078,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_finality_depth_defaults_and_allows_disable() {
+        assert_eq!(parse_finality_depth(None), Some(DEFAULT_FINALITY_DEPTH));
+        assert_eq!(parse_finality_depth(Some("128".to_owned())), Some(128));
+        assert_eq!(parse_finality_depth(Some("off".to_owned())), None);
+    }
+
+    #[test]
     fn build_notifications_prefers_jsonl_stream_when_present() {
         let config = NodeConfig {
             database_url: None,
@@ -3038,6 +3106,7 @@ mod tests {
             bootstrap_block: block("bootstrap", 1, true),
             ingest_mode: IngestMode::default(),
             continuous: ContinuousConfig::default(),
+            finality_depth: None,
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -3324,7 +3393,7 @@ mod integration_pg_persist {
         ));
 
         // Start with only sg_a live, carrying a distinctive in-flight POI.
-        let mut a_rt = make_subgraph_runtime(&store, sg_a.clone(), None)
+        let mut a_rt = make_subgraph_runtime(&store, sg_a.clone(), None, None)
             .await
             .unwrap();
         a_rt.ingestion.reseed_prior_poi([9u8; 32]);
@@ -3332,7 +3401,7 @@ mod integration_pg_persist {
 
         // Reconcile against the registry → sg_b is added, sg_a is kept with its
         // POI state intact.
-        let delta = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir)
+        let delta = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3357,7 +3426,7 @@ mod integration_pg_persist {
         );
 
         // A second reconcile with no registry change is a no-op.
-        let delta2 = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir)
+        let delta2 = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir, None)
             .await
             .unwrap();
         assert_eq!(delta2, ReloadDelta::default());
@@ -3365,7 +3434,7 @@ mod integration_pg_persist {
 
         // Remove sg_b → reconcile drops it.
         assert!(store.set_subgraph_removed(&sg_b).await.unwrap());
-        let delta3 = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir)
+        let delta3 = reconcile_subgraph_runtimes(&store, &mut runtimes, &work_dir, None)
             .await
             .unwrap();
         assert_eq!(

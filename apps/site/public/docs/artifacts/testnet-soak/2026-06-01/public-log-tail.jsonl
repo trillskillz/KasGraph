@@ -1,0 +1,15 @@
+Starting indexer: cargo run -p kasgraph-node
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running `target/debug/kasgraph-node`
+2026-06-01T15:03:11.439453Z  INFO kasgraph_node: kasgraph-node bootstrap version="0.1.0" config=NodeConfig { database_url:[REDACTED], subgraph: "kasgraph_scaffold", block_hashes: ["scaffold-block-0001"], rpc: Some(RpcConfig { primary_url: "ws://[REDACTED].1:18210", primary_label: "primary", timeout_ms: 1500, health_probe_interval_ms: 10000, backup_urls: [] }), recovery: RecoveryConfig { removed_block_hashes: [], recovery_block_hashes: [], recovery_range: None }, notification_stream: Some(NotificationStreamConfig { jsonl: None, ws_url: Some("ws://[REDACTED].1:18210"), served_by: "stream", max_messages: 64, idle_timeout_ms: 0 }), bootstrap_block: BootstrapBlock { hash: "scaffold-block-0001", daa_score: 1, blue_score: 1, served_by: "bootstrap", is_finalized: true, canonical_entity_bytes: [115, 99, 97, 102, 102, 111, 108, 100, 45, 101, 110, 116, 105, 116, 121, 45, 115, 116, 97, 116, 101], outputs: [], inputs: [], detector_hits: [] }, ingest_mode: Continuous, continuous: ContinuousConfig { ws_url: Some("ws://[REDACTED].1:18210"), served_by: "wrpc", max_messages: 0, channel_capacity: 64, backoff_initial_ms: 500, backoff_max_ms: 30000, backoff_multiplier: 2.0, backoff_max_attempts: 0, gap_recovery_block_hashes: [] } }
+2026-06-01T15:03:11.439575Z  INFO kasgraph_node: crates wired: rpc, store, detectors, mapping, poi, stream
+2026-06-01T15:03:11.481476Z  INFO sqlx::postgres::notice: relation "_sqlx_migrations" already exists, skipping
+2026-06-01T15:03:11.530697Z  INFO sqlx::postgres::notice: schema "kasgraph_scaffold" already exists, skipping
+2026-06-01T15:03:11.531484Z  INFO sqlx::postgres::notice: relation "entity_versions" already exists, skipping
+2026-06-01T15:03:11.532147Z  INFO sqlx::postgres::notice: relation "covenant_utxos" already exists, skipping
+2026-06-01T15:03:11.532807Z  INFO sqlx::postgres::notice: relation "covenant_spends" already exists, skipping
+2026-06-01T15:03:11.584738Z  INFO kasgraph_node: KasStream hub initialized; detector hits will be published to in-process subscribers capacity=1024
+2026-06-01T15:03:11.591042Z  INFO kasgraph_node: no deployed mapping in the registry and KASGRAPH_SUBGRAPH_DIR not set; skipping WASM mapping dispatch
+2026-06-01T15:03:11.593458Z  INFO kasgraph_node: re-anchored ingestion POI chain from existing checkpoint subgraph="kasgraph_scaffold" resumed_from_daa=1 prior_poi="4e6c1f54cf906038b071dcf6d595755eca10ee7e3353ac060279655be1cc901b"
+2026-06-01T15:03:11.595638Z  WARN kasgraph_node: live RPC capability probe succeeded but endpoint is not fully synced endpoint="primary" server_version="1.1.0" network_id="testnet-10"
+2026-06-01T15:03:11.595728Z  INFO kasgraph_node: continuous wRPC ingestion started ws_url=ws://[REDACTED].1:18210 served_by="wrpc" channel_capacity=64 max_messages=0

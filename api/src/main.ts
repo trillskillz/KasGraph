@@ -70,6 +70,11 @@ interface CommittedBlockStatsRow {
   indexed_blocks: string;
 }
 
+interface RpcAuditStatsRow {
+  observed_daa_score: string | null;
+  observed_blocks: string;
+}
+
 interface PoiStatsRow {
   latest_poi_checkpoint: Buffer | string | null;
   poi_checkpoints_total: string;
@@ -147,6 +152,17 @@ async function committedBlockStats(pool: PgPoolLike): Promise<CommittedBlockStat
   return row ?? { indexed_daa_score: null, indexed_blocks: '0' };
 }
 
+async function rpcAuditStats(pool: PgPoolLike): Promise<RpcAuditStatsRow> {
+  const row = await optionalQueryFirst<RpcAuditStatsRow>(
+    pool,
+    `SELECT
+       MAX(daa_score)::text AS observed_daa_score,
+       COUNT(*)::text AS observed_blocks
+     FROM kasgraph_rpc_block_audit`,
+  );
+  return row ?? { observed_daa_score: null, observed_blocks: '0' };
+}
+
 async function poiStats(pool: PgPoolLike): Promise<PoiStatsRow> {
   const row = await optionalQueryFirst<PoiStatsRow>(
     pool,
@@ -178,10 +194,11 @@ export async function operationalStatusResponse(
   options: OperationalStatusOptions,
 ): Promise<HealthzResponse> {
   const connected = await postgresConnected(pool);
-  const [blocks, poi, subgraphs] = connected
-    ? await Promise.all([committedBlockStats(pool), poiStats(pool), subgraphStats(pool)])
+  const [blocks, audit, poi, subgraphs] = connected
+    ? await Promise.all([committedBlockStats(pool), rpcAuditStats(pool), poiStats(pool), subgraphStats(pool)])
     : [
         { indexed_daa_score: null, indexed_blocks: '0' },
+        { observed_daa_score: null, observed_blocks: '0' },
         { latest_poi_checkpoint: null, poi_checkpoints_total: '0' },
         { subgraphs_deployed: '0' },
       ];
@@ -195,6 +212,8 @@ export async function operationalStatusResponse(
       network: options.network ?? null,
       indexedDaaScore: blocks.indexed_daa_score,
       indexedBlocks: asNumber(blocks.indexed_blocks),
+      observedDaaScore: audit.observed_daa_score,
+      observedBlocks: asNumber(audit.observed_blocks),
       rpcConnected: 'unavailable',
       postgresConnected: connected,
       latestPoiCheckpoint: hexValue(poi.latest_poi_checkpoint),
@@ -213,10 +232,11 @@ export async function operationalStatusResponse(
  */
 export async function metricsResponse(pool: PgPoolLike): Promise<HealthzResponse> {
   const connected = await postgresConnected(pool);
-  const [blocks, poi, subgraphs] = connected
-    ? await Promise.all([committedBlockStats(pool), poiStats(pool), subgraphStats(pool)])
+  const [blocks, audit, poi, subgraphs] = connected
+    ? await Promise.all([committedBlockStats(pool), rpcAuditStats(pool), poiStats(pool), subgraphStats(pool)])
     : [
         { indexed_daa_score: null, indexed_blocks: '0' },
+        { observed_daa_score: null, observed_blocks: '0' },
         { latest_poi_checkpoint: null, poi_checkpoints_total: '0' },
         { subgraphs_deployed: '0' },
       ];
@@ -231,6 +251,12 @@ export async function metricsResponse(pool: PgPoolLike): Promise<HealthzResponse
     '# HELP kasgraph_indexed_daa_score Highest committed DAA score visible to the API.',
     '# TYPE kasgraph_indexed_daa_score gauge',
     `kasgraph_indexed_daa_score ${asNumber(blocks.indexed_daa_score) ?? 0}`,
+    '# HELP kasgraph_observed_blocks_total RPC block audit rows received by the indexer.',
+    '# TYPE kasgraph_observed_blocks_total gauge',
+    `kasgraph_observed_blocks_total ${asNumber(audit.observed_blocks) ?? 0}`,
+    '# HELP kasgraph_observed_daa_score Highest RPC block DAA observed by the indexer.',
+    '# TYPE kasgraph_observed_daa_score gauge',
+    `kasgraph_observed_daa_score ${asNumber(audit.observed_daa_score) ?? 0}`,
     '# HELP kasgraph_poi_checkpoints_total POI checkpoint rows visible to the API.',
     '# TYPE kasgraph_poi_checkpoints_total gauge',
     `kasgraph_poi_checkpoints_total ${asNumber(poi.poi_checkpoints_total) ?? 0}`,
@@ -254,9 +280,11 @@ export async function metricsResponse(pool: PgPoolLike): Promise<HealthzResponse
 
 export interface SoakMonitorOptions extends OperationalStatusOptions {
   artifactDir: string;
+  kaspadRpcUrl?: string;
 }
 
-type SoakStatusValue = 'pending' | 'running' | 'degraded' | 'completed' | 'failed' | 'offline';
+type SoakStatusValue = 'pending' | 'active' | 'running' | 'degraded' | 'completed' | 'failed' | 'offline';
+const SOAK_COMPLETION_TARGET_SECONDS = 24 * 60 * 60;
 
 interface SoakSummaryFile {
   status?: SoakStatusValue;
@@ -276,6 +304,27 @@ interface SoakSummaryFile {
   websocketHealthy?: boolean | null;
   knownIssues?: string[];
   restartRecovery?: string | null;
+}
+
+interface KaspadStatus {
+  connected: boolean;
+  serverVersion: string | null;
+  isSynced: boolean | null;
+  virtualDaaScore: string | null;
+  networkId: string | null;
+  phase: string | null;
+  blockCount: string | null;
+  headerCount: string | null;
+  pruningPointHash: string | null;
+  sinkHash: string | null;
+  tipCount: number | null;
+  virtualParentCount: number | null;
+  peerCount: number | null;
+  ibdPeerCount: number | null;
+  protocolVersion10Peers: number | null;
+  protocolVersion9Peers: number | null;
+  lastPingMsMax: number | null;
+  error?: string;
 }
 
 function readJsonFile<T>(filePath: string): T | null {
@@ -310,43 +359,247 @@ function delta(start: string | number | null | undefined, current: string | null
   }
 }
 
+function soakElapsedSeconds(startedAt: string | null, fallback: number | undefined): number | null {
+  if (startedAt === null) return null;
+  const parsed = Date.parse(startedAt);
+  if (!Number.isFinite(parsed)) return fallback ?? null;
+  return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+}
+
+function soakTargetReachedAt(startedAt: string | null): string | null {
+  if (startedAt === null) return null;
+  const parsed = Date.parse(startedAt);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed + SOAK_COMPLETION_TARGET_SECONDS * 1000).toISOString();
+}
+
+type KaspadRpcBody = Record<string, unknown>;
+
+function emptyKaspadStatus(error?: string): KaspadStatus {
+  return {
+    connected: false,
+    serverVersion: null,
+    isSynced: null,
+    virtualDaaScore: null,
+    networkId: null,
+    phase: null,
+    blockCount: null,
+    headerCount: null,
+    pruningPointHash: null,
+    sinkHash: null,
+    tipCount: null,
+    virtualParentCount: null,
+    peerCount: null,
+    ibdPeerCount: null,
+    protocolVersion10Peers: null,
+    protocolVersion9Peers: null,
+    lastPingMsMax: null,
+    ...(error !== undefined && { error }),
+  };
+}
+
+function stringField(body: KaspadRpcBody | null, field: string): string | null {
+  const value = body?.[field];
+  return value === undefined || value === null ? null : String(value);
+}
+
+function booleanField(body: KaspadRpcBody | null, field: string): boolean | null {
+  const value = body?.[field];
+  return typeof value === 'boolean' ? value : null;
+}
+
+function arrayLengthField(body: KaspadRpcBody | null, field: string): number | null {
+  const value = body?.[field];
+  return Array.isArray(value) ? value.length : null;
+}
+
+async function kaspadRpcCall(rpcUrl: string, method: string, timeoutMs = 2500): Promise<KaspadRpcBody> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(rpcUrl);
+    const timeout = setTimeout(() => {
+      try {
+        ws.close();
+      } catch {
+        // Ignore close failures during timeout cleanup.
+      }
+      reject(new Error(`${method} timeout`));
+    }, timeoutMs);
+
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        ws.close();
+      } catch {
+        // The socket may already be closed.
+      }
+      fn();
+    };
+
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ id: 1, method, params: {} }));
+    });
+    ws.addEventListener('message', (event) => {
+      finish(() => {
+        try {
+          const payload = JSON.parse(String(event.data)) as {
+            params?: KaspadRpcBody;
+            result?: KaspadRpcBody;
+            error?: unknown;
+          };
+          const body = payload.params ?? payload.result;
+          if (body === undefined) {
+            reject(new Error(payload.error === undefined ? `${method} empty RPC response` : String(payload.error)));
+            return;
+          }
+          resolve(body);
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+    });
+    ws.addEventListener('error', () => {
+      finish(() => reject(new Error(`${method} connection error`)));
+    });
+  });
+}
+
+function kaspadPhase(server: KaspadRpcBody | null, dag: KaspadRpcBody | null): string | null {
+  const isSynced = booleanField(server, 'isSynced');
+  const daa = stringField(server, 'virtualDaaScore') ?? stringField(dag, 'virtualDaaScore');
+  const blockCount = stringField(dag, 'blockCount');
+  const headerCount = stringField(dag, 'headerCount');
+  if (isSynced === true) return 'synced';
+  if (daa === '0' && blockCount === '0' && headerCount !== null && headerCount !== '0') {
+    return 'pruning point / UTXO import';
+  }
+  if (daa === '0') return 'initial block download';
+  return 'syncing live DAG';
+}
+
+async function kaspadStatus(rpcUrl: string | undefined): Promise<KaspadStatus | null> {
+  if (rpcUrl === undefined || rpcUrl.length === 0 || typeof WebSocket === 'undefined') return null;
+
+  try {
+    const [server, dag, peers] = await Promise.all([
+      kaspadRpcCall(rpcUrl, 'getServerInfo'),
+      kaspadRpcCall(rpcUrl, 'getBlockDagInfo'),
+      kaspadRpcCall(rpcUrl, 'getConnectedPeerInfo').catch(() => null),
+    ]);
+    const peerInfo = peers?.peerInfo;
+    const peerRows = Array.isArray(peerInfo) ? (peerInfo as Array<Record<string, unknown>>) : [];
+    const lastPingMs = peerRows
+      .map((peer) => Number(peer.last_ping_duration))
+      .filter((value) => Number.isFinite(value));
+    const serverDaa = stringField(server, 'virtualDaaScore');
+    const dagDaa = stringField(dag, 'virtualDaaScore');
+
+    return {
+      connected: true,
+      serverVersion: stringField(server, 'serverVersion'),
+      isSynced: booleanField(server, 'isSynced'),
+      virtualDaaScore: serverDaa ?? dagDaa,
+      networkId: stringField(server, 'networkId') ?? stringField(dag, 'network'),
+      phase: kaspadPhase(server, dag),
+      blockCount: stringField(dag, 'blockCount'),
+      headerCount: stringField(dag, 'headerCount'),
+      pruningPointHash: stringField(dag, 'pruningPointHash'),
+      sinkHash: stringField(dag, 'sink'),
+      tipCount: arrayLengthField(dag, 'tipHashes'),
+      virtualParentCount: arrayLengthField(dag, 'virtualParentHashes'),
+      peerCount: peerRows.length,
+      ibdPeerCount: peerRows.filter((peer) => peer.is_ibd_peer === true).length,
+      protocolVersion10Peers: peerRows.filter((peer) => peer.advertised_protocol_version === 10).length,
+      protocolVersion9Peers: peerRows.filter((peer) => peer.advertised_protocol_version === 9).length,
+      lastPingMsMax: lastPingMs.length === 0 ? null : Math.max(...lastPingMs),
+    };
+  } catch (err) {
+    return emptyKaspadStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function soakStatusBody(
   pool: PgPoolLike,
   options: SoakMonitorOptions,
 ): Promise<Record<string, unknown>> {
   const summary = readJsonFile<SoakSummaryFile>(path.join(options.artifactDir, 'summary.json'));
   const connected = await postgresConnected(pool);
-  const [blocks, poi] = connected
-    ? await Promise.all([committedBlockStats(pool), poiStats(pool)])
+  const [blocks, audit, poi] = connected
+    ? await Promise.all([committedBlockStats(pool), rpcAuditStats(pool), poiStats(pool)])
     : [
         { indexed_daa_score: null, indexed_blocks: '0' },
+        { observed_daa_score: null, observed_blocks: '0' },
         { latest_poi_checkpoint: null, poi_checkpoints_total: '0' },
       ];
+  const kaspad = await kaspadStatus(options.kaspadRpcUrl);
   const updatedAt = new Date().toISOString();
   const startedAt = summary?.startedAt ?? null;
+  const sourceStatus: SoakStatusValue = summary?.status ?? 'pending';
+  const isActiveRun = sourceStatus === 'active' || sourceStatus === 'running' || sourceStatus === 'degraded';
   const durationSeconds =
-    summary?.durationSeconds ??
-    (startedAt === null ? null : Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000)));
-  const status: SoakStatusValue = summary?.status ?? 'pending';
+    isActiveRun ? soakElapsedSeconds(startedAt, summary?.durationSeconds) : (summary?.durationSeconds ?? soakElapsedSeconds(startedAt, undefined));
+  const indexedDaaDelta = delta(summary?.daaStart, blocks.indexed_daa_score);
+  const observedRpcDaaDelta = delta(summary?.daaStart, audit.observed_daa_score);
+  const kaspadDaaDelta = delta(summary?.daaStart, kaspad?.virtualDaaScore ?? null);
+  const targetReached = sourceStatus !== 'failed' && (durationSeconds ?? 0) >= SOAK_COMPLETION_TARGET_SECONDS;
+  const status: SoakStatusValue = targetReached ? 'completed' : sourceStatus;
+  const completionStatus = targetReached ? 'success' : sourceStatus === 'failed' ? 'failed' : 'in_progress';
+  const verdict = targetReached
+    ? 'Success: 24-hour testnet soak target reached.'
+    : sourceStatus === 'failed'
+      ? 'Failed: soak run did not complete successfully.'
+      : 'Incomplete: 24-hour testnet soak target has not been reached.';
 
   return {
     status,
+    sourceStatus,
+    completionStatus,
+    verdict,
+    targetDurationSeconds: SOAK_COMPLETION_TARGET_SECONDS,
+    targetReached,
     environment: summary?.environment ?? options.environment,
     network: summary?.network ?? options.network ?? null,
     startedAt,
-    updatedAt: summary?.updatedAt ?? updatedAt,
+    endedAt: targetReached ? (summary?.updatedAt ?? soakTargetReachedAt(startedAt) ?? updatedAt) : null,
+    targetReachedAt: targetReached ? soakTargetReachedAt(startedAt) : null,
+    updatedAt: isActiveRun ? updatedAt : (summary?.updatedAt ?? updatedAt),
     durationSeconds,
     commit: summary?.commit ?? null,
     version: summary?.version ?? options.version,
     indexedDaaScore: blocks.indexed_daa_score,
     daaStart: summary?.daaStart ?? null,
-    daaDelta: delta(summary?.daaStart, blocks.indexed_daa_score),
+    daaDelta: indexedDaaDelta,
+    indexedDaaDelta,
     indexedBlocks: asNumber(blocks.indexed_blocks),
+    observedDaaScore: audit.observed_daa_score,
+    observedRpcDaaDelta,
+    observedBlocks: asNumber(audit.observed_blocks),
+    kaspadConnected: kaspad?.connected ?? null,
+    kaspadVersion: kaspad?.serverVersion ?? null,
+    kaspadSynced: kaspad?.isSynced ?? null,
+    kaspadDaaScore: kaspad?.virtualDaaScore ?? null,
+    kaspadDaaDelta,
+    kaspadNetworkId: kaspad?.networkId ?? null,
+    kaspadPhase: kaspad?.phase ?? null,
+    kaspadBlockCount: kaspad?.blockCount ?? null,
+    kaspadHeaderCount: kaspad?.headerCount ?? null,
+    kaspadPruningPointHash: kaspad?.pruningPointHash ?? null,
+    kaspadSinkHash: kaspad?.sinkHash ?? null,
+    kaspadTipCount: kaspad?.tipCount ?? null,
+    kaspadVirtualParentCount: kaspad?.virtualParentCount ?? null,
+    kaspadPeerCount: kaspad?.peerCount ?? null,
+    kaspadIbdPeerCount: kaspad?.ibdPeerCount ?? null,
+    kaspadProtocolVersion10Peers: kaspad?.protocolVersion10Peers ?? null,
+    kaspadProtocolVersion9Peers: kaspad?.protocolVersion9Peers ?? null,
+    kaspadLastPingMsMax: kaspad?.lastPingMsMax ?? null,
+    kaspadError: kaspad?.error ?? null,
     transactionsIndexed: summary?.transactionsIndexed ?? null,
     entitiesWritten: summary?.entitiesWritten ?? null,
     latestPoiCheckpoint: hexValue(poi.latest_poi_checkpoint),
     poiCheckpointsTotal: asNumber(poi.poi_checkpoints_total),
-    rpcConnected: summary?.rpcConnected ?? null,
+    rpcConnected: summary?.rpcConnected ?? kaspad?.connected ?? null,
     postgresConnected: connected,
     graphqlHealthy: summary?.graphqlHealthy ?? null,
     mcpHealthy: summary?.mcpHealthy ?? null,
@@ -390,6 +643,243 @@ export async function soakSummaryResponse(
   options: SoakMonitorOptions,
 ): Promise<HealthzResponse> {
   return soakStatusResponse(pool, options);
+}
+
+function soakDashboardResponse(): HealthzResponse {
+  return {
+    status: 200,
+    contentType: 'text/html; charset=utf-8',
+    body: `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KasGraph Live Soak</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #06110f;
+      --panel: #0b1a17;
+      --line: rgba(112, 199, 186, 0.22);
+      --text: #eefefa;
+      --muted: #9bb3ae;
+      --accent: #49eacb;
+      --warn: #f7c66a;
+      --bad: #ff7b7b;
+      --ok: #66e6a3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top left, rgba(73, 234, 203, 0.12), transparent 34rem), var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 48px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
+    h1 { margin: 0; font-size: clamp(2rem, 4vw, 4rem); letter-spacing: -0.03em; }
+    p { color: var(--muted); line-height: 1.6; }
+    a { color: var(--accent); }
+    .eyebrow, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .eyebrow { color: var(--accent); text-transform: uppercase; font-size: 12px; letter-spacing: 0.22em; margin-bottom: 12px; }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; color: var(--accent); white-space: nowrap; }
+    .grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .panel, .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(11, 26, 23, 0.78);
+      box-shadow: 0 20px 70px rgba(0, 0, 0, 0.24);
+    }
+    .panel { padding: 20px; margin-top: 16px; }
+    .card { padding: 16px; min-height: 92px; }
+    .label { color: #70c7ba; text-transform: uppercase; font-size: 11px; letter-spacing: 0.16em; }
+    .value { margin-top: 10px; overflow-wrap: anywhere; font-size: 15px; }
+    .value.big { font-size: 22px; font-weight: 700; }
+    .status-ok, .status-active, .status-begun { color: var(--ok); }
+    .status-degraded { color: var(--warn); }
+    .status-offline, .status-failed { color: var(--bad); }
+    .bar { height: 10px; background: rgba(0, 0, 0, 0.38); border-radius: 999px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0%; background: var(--accent); transition: width 250ms ease; }
+    pre {
+      margin: 0;
+      max-height: 380px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #d8fff7;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .two { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 16px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    button {
+      border: 1px solid rgba(73, 234, 203, 0.38);
+      color: var(--text);
+      background: rgba(0, 0, 0, 0.28);
+      border-radius: 6px;
+      padding: 9px 12px;
+      cursor: pointer;
+    }
+    @media (max-width: 920px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .two { grid-template-columns: 1fr; } header { flex-direction: column; } }
+    @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } main { width: min(100% - 20px, 1180px); } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="eyebrow">kasgraph live soak</div>
+        <h1>Testnet Soak Dashboard</h1>
+        <p>Local operator view served directly by the KasGraph API. It refreshes from <span class="mono">/soak/status</span> and streams <span class="mono">/soak/events</span> when available.</p>
+      </div>
+      <div class="pill mono" id="connection">connecting</div>
+    </header>
+
+    <section class="grid" id="cards"></section>
+
+    <section class="panel">
+      <div class="label">24h soak progress</div>
+      <div class="bar" style="margin-top: 14px"><div id="progress"></div></div>
+      <p id="progressText">Waiting for status...</p>
+      <div class="actions">
+        <button type="button" id="refresh">Refresh now</button>
+        <a href="/soak/status">JSON status</a>
+        <a href="/status">API status</a>
+        <a href="/graphql">GraphQL</a>
+        <a href="/metrics">Metrics</a>
+      </div>
+    </section>
+
+    <section class="two">
+      <div class="panel">
+        <div class="label">sanitized logs</div>
+        <pre id="logs">Loading logs...</pre>
+      </div>
+      <div class="panel">
+        <div class="label">known issues</div>
+        <pre id="issues">Loading issues...</pre>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const cards = document.getElementById('cards');
+    const progress = document.getElementById('progress');
+    const progressText = document.getElementById('progressText');
+    const connection = document.getElementById('connection');
+    const logs = document.getElementById('logs');
+    const issues = document.getElementById('issues');
+    const refresh = document.getElementById('refresh');
+    const runtimeTarget = 24 * 60 * 60;
+
+    function value(v, fallback = 'Unavailable') {
+      if (v === null || v === undefined || v === '') return fallback;
+      return String(v);
+    }
+
+    function duration(seconds) {
+      if (seconds === null || seconds === undefined) return 'Unavailable';
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      return h + 'h ' + m + 'm';
+    }
+
+    function card(label, val, big = false, className = '') {
+      return '<article class="card"><div class="label">' + label + '</div><div class="value ' + (big ? 'big ' : '') + className + '">' + value(val) + '</div></article>';
+    }
+
+    function syncedAndMoving(s) {
+      const delta = Number(s.daaDelta);
+      return s.status === 'active' && (s.kaspadSynced === true || delta > 0);
+    }
+
+    function displayStatus(s) {
+      if (s.targetReached === true || s.status === 'completed') return 'completed';
+      return syncedAndMoving(s) ? 'begun' : s.status;
+    }
+
+    function renderStatus(s) {
+      const shownStatus = displayStatus(s);
+      const statusClass = 'status-' + value(shownStatus, 'pending');
+      cards.innerHTML = [
+        card('Soak status', shownStatus, true, statusClass),
+        card('Completion', s.completionStatus),
+        card('Verdict', s.verdict),
+        card('Network', s.network),
+        card('Runtime', duration(s.durationSeconds)),
+        card('Indexed DAA', s.indexedDaaScore),
+        card('Indexed DAA delta', s.indexedDaaDelta ?? s.daaDelta),
+        card('Indexed blocks', s.indexedBlocks),
+        card('Observed RPC DAA', s.observedDaaScore),
+        card('Observed RPC DAA delta', s.observedRpcDaaDelta),
+        card('Observed RPC blocks', s.observedBlocks),
+        card('Kaspad version', s.kaspadVersion),
+        card('Kaspad synced', s.kaspadSynced),
+        card('Kaspad DAA', s.kaspadDaaScore),
+        card('Kaspad DAA delta', s.kaspadDaaDelta),
+        card('Kaspad network', s.kaspadNetworkId),
+        card('Kaspad phase', s.kaspadPhase),
+        card('Kaspad headers', s.kaspadHeaderCount),
+        card('Kaspad blocks', s.kaspadBlockCount),
+        card('Kaspad peers', s.kaspadPeerCount),
+        card('Kaspad IBD peers', s.kaspadIbdPeerCount),
+        card('Protocol v10 peers', s.kaspadProtocolVersion10Peers),
+        card('Protocol v9 peers', s.kaspadProtocolVersion9Peers),
+        card('Max peer ping ms', s.kaspadLastPingMsMax),
+        card('Tip count', s.kaspadTipCount),
+        card('Virtual parents', s.kaspadVirtualParentCount),
+        card('Pruning point', s.kaspadPruningPointHash),
+        card('Latest POI', s.latestPoiCheckpoint),
+        card('API health', s.graphqlHealthy),
+        card('Postgres', s.postgresConnected),
+        card('Updated', s.updatedAt)
+      ].join('');
+
+      const pct = Math.min(100, Math.round(((s.durationSeconds || 0) / runtimeTarget) * 100));
+      progress.style.width = pct + '%';
+      progressText.textContent = pct + '% of 24h target. Started ' + value(s.startedAt) + '.';
+      issues.textContent = (s.knownIssues && s.knownIssues.length > 0) ? s.knownIssues.join('\\n') : 'None reported.';
+    }
+
+    async function loadStatus() {
+      const res = await fetch('/soak/status', { cache: 'no-store' });
+      const body = await res.json();
+      renderStatus(body);
+      connection.textContent = res.ok ? 'connected' : 'degraded';
+    }
+
+    async function loadLogs() {
+      const res = await fetch('/soak/logs?tail=80', { cache: 'no-store' });
+      const body = await res.json();
+      logs.textContent = body.logs && body.logs.length > 0 ? body.logs.join('\\n') : 'No public sanitized logs available.';
+    }
+
+    async function refreshAll() {
+      try {
+        await Promise.all([loadStatus(), loadLogs()]);
+      } catch (err) {
+        connection.textContent = 'offline';
+        issues.textContent = String(err);
+      }
+    }
+
+    refresh.addEventListener('click', refreshAll);
+    refreshAll();
+    setInterval(refreshAll, 10000);
+
+    if (typeof EventSource !== 'undefined') {
+      const events = new EventSource('/soak/events');
+      events.addEventListener('soak_status', (event) => {
+        renderStatus(JSON.parse(event.data));
+        connection.textContent = 'streaming';
+      });
+      events.onerror = () => {
+        connection.textContent = 'polling fallback';
+      };
+    }
+  </script>
+</body>
+</html>`,
+  };
 }
 
 export function soakLogsResponse(req: IncomingMessage, options: SoakMonitorOptions): HealthzResponse {
@@ -456,6 +946,10 @@ export function nodeSoakHandler(pool: PgPoolLike, options: SoakMonitorOptions): 
       res.end(req.method === 'HEAD' ? undefined : response.body);
     };
 
+    if (pathname === '/soak' || pathname === '/soak/') {
+      respond(soakDashboardResponse());
+      return;
+    }
     if (pathname === '/soak/status') {
       void soakStatusResponse(pool, options).then(respond);
       return;
@@ -607,6 +1101,13 @@ export function createKasGraphHttpHandler(
       res.end(JSON.stringify({ error: 'rate limit exceeded' }));
       return;
     }
+    if ((url === '/' || url.startsWith('/?')) && soakHandler !== undefined) {
+      const originalUrl = req.url;
+      req.url = '/soak';
+      soakHandler(req, res);
+      req.url = originalUrl;
+      return;
+    }
     if (
       deployHandler !== undefined &&
       (url === '/subgraphs' || url.startsWith('/subgraphs/') || url.startsWith('/subgraphs?'))
@@ -710,6 +1211,8 @@ export interface RunServerOptions {
   rateLimitPerMinute: number;
   /** Directory containing live public soak artifacts. */
   soakArtifactDir: string;
+  /** Optional JSON-wRPC URL for the kaspad backing live soak status. */
+  kaspadRpcUrl?: string;
 }
 
 function envBoolean(name: string, fallback: boolean): boolean {
@@ -735,6 +1238,7 @@ export function readOptionsFromEnv(): RunServerOptions {
   const listenDatabaseUrl = process.env.LISTEN_DATABASE_URL ?? databaseUrl;
   const deployToken = process.env.KASGRAPH_DEPLOY_TOKEN;
   const network = process.env.KASGRAPH_NETWORK;
+  const kaspadRpcUrl = process.env.KASGRAPH_KASPAD_RPC_URL ?? process.env.KASGRAPH_RPC_PRIMARY_URL;
   return {
     databaseUrl,
     host: process.env.HOST ?? '0.0.0.0',
@@ -756,6 +1260,7 @@ export function readOptionsFromEnv(): RunServerOptions {
       new URL('../../docs/artifacts/sustained-run/live', import.meta.url).pathname,
     ...(deployToken !== undefined && deployToken.length > 0 && { deployToken }),
     ...(network !== undefined && network.length > 0 && { network }),
+    ...(kaspadRpcUrl !== undefined && kaspadRpcUrl.length > 0 && { kaspadRpcUrl }),
   };
 }
 
@@ -824,6 +1329,7 @@ export async function runKasGraphServer(options: RunServerOptions): Promise<Runn
       ...(options.network !== undefined && { network: options.network }),
       version: options.version,
       artifactDir: options.soakArtifactDir,
+      ...(options.kaspadRpcUrl !== undefined && { kaspadRpcUrl: options.kaspadRpcUrl }),
     }),
   );
   const server = http.createServer(handler);
