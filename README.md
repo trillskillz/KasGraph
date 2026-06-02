@@ -49,7 +49,7 @@ All four interfaces ship together. MCP is a first-class surface, not a future ad
 
 ## Status
 
-The indexer is **feature-complete core infrastructure**: `build -> deploy -> index -> query` is multi-tenant, hot-reloadable, and verified end-to-end against a real Postgres. Hosted deploy writes support bearer-token auth, and the API exposes `/healthz`, `/health`, `/status`, and `/metrics` for operators. Remaining pre-public work is operational validation: live hosted testnet indexing, published benchmarks, sustained soak evidence, and protected log streaming. See [`STATUS.md`](STATUS.md) for the live per-phase block.
+The indexer is **feature-complete core infrastructure**: `build -> deploy -> index -> query` is multi-tenant, hot-reloadable, and verified end-to-end against a real Postgres. Hosted deploy writes support bearer-token auth, and the API exposes `/healthz`, `/health`, `/status`, and `/metrics` for operators. A 24-hour testnet soak artifact is published; remaining pre-public work is operational validation for hosted topology, published benchmarks, mainnet readiness, and protected log streaming. See [`STATUS.md`](STATUS.md) for the live per-phase block.
 
 ## Quick start
 

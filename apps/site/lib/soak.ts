@@ -18,6 +18,7 @@ export type SoakSummary = {
   transactionsIndexed?: number | string | null;
   entitiesWritten?: number | string | null;
   poiCheckpoints?: number | string | null;
+  latestPoiCheckpoint?: string | null;
   restartRecoveryVerdict?: string;
   knownIssues?: string[] | string;
   publicLogs?: {
@@ -25,7 +26,13 @@ export type SoakSummary = {
     apiHealth?: string;
     poiCheckpoints?: string;
     dbStats?: string;
+    resourceMetrics?: string;
     restartNotes?: string;
+    'log-tail'?: string;
+    'poi-checkpoints'?: string;
+    'db-stats'?: string;
+    'resource-metrics'?: string;
+    'restart-recovery-notes'?: string;
   };
 };
 

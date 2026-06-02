@@ -156,8 +156,8 @@ export default function Home() {
           </h2>
           <p className="mt-5 max-w-4xl text-lg leading-8 text-[#b7c9c5]">
             The build {'->'} deploy {'->'} index {'->'} query pipeline is multi-tenant, hot-reloadable,
-            and verified end-to-end against real Postgres. Remaining public-launch work includes
-            live testnet soak, hosted topology, log streaming, benchmarks, and deployment confirmation.
+            verified end-to-end against real Postgres, and backed by a published 24-hour testnet soak.
+            Remaining public-launch work includes hosted topology, log streaming, benchmarks, and deployment confirmation.
           </p>
           <Link className="mt-7 inline-flex text-sm font-medium text-[#49EACB]" href="/status">
             Read the full status

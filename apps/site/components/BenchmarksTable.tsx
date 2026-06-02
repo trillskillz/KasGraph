@@ -1,36 +1,44 @@
-const rows: Array<[string, string, string, string, string]> = [
-  ['Indexing throughput', 'Pending', 'TBD blocks/sec', 'Pending measurement', 'Awaiting sustained testnet soak.'],
-  ['GraphQL query latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires hosted endpoint and representative subgraphs.'],
-  ['Reorg handling latency', 'Pending', 'TBD seconds', 'Pending measurement', 'Needs controlled virtual-chain/reorg simulation.'],
-  ['PostgreSQL storage growth', 'Pending', 'TBD GB / million txs', 'Pending measurement', 'Depends on entity volume and indexing profile.'],
-  ['WebSocket/KasStream event latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires live streaming deployment.'],
-  ['MCP tool response latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires hosted MCP/gateway path.'],
-  ['Proof-of-Indexing checkpoint cost', 'Pending', 'TBD ms/checkpoint', 'Pending measurement', 'Depends on entity update volume.'],
-  ['Testnet soak duration', 'Not run', '24h minimum / 72h preferred', 'Pending validation', 'Harness added; no sustained testnet artifact has been published.'],
-  ['Mainnet readiness', 'Not validated', 'Defined checklist', 'Not production-ready', 'Requires testnet soak, monitoring, benchmarks, and runbooks.'],
-];
-
-const cards: Array<[string, string]> = [
-  ['Indexing throughput', 'Pending measurement'],
-  ['Query latency', 'Pending measurement'],
-  ['Reorg handling latency', 'Pending measurement'],
-  ['PostgreSQL storage growth', 'Pending measurement'],
-  ['WebSocket/KasStream event latency', 'Pending measurement'],
-  ['MCP tool response latency', 'Pending measurement'],
-  ['POI checkpoint cost', 'Pending measurement'],
-  ['Testnet soak duration', 'Not run'],
-  ['Mainnet readiness', 'Not production-ready'],
-];
+import { formatDuration, getLatestSoakSummary, soakValue } from '@/lib/soak';
 
 export function BenchmarksTable() {
+  const soak = getLatestSoakSummary();
+  const summary = soak.summary;
+  const soakDuration = soak.hasSummary ? formatDuration(summary) : '24h minimum / 72h preferred';
+  const soakStatus = soak.hasSummary ? soakValue(summary?.status, 'Published') : 'Pending validation';
+  const soakNotes = soak.hasSummary
+    ? `Published ${soakValue(summary?.runDate ?? soak.artifactDate)} artifact on ${soakValue(summary?.network)} with ${soakValue(summary?.blocksIndexed)} blocks and ${soakValue(summary?.poiCheckpoints)} POI checkpoints.`
+    : 'Harness added; no sustained testnet artifact has been published.';
+  const rows: Array<[string, string, string, string, string]> = [
+    ['Indexing throughput', 'Pending', 'TBD blocks/sec', 'Pending measurement', 'Requires repeatable benchmark run beyond the completed soak.'],
+    ['GraphQL query latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires hosted endpoint and representative subgraphs.'],
+    ['Reorg handling latency', 'Pending', 'TBD seconds', 'Pending measurement', 'Needs controlled virtual-chain/reorg simulation.'],
+    ['PostgreSQL storage growth', 'Pending', 'TBD GB / million txs', 'Pending measurement', 'Depends on entity volume and indexing profile.'],
+    ['WebSocket/KasStream event latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires live streaming deployment.'],
+    ['MCP tool response latency', 'Pending', 'TBD ms p95', 'Pending measurement', 'Requires hosted MCP/gateway path.'],
+    ['Proof-of-Indexing checkpoint cost', 'Pending', 'TBD ms/checkpoint', 'Pending measurement', 'Depends on entity update volume.'],
+    ['Testnet soak duration', soakDuration, '24h minimum / 72h preferred', soakStatus, soakNotes],
+    ['Mainnet readiness', 'Not validated', 'Defined checklist', 'Not production-ready', 'Requires monitoring, benchmarks, runbooks, and mainnet validation.'],
+  ];
+  const cards: Array<[string, string]> = [
+    ['Indexing throughput', 'Pending measurement'],
+    ['Query latency', 'Pending measurement'],
+    ['Reorg handling latency', 'Pending measurement'],
+    ['PostgreSQL storage growth', 'Pending measurement'],
+    ['WebSocket/KasStream event latency', 'Pending measurement'],
+    ['MCP tool response latency', 'Pending measurement'],
+    ['POI checkpoint cost', 'Pending measurement'],
+    ['Testnet soak duration', soak.hasSummary ? soakDuration : 'Not run'],
+    ['Mainnet readiness', 'Not production-ready'],
+  ];
+
   return (
     <section className="section py-16">
       <div className="mb-8 max-w-4xl">
         <p className="mono text-xs uppercase tracking-[0.24em] text-[#49EACB]">benchmarks</p>
         <h2 className="mt-4 text-3xl font-semibold tracking-tight text-[#f3fffc]">Benchmarks.</h2>
         <p className="mt-4 text-lg leading-8 text-[#b7c9c5]">
-          This is the public placeholder for performance data. The soak harness exists, but results
-          remain pending until sustained testnet/mainnet validation produces repeatable measurements.
+          This table separates the published testnet soak artifact from performance benchmarks that
+          still need repeatable hosted measurements.
         </p>
       </div>
       <div className="mb-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

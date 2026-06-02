@@ -23,12 +23,12 @@ Every benchmark result must include:
 
 | Metric | Result | Environment | Dataset | Hardware | Date | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| Indexing throughput | Pending | N/A | N/A | N/A | N/A | Requires sustained testnet run. |
+| Indexing throughput | Pending | N/A | N/A | N/A | N/A | Requires a benchmark run; the completed soak artifact is not a throughput benchmark. |
 | GraphQL p50/p95/p99 latency | Pending | N/A | N/A | N/A | N/A | Requires hosted endpoint and reviewed artifact. |
-| Postgres storage growth | Pending | N/A | N/A | N/A | N/A | Requires sustained indexing run. |
+| Postgres storage growth | Pending | N/A | N/A | N/A | N/A | Requires a benchmark artifact with database size before/after the run. |
 | POI checkpoint generation cost | Pending | N/A | N/A | N/A | N/A | Requires checkpoint timing instrumentation. |
-| Memory usage | Pending | N/A | N/A | N/A | N/A | Requires sustained run metrics. |
-| CPU usage | Pending | N/A | N/A | N/A | N/A | Requires sustained run metrics. |
+| Memory usage | Pending | N/A | N/A | N/A | N/A | Requires benchmark-reviewed resource metrics. |
+| CPU usage | Pending | N/A | N/A | N/A | N/A | Requires benchmark-reviewed resource metrics. |
 | Disk I/O | Pending | N/A | N/A | N/A | N/A | Requires host metrics. |
 | Restart recovery time | Pending | N/A | N/A | N/A | N/A | Requires controlled restart test. |
 | API uptime | Pending | N/A | N/A | N/A | N/A | Requires uptime monitor or soak health snapshots. |
